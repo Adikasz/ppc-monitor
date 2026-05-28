@@ -1,0 +1,30 @@
+# Discord bot
+discord.py==2.4.0
+
+# Supabase
+supabase==2.9.1
+
+# Meta Ads API
+facebook-business==21.0.0
+
+# Google Ads API
+google-ads==25.1.0
+
+# Claude (Anthropic)
+anthropic==0.39.0
+
+# ClickUp — egyszerű HTTP, nincs dedikált SDK, requests-szel kezeljük
+requests==2.32.3
+
+# Környezeti változók
+python-dotenv==1.0.1
+
+# Időkezelés (timezone)
+pytz==2024.2
+
+# Ütemezés (cron-szerű, álló bot mellé)
+apscheduler==3.10.4
+
+# Fejlesztés / tesztelés
+pytest==8.3.3
+pytest-asyncio==0.24.0

@@ -1,0 +1,36 @@
+# Környezeti változók — SOHA ne committold
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Google Ads konfiguráció (érzékeny)
+google-ads.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Naplók
+*.log
+logs/
+
+# Railway
+.railway/
