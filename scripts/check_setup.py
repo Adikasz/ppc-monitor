@@ -15,6 +15,11 @@ import sys
 
 
 def main() -> int:
+    # Windows default console (cp1252) can't render Hungarian/Unicode output.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+
     print("=" * 60)
     print("PPC Monitor — Setup ellenőrzés")
     print("=" * 60)

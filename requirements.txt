@@ -1,14 +1,24 @@
 # Discord bot
 discord.py==2.4.0
+# audioop-lts backport: Python 3.13 eltávolította a stdlib `audioop` modult,
+# de a discord.py 2.4 még importálja (hangkezeléshez). A bot szöveges, de a
+# csomag importja a teljes stack betöltését igényli.
+audioop-lts==0.2.2; python_version >= "3.13"
 
 # Supabase
-supabase==2.9.1
+# 2.17.0 supports the new sb_publishable_/sb_secret_ key format AND avoids
+# the pyiceberg dependency that storage3>=2.x pulls in (pyiceberg needs MSVC
+# to build on Windows + Python 3.14). Bump when a Python-3.14 pyiceberg wheel
+# ships, or when storage3 drops the pyiceberg requirement.
+supabase==2.17.0
 
 # Meta Ads API
 facebook-business==21.0.0
 
 # Google Ads API
-google-ads==25.1.0
+# Skipped for now — google-ads<28.2 doesn't support Python 3.14.
+# Re-enable (e.g. google-ads==31.0.0) before wiring up the Google Ads integration.
+# google-ads==25.1.0
 
 # Claude (Anthropic)
 anthropic==0.39.0
