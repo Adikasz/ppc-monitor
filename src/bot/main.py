@@ -25,6 +25,7 @@ log = get_logger(__name__)
 # Cog-ok, amiket a bot induláskor betölt. Új parancsmodulokat ide kell felvenni.
 _EXTENSIONS: tuple[str, ...] = (
     "src.bot.commands.clients",
+    "src.bot.commands.assignments",
 )
 
 
