@@ -26,6 +26,7 @@ log = get_logger(__name__)
 _EXTENSIONS: tuple[str, ...] = (
     "src.bot.commands.clients",
     "src.bot.commands.assignments",
+    "src.bot.commands.campaigns",
 )
 
 
