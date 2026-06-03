@@ -31,6 +31,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from src.config import get_config
+from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import campaigns as campaigns_storage
 from src.storage import clients as clients_storage
 from src.storage import kpis as kpis_storage
@@ -206,15 +207,18 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         await interaction.followup.send(embed=embed)
 
     # ------------------------------------------------------------------
-    # /campaign add client_name:<név> platform:<meta|google> name:<...> ...
+    # /campaign add client_name:<név> platform:<meta|google> account_id:<...>
+    # Regisztrál egy hirdetési fiókot az ügyfélhez — a discovery ebből indul.
     # ------------------------------------------------------------------
-    @app_commands.command(name="add", description="Új kampány létrehozása (admin csatorna)")
+    @app_commands.command(
+        name="add",
+        description="Hirdetési fiók regisztrálása ügyfélhez (discovery innen indul)",
+    )
     @app_commands.describe(
         client_name="Az ügyfél neve",
         platform="Hirdetési platform: meta vagy google",
-        name="A kampány neve",
-        account_id="Hirdetési fiók azonosítója (opcionális, pl. act_123456)",
-        campaign_type="Kampány típusa (opcionális, pl. meta_conversion)",
+        account_id="Hirdetési fiók azonosítója (Meta: act_123456789, Google: 1234567890)",
+        account_name="Opcionális: fiók emberi neve",
     )
     @app_commands.choices(platform=[
         app_commands.Choice(name="Meta Ads", value="meta"),
@@ -225,9 +229,8 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         interaction: discord.Interaction,
         client_name: str,
         platform: str,
-        name: str,
-        account_id: str | None = None,
-        campaign_type: str | None = None,
+        account_id: str,
+        account_name: str | None = None,
     ) -> None:
         if not _is_admin_channel(interaction):
             await interaction.response.send_message(
@@ -236,9 +239,11 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
-        name = name.strip()
-        if not name:
-            await interaction.response.send_message("A kampánynév nem lehet üres.", ephemeral=True)
+        account_id = account_id.strip()
+        if not account_id:
+            await interaction.response.send_message(
+                "A fiók azonosító nem lehet üres.", ephemeral=True
+            )
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -254,46 +259,56 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
 
         if not client.get("is_active", True):
             await interaction.followup.send(
-                f"Az ügyfél **{client_name}** inaktív, nem hozható létre kampány hozzá."
+                f"Az ügyfél **{client_name}** inaktív."
             )
             return
 
         try:
-            row = campaigns_storage.create_campaign(
+            row, created = ad_accounts_storage.get_or_create_ad_account(
                 client_id=client["id"],
-                name=name,
                 platform=platform,
-                account_id=account_id,
-                campaign_type=campaign_type,
+                external_account_id=account_id,
+                account_name=account_name,
             )
         except Exception as exc:  # noqa: BLE001
-            log.exception("Hiba a kampány létrehozásakor (%s / %s)", client_name, name)
-            await interaction.followup.send(f"Hiba a létrehozáskor: `{exc}`")
+            log.exception(
+                "Hiba a hirdetési fiók regisztrálásakor (%s / %s)",
+                client_name, account_id,
+            )
+            await interaction.followup.send(f"Hiba: `{exc}`")
+            return
+
+        if not created:
+            await interaction.followup.send(
+                f"ℹ️ Ez a hirdetési fiók már regisztrálva van:\n"
+                f"**{platform}** / `{account_id}` → ügyfél: **{client['name']}**\n"
+                f"*(ad_account #{row['id']})*"
+            )
             return
 
         audit.log_action(
             discord_user_id=str(interaction.user.id),
-            action="campaign_add",
-            entity_type="campaign",
+            action="ad_account_add",
+            entity_type="ad_account",
             entity_id=row["id"],
             details={
                 "client_id": client["id"],
                 "client_name": client["name"],
-                "name": name,
                 "platform": platform,
-                "account_id": account_id,
-                "campaign_type": campaign_type,
+                "external_account_id": account_id,
+                "account_name": account_name,
             },
         )
 
         log.info(
-            "Kampány létrehozva: %s / %s (#%s) — platform=%s",
-            client["name"], name, row["id"], platform,
+            "Hirdetési fiók regisztrálva: %s / %s → ügyfél %s (ad_account #%s)",
+            platform, account_id, client["name"], row["id"],
         )
         await interaction.followup.send(
-            f"✅ Kampány létrehozva: **#{row['id']} — {row['name']}**\n"
-            f"Ügyfél: **{client['name']}** · Platform: `{platform}` · Lifecycle: `new`\n"
-            f"Következő lépés: állítsd be a KPI-okat a `/campaign kpi` paranccsal."
+            f"✅ Hirdetési fiók regisztrálva: **{platform}** / `{account_id}`\n"
+            f"Ügyfél: **{client['name']}** · *(ad_account #{row['id']})*\n"
+            f"Következő lépés: futtasd a discovery-t:\n"
+            f"`python -m scripts.run_discovery --client-name {client['name']}`"
         )
 
     # ------------------------------------------------------------------
