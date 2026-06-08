@@ -232,21 +232,19 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         account_id: str,
         account_name: str | None = None,
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
         if not _is_admin_channel(interaction):
-            await interaction.response.send_message(
-                "Ez a parancs csak az admin csatornában használható.",
-                ephemeral=True,
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható."
             )
             return
 
         account_id = account_id.strip()
         if not account_id:
-            await interaction.response.send_message(
-                "A fiók azonosító nem lehet üres.", ephemeral=True
-            )
+            await interaction.followup.send("A fiók azonosító nem lehet üres.")
             return
 
-        await interaction.response.defer(ephemeral=True)
 
         # Ügyfél ellenőrzése
         client = clients_storage.get_client_by_name(client_name.strip())
@@ -325,14 +323,14 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         campaign_id: int,
         campaign_type: str,
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
         if not _is_admin_channel(interaction):
-            await interaction.response.send_message(
-                "Ez a parancs csak az admin csatornában használható.",
-                ephemeral=True,
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható."
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
 
         c = campaigns_storage.get_campaign(campaign_id)
         if c is None:
@@ -398,10 +396,11 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         cpa_spike_critical_pct: float | None = None,
         trend_warning_days: int | None = None,
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
         if not _is_admin_channel(interaction):
-            await interaction.response.send_message(
-                "Ez a parancs csak az admin csatornában használható.",
-                ephemeral=True,
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható."
             )
             return
 
@@ -412,12 +411,9 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             cpa_spike_critical_pct, trend_warning_days,
         ]
         if all(v is None for v in all_values):
-            await interaction.response.send_message(
-                "Legalább egy KPI mezőt meg kell adni!", ephemeral=True
-            )
+            await interaction.followup.send("Legalább egy KPI mezőt meg kell adni!")
             return
 
-        await interaction.response.defer(ephemeral=True)
 
         c = campaigns_storage.get_campaign(campaign_id)
         if c is None:
@@ -510,14 +506,14 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         state: str,
         until: str | None = None,
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
         if not _is_admin_channel(interaction):
-            await interaction.response.send_message(
-                "Ez a parancs csak az admin csatornában használható.",
-                ephemeral=True,
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható."
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
 
         c = campaigns_storage.get_campaign(campaign_id)
         if c is None:
@@ -575,14 +571,14 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         campaign_id: int,
         supporter: discord.Member,
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
         if not _is_admin_channel(interaction):
-            await interaction.response.send_message(
-                "Ez a parancs csak az admin csatornában használható.",
-                ephemeral=True,
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható."
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
 
         c = campaigns_storage.get_campaign(campaign_id)
         if c is None:
@@ -646,14 +642,14 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         campaign_id: int,
         supporter: discord.Member,
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
         if not _is_admin_channel(interaction):
-            await interaction.response.send_message(
-                "Ez a parancs csak az admin csatornában használható.",
-                ephemeral=True,
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható."
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
 
         c = campaigns_storage.get_campaign(campaign_id)
         if c is None:
