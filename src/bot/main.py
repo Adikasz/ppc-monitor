@@ -13,7 +13,10 @@ Indítás:
 """
 from __future__ import annotations
 
+import traceback
+
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from src.config import get_config
@@ -72,6 +75,39 @@ def build_bot() -> commands.Bot:
             bot.user, bot.user.id if bot.user else "?",
         )
         log.info("Csatlakozott szerverek: %s", guilds)
+
+    @bot.tree.error
+    async def on_app_command_error(
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        """Globális app command hibakezelő.
+
+        Ha egy slash command exception-t dob és nem kezeli le magában,
+        ez biztosítja, hogy:
+          1. A hiba bekerül a logba (traceback-kel együtt)
+          2. A felhasználó kap visszajelzést (nem marad örök "thinking...")
+        """
+        # Teljes traceback a logba
+        tb = traceback.format_exception(type(error), error, error.__traceback__)
+        log.error(
+            "App command hiba [/%s]: %s\n%s",
+            interaction.command.name if interaction.command else "?",
+            error,
+            "".join(tb),
+        )
+
+        error_msg = f"❌ Váratlan hiba: `{error}`\nNézd meg a bot logját a részletekért."
+
+        try:
+            if interaction.response.is_done():
+                # Már defer()-elve volt → followup
+                await interaction.followup.send(error_msg, ephemeral=True)
+            else:
+                # Még nem válaszolt → response
+                await interaction.response.send_message(error_msg, ephemeral=True)
+        except Exception:
+            log.exception("Nem sikerült az error üzenetet elküldeni az interakcióhoz")
 
     return bot
 

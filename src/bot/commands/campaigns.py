@@ -241,83 +241,17 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         account_id: str,
         account_name: str | None = None,
     ) -> None:
-        # ELSŐ sor: defer — azonnal jelzi Discordnak, hogy dolgozunk
+        # ── DEBUG STRIP ── minden logika ki van kommentelve ──────────────
+        # Ha ez a válasz megjelenik, a defer+followup lánc működik.
+        # Ha nem jelenik meg → valami a bot betöltésekor már elromlott.
         await interaction.response.defer(ephemeral=True)
-
-        if not _is_admin_channel(interaction):
-            await interaction.followup.send(
-                "Ez a parancs csak az admin csatornában használható."
-            )
-            return
-
-        account_id = account_id.strip()
-        if not account_id:
-            await interaction.followup.send("A fiók azonosító nem lehet üres.")
-            return
-
-        # Ügyfél ellenőrzése — to_thread: nem blokkolja az event loop-ot
-        client = await asyncio.to_thread(
-            clients_storage.get_client_by_name, client_name.strip()
-        )
-        if client is None:
-            await interaction.followup.send(
-                f"Nem található ügyfél: **{client_name}**\n"
-                f"Ellenőrizd a `/clients list` paranccsal."
-            )
-            return
-
-        if not client.get("is_active", True):
-            await interaction.followup.send(f"Az ügyfél **{client_name}** inaktív.")
-            return
-
-        try:
-            row, created = await asyncio.to_thread(
-                ad_accounts_storage.get_or_create_ad_account,
-                client["id"],
-                platform,
-                account_id,
-                account_name=account_name,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception(
-                "Hiba a hirdetési fiók regisztrálásakor (%s / %s)",
-                client_name, account_id,
-            )
-            await interaction.followup.send(f"Hiba: `{exc}`")
-            return
-
-        if not created:
-            await interaction.followup.send(
-                f"ℹ️ Ez a hirdetési fiók már regisztrálva van:\n"
-                f"**{platform}** / `{account_id}` → ügyfél: **{client['name']}**\n"
-                f"*(ad_account #{row['id']})*"
-            )
-            return
-
-        await asyncio.to_thread(
-            audit.log_action,
-            str(interaction.user.id),
-            "ad_account_add",
-            entity_type="ad_account",
-            entity_id=row["id"],
-            details={
-                "client_id": client["id"],
-                "client_name": client["name"],
-                "platform": platform,
-                "external_account_id": account_id,
-                "account_name": account_name,
-            },
-        )
-
         log.info(
-            "Hirdetési fiók regisztrálva: %s / %s → ügyfél %s (ad_account #%s)",
-            platform, account_id, client["name"], row["id"],
+            "DEBUG /campaign add hívva: client=%r platform=%r account_id=%r",
+            client_name, platform, account_id,
         )
         await interaction.followup.send(
-            f"✅ Hirdetési fiók regisztrálva: **{platform}** / `{account_id}`\n"
-            f"Ügyfél: **{client['name']}** · *(ad_account #{row['id']})*\n"
-            f"Következő lépés: futtasd a discovery-t:\n"
-            f"`python -m scripts.run_discovery --client-name {client['name']}`"
+            f"✅ DEBUG: add parancs elért a followup.send-ig\n"
+            f"client={client_name!r}  platform={platform!r}  account_id={account_id!r}"
         )
 
     # ------------------------------------------------------------------
