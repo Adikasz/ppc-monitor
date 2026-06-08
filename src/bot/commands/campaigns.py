@@ -23,8 +23,11 @@ Megjegyzések:
   - A /campaign list és info bárhonnan hívható (ephemeral válasz).
   - A supporter hozzárendelés az assignments táblán keresztül kezelt (role='supporter').
   - KPI beállítás verziózott — minden /campaign kpi hívás új sort hoz létre.
+  - Minden Supabase hívás asyncio.to_thread()-ben fut, hogy ne blokkolja az event loop-ot.
 """
 from __future__ import annotations
+
+import asyncio
 
 import discord
 from discord import app_commands
@@ -117,7 +120,9 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
-        client = clients_storage.get_client_by_name(client_name.strip())
+        client = await asyncio.to_thread(
+            clients_storage.get_client_by_name, client_name.strip()
+        )
         if client is None:
             await interaction.followup.send(
                 f"Nem található ügyfél: **{client_name}**\n"
@@ -125,7 +130,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
-        rows = campaigns_storage.list_campaigns(client["id"])
+        rows = await asyncio.to_thread(campaigns_storage.list_campaigns, client["id"])
         if not rows:
             await interaction.followup.send(
                 f"**{client['name']}** ügyfélhez még nincs aktív kampány.\n"
@@ -164,7 +169,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
-        c = campaigns_storage.get_campaign(campaign_id)
+        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
         if c is None:
             await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
             return
@@ -185,7 +190,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             embed.add_field(name="Adat érvényes ettől", value=str(c["data_valid_from"]), inline=False)
 
         # Aktív KPI-ok
-        kpi = kpis_storage.get_active_kpis(campaign_id)
+        kpi = await asyncio.to_thread(kpis_storage.get_active_kpis, campaign_id)
         if kpi:
             kpi_lines = "\n".join(filter(None, [
                 _fmt_kpi("ROAS cél", kpi.get("target_roas"), "%"),
@@ -201,7 +206,11 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             ]))
             embed.add_field(name="📈 Aktív KPI-ok", value=kpi_lines or "—", inline=False)
         else:
-            embed.add_field(name="📈 Aktív KPI-ok", value="Még nincs beállítva — használd a `/campaign kpi` parancsot.", inline=False)
+            embed.add_field(
+                name="📈 Aktív KPI-ok",
+                value="Még nincs beállítva — használd a `/campaign kpi` parancsot.",
+                inline=False,
+            )
 
         embed.add_field(name="Létrehozva", value=str(c.get("created_at", "—")), inline=False)
         await interaction.followup.send(embed=embed)
@@ -232,6 +241,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         account_id: str,
         account_name: str | None = None,
     ) -> None:
+        # ELSŐ sor: defer — azonnal jelzi Discordnak, hogy dolgozunk
         await interaction.response.defer(ephemeral=True)
 
         if not _is_admin_channel(interaction):
@@ -245,9 +255,10 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             await interaction.followup.send("A fiók azonosító nem lehet üres.")
             return
 
-
-        # Ügyfél ellenőrzése
-        client = clients_storage.get_client_by_name(client_name.strip())
+        # Ügyfél ellenőrzése — to_thread: nem blokkolja az event loop-ot
+        client = await asyncio.to_thread(
+            clients_storage.get_client_by_name, client_name.strip()
+        )
         if client is None:
             await interaction.followup.send(
                 f"Nem található ügyfél: **{client_name}**\n"
@@ -256,16 +267,15 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             return
 
         if not client.get("is_active", True):
-            await interaction.followup.send(
-                f"Az ügyfél **{client_name}** inaktív."
-            )
+            await interaction.followup.send(f"Az ügyfél **{client_name}** inaktív.")
             return
 
         try:
-            row, created = ad_accounts_storage.get_or_create_ad_account(
-                client_id=client["id"],
-                platform=platform,
-                external_account_id=account_id,
+            row, created = await asyncio.to_thread(
+                ad_accounts_storage.get_or_create_ad_account,
+                client["id"],
+                platform,
+                account_id,
                 account_name=account_name,
             )
         except Exception as exc:  # noqa: BLE001
@@ -284,9 +294,10 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
-        audit.log_action(
-            discord_user_id=str(interaction.user.id),
-            action="ad_account_add",
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "ad_account_add",
             entity_type="ad_account",
             entity_id=row["id"],
             details={
@@ -331,29 +342,34 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
-
-        c = campaigns_storage.get_campaign(campaign_id)
+        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
         if c is None:
             await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
             return
 
+        # Supabase hívás thread-poolban
+        _type = campaign_type.strip()
         try:
-            res = (
-                get_supabase()
-                .table("campaigns")
-                .update({"campaign_type": campaign_type.strip()})
-                .eq("id", campaign_id)
-                .execute()
-            )
-            updated = res.data[0] if res.data else None
+            def _do_tag_update() -> dict | None:
+                res = (
+                    get_supabase()
+                    .table("campaigns")
+                    .update({"campaign_type": _type})
+                    .eq("id", campaign_id)
+                    .execute()
+                )
+                return res.data[0] if res.data else None
+
+            await asyncio.to_thread(_do_tag_update)
         except Exception as exc:  # noqa: BLE001
             log.exception("Hiba a kampány tag frissítésekor (#%s)", campaign_id)
             await interaction.followup.send(f"Hiba: `{exc}`")
             return
 
-        audit.log_action(
-            discord_user_id=str(interaction.user.id),
-            action="campaign_tag",
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "campaign_tag",
             entity_type="campaign",
             entity_id=campaign_id,
             details={"campaign_type": campaign_type, "campaign_name": c["name"]},
@@ -414,15 +430,15 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             await interaction.followup.send("Legalább egy KPI mezőt meg kell adni!")
             return
 
-
-        c = campaigns_storage.get_campaign(campaign_id)
+        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
         if c is None:
             await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
             return
 
         try:
-            new_kpi = kpis_storage.set_kpis(
-                campaign_id=campaign_id,
+            new_kpi = await asyncio.to_thread(
+                kpis_storage.set_kpis,
+                campaign_id,
                 target_roas=target_roas,
                 max_cpa=max_cpa,
                 max_cpl=max_cpl,
@@ -439,9 +455,10 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             await interaction.followup.send(f"Hiba a KPI mentésekor: `{exc}`")
             return
 
-        audit.log_action(
-            discord_user_id=str(interaction.user.id),
-            action="set_kpi",
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "set_kpi",
             entity_type="campaign",
             entity_id=campaign_id,
             details={
@@ -514,8 +531,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
-
-        c = campaigns_storage.get_campaign(campaign_id)
+        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
         if c is None:
             await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
             return
@@ -523,7 +539,12 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         old_state = c.get("lifecycle_state", "?")
 
         try:
-            updated = campaigns_storage.set_lifecycle_state(campaign_id, state, until=until)
+            updated = await asyncio.to_thread(
+                campaigns_storage.set_lifecycle_state,
+                campaign_id,
+                state,
+                until=until,
+            )
         except Exception as exc:  # noqa: BLE001
             log.exception("Hiba a lifecycle beállításakor (#%s)", campaign_id)
             await interaction.followup.send(f"Hiba: `{exc}`")
@@ -533,9 +554,10 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             await interaction.followup.send(f"Nem sikerült frissíteni: #{campaign_id}")
             return
 
-        audit.log_action(
-            discord_user_id=str(interaction.user.id),
-            action="set_lifecycle",
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "set_lifecycle",
             entity_type="campaign",
             entity_id=campaign_id,
             details={
@@ -579,35 +601,38 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
-
-        c = campaigns_storage.get_campaign(campaign_id)
+        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
         if c is None:
             await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
             return
 
         # Supporter auto-regisztráció (users tábla)
-        user_row, user_created = users_storage.get_or_create_user(
-            discord_user_id=str(supporter.id),
-            display_name=_display_name(supporter),
+        user_row, user_created = await asyncio.to_thread(
+            users_storage.get_or_create_user,
+            str(supporter.id),
+            _display_name(supporter),
         )
         if user_created:
             log.info("Új felhasználó regisztrálva: %s (%s)", supporter, supporter.id)
 
-        assignment, created = campaigns_storage.add_supporter(
-            campaign_id=campaign_id,
-            user_id=user_row["id"],
+        assignment, created = await asyncio.to_thread(
+            campaigns_storage.add_supporter,
+            campaign_id,
+            user_row["id"],
             created_by_discord_user_id=str(interaction.user.id),
         )
 
         if not created:
             await interaction.followup.send(
-                f"**{_display_name(supporter)}** már helyettes a **#{campaign_id} — {c['name']}** kampányon."
+                f"**{_display_name(supporter)}** már helyettes a "
+                f"**#{campaign_id} — {c['name']}** kampányon."
             )
             return
 
-        audit.log_action(
-            discord_user_id=str(interaction.user.id),
-            action="add_supporter",
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "add_supporter",
             entity_type="campaign",
             entity_id=campaign_id,
             details={
@@ -650,13 +675,14 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
-
-        c = campaigns_storage.get_campaign(campaign_id)
+        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
         if c is None:
             await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
             return
 
-        user_row = users_storage.get_user_by_discord_id(str(supporter.id))
+        user_row = await asyncio.to_thread(
+            users_storage.get_user_by_discord_id, str(supporter.id)
+        )
         if user_row is None:
             await interaction.followup.send(
                 f"**{_display_name(supporter)}** nincs a rendszerben — "
@@ -664,9 +690,10 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
-        deleted = campaigns_storage.remove_supporter(
-            campaign_id=campaign_id,
-            user_id=user_row["id"],
+        deleted = await asyncio.to_thread(
+            campaigns_storage.remove_supporter,
+            campaign_id,
+            user_row["id"],
         )
 
         if not deleted:
@@ -676,9 +703,10 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
-        audit.log_action(
-            discord_user_id=str(interaction.user.id),
-            action="remove_supporter",
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "remove_supporter",
             entity_type="campaign",
             entity_id=campaign_id,
             details={

@@ -15,8 +15,11 @@ Megjegyzések:
   - Az /assign automatikusan létrehozza a users táblában az érintett
     személyt, ha még nem létezik (auto-registration).
   - Minden írási művelet auditálva van (audit_log tábla).
+  - Minden Supabase hívás asyncio.to_thread()-ben fut, hogy ne blokkolja az event loop-ot.
 """
 from __future__ import annotations
+
+import asyncio
 
 import discord
 from discord import app_commands
@@ -89,17 +92,19 @@ class AssignmentsCog(commands.Cog):
         client_name: str,
         manager: discord.Member,
     ) -> None:
+        # ELSŐ sor: defer — azonnal jelzi Discordnak, hogy dolgozunk
+        await interaction.response.defer(ephemeral=True)
+
         if not _is_admin_channel(interaction):
-            await interaction.response.send_message(
-                "Ez a parancs csak az admin csatornában használható.",
-                ephemeral=True,
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható."
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
-
-        # 1) Ügyfél megkeresése
-        client = clients_storage.get_client_by_name(client_name.strip())
+        # 1) Ügyfél megkeresése — to_thread: nem blokkolja az event loop-ot
+        client = await asyncio.to_thread(
+            clients_storage.get_client_by_name, client_name.strip()
+        )
         if client is None:
             await interaction.followup.send(
                 f"Nem található ügyfél ezzel a névvel: **{client_name}**\n"
@@ -114,15 +119,17 @@ class AssignmentsCog(commands.Cog):
             return
 
         # 2) Manager auto-regisztráció (users tábla)
-        user_row, user_created = users_storage.get_or_create_user(
-            discord_user_id=str(manager.id),
-            display_name=_display_name(manager),
+        user_row, user_created = await asyncio.to_thread(
+            users_storage.get_or_create_user,
+            str(manager.id),
+            _display_name(manager),
         )
         if user_created:
             log.info("Új felhasználó regisztrálva: %s (%s)", manager, manager.id)
 
         # 3) Hozzárendelés létrehozása
-        assignment, created = assignments_storage.create_assignment(
+        assignment, created = await asyncio.to_thread(
+            assignments_storage.create_assignment,
             user_id=user_row["id"],
             client_id=client["id"],
             created_by_discord_user_id=str(interaction.user.id),
@@ -136,9 +143,10 @@ class AssignmentsCog(commands.Cog):
             return
 
         # 4) Audit log
-        audit.log_action(
-            discord_user_id=str(interaction.user.id),
-            action="assign",
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "assign",
             entity_type="assignment",
             entity_id=assignment["id"],
             details={
@@ -175,17 +183,19 @@ class AssignmentsCog(commands.Cog):
         client_name: str,
         manager: discord.Member,
     ) -> None:
+        # ELSŐ sor: defer — azonnal jelzi Discordnak, hogy dolgozunk
+        await interaction.response.defer(ephemeral=True)
+
         if not _is_admin_channel(interaction):
-            await interaction.response.send_message(
-                "Ez a parancs csak az admin csatornában használható.",
-                ephemeral=True,
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható."
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
-
         # 1) Ügyfél megkeresése
-        client = clients_storage.get_client_by_name(client_name.strip())
+        client = await asyncio.to_thread(
+            clients_storage.get_client_by_name, client_name.strip()
+        )
         if client is None:
             await interaction.followup.send(
                 f"Nem található ügyfél: **{client_name}**"
@@ -193,7 +203,9 @@ class AssignmentsCog(commands.Cog):
             return
 
         # 2) Felhasználó DB azonosítója
-        user_row = users_storage.get_user_by_discord_id(str(manager.id))
+        user_row = await asyncio.to_thread(
+            users_storage.get_user_by_discord_id, str(manager.id)
+        )
         if user_row is None:
             await interaction.followup.send(
                 f"**{_display_name(manager)}** nincs a rendszerben — "
@@ -202,7 +214,8 @@ class AssignmentsCog(commands.Cog):
             return
 
         # 3) Hozzárendelés törlése
-        deleted = assignments_storage.delete_assignment(
+        deleted = await asyncio.to_thread(
+            assignments_storage.delete_assignment,
             user_id=user_row["id"],
             client_id=client["id"],
         )
@@ -215,9 +228,10 @@ class AssignmentsCog(commands.Cog):
             return
 
         # 4) Audit log
-        audit.log_action(
-            discord_user_id=str(interaction.user.id),
-            action="unassign",
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "unassign",
             entity_type="assignment",
             details={
                 "client_id": client["id"],
@@ -246,7 +260,9 @@ class AssignmentsCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         # Felhasználó keresése (ha még nincs a rendszerben → üres lista)
-        user_row = users_storage.get_user_by_discord_id(str(interaction.user.id))
+        user_row = await asyncio.to_thread(
+            users_storage.get_user_by_discord_id, str(interaction.user.id)
+        )
         if user_row is None:
             await interaction.followup.send(
                 "Még nincs hozzárendelésed. Kérj meg egy kollégát, "
@@ -254,7 +270,9 @@ class AssignmentsCog(commands.Cog):
             )
             return
 
-        rows = assignments_storage.get_clients_for_user(user_row["id"])
+        rows = await asyncio.to_thread(
+            assignments_storage.get_clients_for_user, user_row["id"]
+        )
 
         if not rows:
             await interaction.followup.send(

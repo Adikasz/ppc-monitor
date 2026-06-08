@@ -9,8 +9,13 @@ Három parancsot ad ebben a lépésben:
 Az írási műveletek (add) az admin csatornára vannak korlátozva
 (`DISCORD_ADMIN_CHANNEL_ID`). Ha az env nincs beállítva, a korlátozás kikapcsol
 — ez fejlesztési placeholder, élesben kötelező lesz a beállítása.
+
+Megjegyzés:
+  - Minden Supabase hívás asyncio.to_thread()-ben fut, hogy ne blokkolja az event loop-ot.
 """
 from __future__ import annotations
+
+import asyncio
 
 import discord
 from discord import app_commands
@@ -51,7 +56,8 @@ class ClientsCog(commands.GroupCog, group_name="clients"):
     @app_commands.command(name="list", description="Aktív ügyfelek listázása")
     async def list_(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
-        rows = clients_storage.list_clients()
+
+        rows = await asyncio.to_thread(clients_storage.list_clients)
         if not rows:
             await interaction.followup.send("Nincs aktív ügyfél.")
             return
@@ -69,7 +75,8 @@ class ClientsCog(commands.GroupCog, group_name="clients"):
     @app_commands.describe(client_id="Az ügyfél numerikus azonosítója")
     async def info(self, interaction: discord.Interaction, client_id: int) -> None:
         await interaction.response.defer(ephemeral=True)
-        c = clients_storage.get_client(client_id)
+
+        c = await asyncio.to_thread(clients_storage.get_client, client_id)
         if c is None:
             await interaction.followup.send(f"Nincs ilyen ügyfél: #{client_id}")
             return
@@ -93,28 +100,29 @@ class ClientsCog(commands.GroupCog, group_name="clients"):
     )
     @app_commands.describe(name="Az ügyfél neve (egyedi)")
     async def add(self, interaction: discord.Interaction, name: str) -> None:
+        # ELSŐ sor: defer — azonnal jelzi Discordnak, hogy dolgozunk
+        await interaction.response.defer(ephemeral=True)
+
         if not _is_admin_channel(interaction):
-            await interaction.response.send_message(
-                "Ez a parancs csak az admin csatornában használható.",
-                ephemeral=True,
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható."
             )
             return
 
         name = name.strip()
         if not name:
-            await interaction.response.send_message(
-                "A név nem lehet üres.", ephemeral=True
+            await interaction.followup.send("A név nem lehet üres.")
+            return
+
+        existing = await asyncio.to_thread(clients_storage.get_client_by_name, name)
+        if existing:
+            await interaction.followup.send(
+                f"Már létezik ügyfél ezzel a névvel: **{name}**"
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
-
-        if clients_storage.get_client_by_name(name):
-            await interaction.followup.send(f"Már létezik ügyfél ezzel a névvel: **{name}**")
-            return
-
         try:
-            row = clients_storage.create_client(name)
+            row = await asyncio.to_thread(clients_storage.create_client, name)
         except Exception as exc:  # noqa: BLE001 — felhasználói visszajelzéshez kell
             log.exception("Hiba az ügyfél létrehozásakor (%s)", name)
             await interaction.followup.send(f"Hiba a létrehozáskor: `{exc}`")
