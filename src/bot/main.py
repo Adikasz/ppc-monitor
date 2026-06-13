@@ -20,6 +20,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from src.config import get_config
+from src.monitoring.scheduler import start_scheduler
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -75,6 +76,13 @@ def build_bot() -> commands.Bot:
             bot.user, bot.user.id if bot.user else "?",
         )
         log.info("Csatlakozott szerverek: %s", guilds)
+
+        # Monitoring scheduler indítása (óránkénti anomália-ciklus).
+        # on_ready reconnectkor újra lefuthat — a start_scheduler idempotens.
+        try:
+            start_scheduler()
+        except Exception:
+            log.exception("Monitoring scheduler indítása sikertelen")
 
     @bot.tree.error
     async def on_app_command_error(

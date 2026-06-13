@@ -1,0 +1,155 @@
+"""
+Monitoring scheduler — óránkénti anomália-ciklus (APScheduler).
+
+A bot event loopjában futó AsyncIOScheduler óránként (minden óra :00-kor)
+végigfut az aktívan monitorozott kampányokon:
+
+    1. Lekéri a kampány aktuális metrikáit (get_campaign_metrics — STUB a 9.
+       lépésig, ott jön a valódi Meta/Google API hívás).
+    2. A detektorral kiértékeli az anomáliákat.
+    3. A talált anomáliákat alertként beszúrja (deduplikációval).
+
+Indítás:
+    A botban (src.bot.main on_ready) a `start_scheduler()` hívja meg, egyszer.
+
+Hibatűrés:
+    Egy kampány hibája nem állítja le a ciklust — logoljuk és megyünk tovább.
+"""
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from src.config import get_config
+from src.monitoring.detector import detect_anomalies_for_campaign
+from src.storage.alerts import insert_alert
+from src.storage.supabase_client import get_supabase
+from src.utils.logging import get_logger
+
+log = get_logger(__name__)
+
+_scheduler: AsyncIOScheduler | None = None
+
+
+# ---------------------------------------------------------------------------
+# Metrics — STUB (9. lépésben valódi Meta/Google API hívásra cseréljük)
+# ---------------------------------------------------------------------------
+
+def get_campaign_metrics(campaign: dict[str, Any]) -> dict[str, Any]:
+    """A kampány aktuális metrikái.
+
+    TBD — 9. lépés: a kampány platformja (meta/google) szerint a megfelelő
+    API kliens (MetaAdsClient.get_campaign_insights / GoogleAdsClient.
+    get_campaign_metrics) hívása. Addig nulla-placeholder, ami a detektorban
+    semmilyen anomáliát nem vált ki (impressions=0 ÉS spend=0 → nincs jelzés).
+    """
+    return {
+        "impressions": 0,
+        "clicks": 0,
+        "spend": 0.0,
+        "conversions": 0.0,
+        "conversion_value": 0.0,
+        "ctr": 0.0,
+        "cpc": 0.0,
+        "cpa": 0.0,
+        "roas": 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Óránkénti ciklus
+# ---------------------------------------------------------------------------
+
+def _fetch_monitored_campaigns() -> list[dict[str, Any]]:
+    """Aktívan monitorozott kampányok (is_monitored, nem paused/ended)."""
+    return (
+        get_supabase()
+        .table("campaigns")
+        .select("*")
+        .eq("is_monitored", True)
+        .neq("lifecycle_state", "paused")
+        .neq("lifecycle_state", "ended")
+        .execute()
+        .data
+        or []
+    )
+
+
+async def hourly_monitoring() -> None:
+    """Egy monitoring ciklus: minden aktív kampány kiértékelése + alertek."""
+    log.info("Monitoring ciklus indítva…")
+
+    try:
+        campaigns = await asyncio.to_thread(_fetch_monitored_campaigns)
+    except Exception:
+        log.exception("Monitoring: a kampánylista lekérése sikertelen — ciklus kihagyva")
+        return
+
+    new_alerts = 0
+    for campaign in campaigns:
+        cid = campaign.get("id")
+        try:
+            insights = get_campaign_metrics(campaign)
+            anomalies = await detect_anomalies_for_campaign(cid, insights)
+            for a in anomalies:
+                inserted = await asyncio.to_thread(
+                    insert_alert,
+                    a["campaign_id"],
+                    a["severity"],
+                    a["metric"],
+                    a.get("observed_value"),
+                    a.get("threshold_value"),
+                    a["message"],
+                )
+                if inserted:
+                    new_alerts += 1
+        except Exception as exc:  # noqa: BLE001 — egy kampány hibája ne állítsa le a ciklust
+            log.error("Monitoring: kampány #%s hiba: %s", cid, exc)
+
+    log.info(
+        "Monitoring ciklus kész: %d kampány feldolgozva, %d új alert",
+        len(campaigns), new_alerts,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scheduler életciklus
+# ---------------------------------------------------------------------------
+
+def start_scheduler() -> AsyncIOScheduler:
+    """Létrehozza és elindítja az óránkénti monitoring schedulert.
+
+    Idempotens: ha már fut, a meglévő példányt adja vissza (az on_ready
+    többször is lefuthat reconnectkor, ezért védjük a dupla indítás ellen).
+    A scheduler a hívó (bot) futó event loopjához kötődik.
+    """
+    global _scheduler
+    if _scheduler is not None and _scheduler.running:
+        return _scheduler
+
+    timezone = get_config().timezone or "UTC"
+    _scheduler = AsyncIOScheduler(timezone=timezone)
+    # 'cron' minden óra :00 perckor (hour='*', minute=0)
+    _scheduler.add_job(
+        hourly_monitoring,
+        trigger="cron",
+        minute=0,
+        id="hourly_monitoring",
+        replace_existing=True,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1,
+    )
+    _scheduler.start()
+    log.info("Monitoring scheduler indítva (óránkénti ciklus, tz=%s)", timezone)
+    return _scheduler
+
+
+def shutdown_scheduler() -> None:
+    """Scheduler leállítása (teszteléshez / graceful shutdownhoz)."""
+    global _scheduler
+    if _scheduler is not None and _scheduler.running:
+        _scheduler.shutdown(wait=False)
+    _scheduler = None
