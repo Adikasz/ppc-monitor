@@ -1,22 +1,26 @@
 """
-Kampány auto-discovery — Meta Ads.
+Kampány auto-discovery — Meta Ads + Google Ads (egységes).
 
-A discovery lekéri az ügyfél Meta hirdetési fiókjaihoz tartozó összes
-kampányt a Meta API-ból, majd szinkronizálja a `campaigns` táblával:
+A discovery lekéri az ügyfél hirdetési fiókjaihoz (Meta ÉS Google) tartozó
+összes kampányt a platform API-ból, majd szinkronizálja a `campaigns` táblával:
 
-  NEW campaign   → INSERT (discovered_at = now, is_monitored = true)
+  NEW campaign   → INSERT (lifecycle_state='new', is_monitored=true)
   EXISTING       → UPDATE (platform_status, last_seen_at)
-  NOT SEEN 24h   → soft delete (is_monitored = false)
+  NOT SEEN 24h   → soft delete (is_monitored=false)
 
 Szinkronizálási logika:
-  1. Ügyfélhez rendelt Meta ad_accounts lekérdezése (ad_accounts tábla)
-  2. Mindegyik fiókra: Meta API-ból kampányok lekérése
+  1. Ügyfélhez rendelt aktív ad_accounts lekérdezése (Meta + Google)
+  2. Mindegyik fiókra: a platformnak megfelelő API-ból kampányok lekérése,
+     közös formátumra normalizálva
   3. DB upsert: új kampány INSERT, meglévő UPDATE (status + last_seen_at)
   4. Stale kampányok (24+ óra nem látott) soft-delete
 
-Hibakezelés:
-  - Egy fiók API hibája NEM állítja le a teljes discovery-t;
-    a hiba az errors listába kerül, a többi fiók folytatódik.
+Hibakezelés (fault isolation):
+  - Egy platform kliens inicializálási hibája (pl. hiányzó Google token vagy
+    nem telepített SDK) csak az adott platform fiókjait érinti — a másik
+    platform discovery-je fut tovább.
+  - Egy fiók API hibája NEM állítja le a teljes discovery-t; a hiba az errors
+    listába kerül, a többi fiók folytatódik.
   - DB hiba esetén az adott kampány hibája logolva, discovery folytatódik.
 
 Visszatérési érték:
@@ -32,6 +36,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from src.integrations.google_ads import GoogleAdsClient
 from src.integrations.meta_ads import MetaAdsClient
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import campaigns as campaigns_storage
@@ -45,7 +50,7 @@ _STALE_HOURS = 24
 
 
 def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
-    """Kampány-discovery egy ügyfél összes Meta ad accountjára.
+    """Kampány-discovery egy ügyfél összes (Meta + Google) ad accountjára.
 
     Paraméterek:
         client_id — ügyfél belső DB ID-ja
@@ -55,7 +60,7 @@ def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
             "inserted":    int,      — DB-be újonnan felvett kampányok
             "updated":     int,      — frissített kampányok (status, last_seen_at)
             "deactivated": int,      — soft-deleted (24h+ nem látott) kampányok
-            "errors":      list,     — [{"account": "act_xxx", "error": "..."}]
+            "errors":      list,     — [{"account": "...", "error": "..."}]
         }
     """
     result: dict[str, Any] = {
@@ -65,51 +70,75 @@ def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
         "errors": [],
     }
 
-    # 1) Meta ad_accountok lekérdezése ehhez az ügyfélhez
+    # 1) Összes aktív ad_account (Meta + Google) ehhez az ügyfélhez
     accounts = ad_accounts_storage.get_ad_accounts_for_client(
         client_id,
-        platform="meta",
+        platform=None,
         active_only=True,
     )
     if not accounts:
         log.info(
-            "Discovery: nincs aktív Meta ad_account ehhez az ügyfélhez (client_id=%s)",
+            "Discovery: nincs aktív ad_account ehhez az ügyfélhez (client_id=%s)",
             client_id,
         )
         return result
 
     log.info(
-        "Discovery indítva: client_id=%s, %d Meta fiók",
+        "Discovery indítva: client_id=%s, %d fiók (Meta + Google)",
         client_id, len(accounts),
     )
-
-    # Meta kliens (singleton)
-    try:
-        meta_client = MetaAdsClient.get_instance()
-    except RuntimeError as exc:
-        log.error("MetaAdsClient inicializálási hiba: %s", exc)
-        result["errors"].append({"account": "all", "error": str(exc)})
-        return result
 
     now = datetime.now(timezone.utc)
     stale_cutoff = now - timedelta(hours=_STALE_HOURS)
 
+    # Platform-kliensek lazy cache + init-hiba jegyzék.
+    # Egy platform kliensét csak akkor (és csak egyszer) inicializáljuk, ha van
+    # hozzá fiók. Ha az init elhasal, a platform összes fiókját kihagyjuk.
+    client_cache: dict[str, Any] = {}
+    failed_platforms: dict[str, str] = {}
+
     for account in accounts:
+        platform: str = account["platform"]
         ext_account_id: str = account["external_account_id"]
         db_account_id: int = account["id"]
 
+        # Platform kliens előállítása (cache-elve, init-hiba platformonként egyszer)
+        if platform in failed_platforms:
+            result["errors"].append({
+                "account": ext_account_id,
+                "error": failed_platforms[platform],
+            })
+            continue
+
+        if platform not in client_cache:
+            try:
+                client_cache[platform] = _make_platform_client(platform)
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "Discovery: %s kliens inicializálási hiba: %s",
+                    platform, exc,
+                )
+                failed_platforms[platform] = str(exc)
+                result["errors"].append({
+                    "account": ext_account_id,
+                    "error": str(exc),
+                })
+                continue
+
+        client = client_cache[platform]
+
         log.info(
-            "Discovery: fiók=%s (db_id=%s) feldolgozása…",
-            ext_account_id, db_account_id,
+            "Discovery: fiók=%s (%s, db_id=%s) feldolgozása…",
+            ext_account_id, platform, db_account_id,
         )
 
-        # 2) Meta API hívás
+        # 2) Platform API hívás → közös formátumú kampánylista
         try:
-            api_campaigns = meta_client.get_campaigns(ext_account_id)
+            api_campaigns = _fetch_campaigns(platform, client, ext_account_id)
         except Exception as exc:  # noqa: BLE001
             log.error(
-                "Discovery: API hiba fiók=%s: %s",
-                ext_account_id, exc,
+                "Discovery: API hiba fiók=%s (%s): %s",
+                ext_account_id, platform, exc,
             )
             result["errors"].append({
                 "account": ext_account_id,
@@ -121,7 +150,7 @@ def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
 
         # 3) Upsert: minden API kampányra
         for api_c in api_campaigns:
-            ext_campaign_id: str = api_c["id"]
+            ext_campaign_id: str = api_c["ext_campaign_id"]
             api_campaign_ids.add(ext_campaign_id)
 
             try:
@@ -163,7 +192,61 @@ def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Belső segédfüggvények
+# Platform-absztrakció
+# ---------------------------------------------------------------------------
+
+def _make_platform_client(platform: str) -> Any:
+    """Platform-specifikus API kliens (singleton) előállítása.
+
+    Raises:
+        RuntimeError — hiányzó token / nem telepített SDK (a kliens dobja)
+        ValueError   — ismeretlen platform
+    """
+    if platform == "meta":
+        return MetaAdsClient.get_instance()
+    if platform == "google":
+        return GoogleAdsClient.get_instance()
+    raise ValueError(f"Ismeretlen platform: {platform!r}")
+
+
+def _fetch_campaigns(
+    platform: str,
+    client: Any,
+    ext_account_id: str,
+) -> list[dict[str, Any]]:
+    """Platform API kampányhívás + normalizálás közös formátumra.
+
+    Közös (platform-független) formátum:
+        {"ext_campaign_id": str, "name": str, "status": str}
+
+    A Meta a "id"/"created_time", a Google a "external_campaign_id"/"created_at"
+    kulcsokat adja vissza — ez a függvény egységesíti őket a discovery számára.
+    """
+    if platform == "meta":
+        raw = client.get_campaigns(ext_account_id)
+        return [
+            {
+                "ext_campaign_id": str(c["id"]),
+                "name": c["name"],
+                "status": c.get("status", "UNKNOWN"),
+            }
+            for c in raw
+        ]
+    if platform == "google":
+        raw = client.get_campaigns(ext_account_id)
+        return [
+            {
+                "ext_campaign_id": str(c["external_campaign_id"]),
+                "name": c["name"],
+                "status": c.get("status", "UNKNOWN"),
+            }
+            for c in raw
+        ]
+    raise ValueError(f"Ismeretlen platform: {platform!r}")
+
+
+# ---------------------------------------------------------------------------
+# Belső segédfüggvények (DB szinkron)
 # ---------------------------------------------------------------------------
 
 def _upsert_campaign(
@@ -173,7 +256,7 @@ def _upsert_campaign(
     now: datetime,
     result: dict[str, Any],
 ) -> None:
-    """Egy Meta kampány INSERT vagy UPDATE a DB-be."""
+    """Egy kampány INSERT vagy UPDATE a DB-be (platform-független)."""
     sb = get_supabase()
 
     # Létezik-e már?

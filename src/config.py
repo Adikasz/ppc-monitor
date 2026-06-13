@@ -31,6 +31,18 @@ def _optional(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
+def _optional_or_none(key: str) -> str | None:
+    """Opcionális változó, ami None ha nincs beállítva (üres string is None).
+
+    A Google Ads mezőknél használjuk: ha nincs token, a kliens egyértelmű
+    None-t lát (nem üres stringet), és warning + RuntimeError úton kezeli.
+    """
+    raw = os.getenv(key)
+    if raw is None or raw.strip() == "":
+        return None
+    return raw.strip()
+
+
 def _int(key: str, default: int) -> int:
     raw = os.getenv(key)
     if raw is None or raw.strip() == "":
@@ -59,11 +71,12 @@ class Config:
     meta_access_token: str
 
     # ---- Google Ads ----
-    google_ads_developer_token: str
-    google_ads_client_id: str
-    google_ads_client_secret: str
-    google_ads_refresh_token: str
-    google_ads_login_customer_id: str
+    # Opcionális — None ha nincs beállítva (a tokenek később jönnek).
+    google_ads_developer_token: str | None
+    google_ads_client_id: str | None
+    google_ads_client_secret: str | None
+    google_ads_refresh_token: str | None
+    google_ads_login_customer_id: str | None
 
     # ---- ClickUp ----
     clickup_api_token: str
@@ -101,11 +114,11 @@ class Config:
             meta_app_secret=_optional("META_APP_SECRET"),
             meta_access_token=_optional("META_ACCESS_TOKEN"),
 
-            google_ads_developer_token=_optional("GOOGLE_ADS_DEVELOPER_TOKEN"),
-            google_ads_client_id=_optional("GOOGLE_ADS_CLIENT_ID"),
-            google_ads_client_secret=_optional("GOOGLE_ADS_CLIENT_SECRET"),
-            google_ads_refresh_token=_optional("GOOGLE_ADS_REFRESH_TOKEN"),
-            google_ads_login_customer_id=_optional("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
+            google_ads_developer_token=_optional_or_none("GOOGLE_ADS_DEVELOPER_TOKEN"),
+            google_ads_client_id=_optional_or_none("GOOGLE_ADS_CLIENT_ID"),
+            google_ads_client_secret=_optional_or_none("GOOGLE_ADS_CLIENT_SECRET"),
+            google_ads_refresh_token=_optional_or_none("GOOGLE_ADS_REFRESH_TOKEN"),
+            google_ads_login_customer_id=_optional_or_none("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
 
             clickup_api_token=_optional("CLICKUP_API_TOKEN"),
             clickup_team_id=_optional("CLICKUP_TEAM_ID"),
