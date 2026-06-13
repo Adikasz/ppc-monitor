@@ -20,6 +20,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from src.config import get_config
+from src.integrations.discord_router import set_client
 from src.monitoring.scheduler import start_scheduler
 from src.utils.logging import get_logger
 
@@ -31,6 +32,7 @@ _EXTENSIONS: tuple[str, ...] = (
     "src.bot.commands.clients",
     "src.bot.commands.assignments",
     "src.bot.commands.campaigns",
+    "src.bot.commands.alerts",
 )
 
 
@@ -76,6 +78,9 @@ def build_bot() -> commands.Bot:
             bot.user, bot.user.id if bot.user else "?",
         )
         log.info("Csatlakozott szerverek: %s", guilds)
+
+        # Az alert-router Discord kliensének bekötése (riasztás-kiküldéshez).
+        set_client(bot)
 
         # Monitoring scheduler indítása (óránkénti anomália-ciklus).
         # on_ready reconnectkor újra lefuthat — a start_scheduler idempotens.

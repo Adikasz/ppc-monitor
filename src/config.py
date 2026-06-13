@@ -60,6 +60,10 @@ class Config:
     discord_bot_token: str
     discord_guild_id: str
     discord_admin_channel_id: str
+    # Alert-routing csatornák (opcionálisak — ha üres, az adott szintű alert
+    # Discord-küldése kimarad warning-gal)
+    discord_critical_alerts_channel_id: str
+    discord_monitoring_summary_channel_id: str
 
     # ---- Anthropic ----
     anthropic_api_key: str
@@ -82,6 +86,7 @@ class Config:
     clickup_api_token: str
     clickup_team_id: str
     clickup_default_list_id: str
+    clickup_anomalies_list_id: str          # "Anomalies" lista — CRITICAL taskokhoz
 
     # ---- Általános ----
     timezone: str
@@ -105,6 +110,8 @@ class Config:
             discord_bot_token=_required("DISCORD_BOT_TOKEN"),
             discord_guild_id=_required("DISCORD_GUILD_ID"),
             discord_admin_channel_id=_optional("DISCORD_ADMIN_CHANNEL_ID"),
+            discord_critical_alerts_channel_id=_optional("DISCORD_CRITICAL_ALERTS_CHANNEL_ID"),
+            discord_monitoring_summary_channel_id=_optional("DISCORD_MONITORING_SUMMARY_CHANNEL_ID"),
 
             # Opcionális fejlesztés közben (mock adatok mellett)
             anthropic_api_key=_optional("ANTHROPIC_API_KEY"),
@@ -123,6 +130,7 @@ class Config:
             clickup_api_token=_optional("CLICKUP_API_TOKEN"),
             clickup_team_id=_optional("CLICKUP_TEAM_ID"),
             clickup_default_list_id=_optional("CLICKUP_DEFAULT_LIST_ID"),
+            clickup_anomalies_list_id=_optional("CLICKUP_ANOMALIES_LIST_ID"),
 
             timezone=_optional("TIMEZONE", "Europe/Budapest"),
             quiet_hours_start=_int("QUIET_HOURS_START", 18),

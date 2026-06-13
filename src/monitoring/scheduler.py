@@ -25,6 +25,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from src.config import get_config
 from src.monitoring.detector import detect_anomalies_for_campaign
 from src.monitoring.metrics import get_campaign_metrics
+from src.monitoring.router import route_alert
 from src.storage.alerts import insert_alert
 from src.storage.insights import insert_campaign_insight, prune_old_insights
 from src.storage.supabase_client import get_supabase
@@ -83,10 +84,10 @@ async def hourly_monitoring() -> None:
             # 2) Insight perzisztálás (óránként egy sor kampányonként)
             await asyncio.to_thread(insert_campaign_insight, cid, insights)
 
-            # 3) Anomália-detektálás + alertek
+            # 3) Anomália-detektálás + alertek + routing
             anomalies = await detect_anomalies_for_campaign(cid, insights)
             for a in anomalies:
-                inserted = await asyncio.to_thread(
+                alert_row = await asyncio.to_thread(
                     insert_alert,
                     a["campaign_id"],
                     a["severity"],
@@ -95,8 +96,16 @@ async def hourly_monitoring() -> None:
                     a.get("threshold_value"),
                     a["message"],
                 )
-                if inserted:
+                if alert_row:
                     new_alerts += 1
+                    # ROUTING — kiküldés a megfelelő csatornákra (Discord/ClickUp)
+                    try:
+                        await route_alert(alert_row)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error(
+                            "Monitoring: routing hiba (alert #%s): %s",
+                            alert_row.get("id"), exc,
+                        )
         except Exception as exc:  # noqa: BLE001 — egy kampány hibája ne állítsa le a ciklust
             log.error("Monitoring: kampány #%s hiba: %s", cid, exc)
 

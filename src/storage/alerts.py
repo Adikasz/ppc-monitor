@@ -16,7 +16,8 @@ Függvények:
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
+from typing import Any
 
 from src.storage.supabase_client import get_supabase
 from src.utils.logging import get_logger
@@ -33,7 +34,7 @@ def insert_alert(
     observed_value: float | None,
     threshold_value: float | None,
     message: str,
-) -> bool:
+) -> dict[str, Any] | None:
     """Egy riasztás beszúrása az alerts táblába, deduplikációval.
 
     Deduplikáció:
@@ -55,8 +56,8 @@ def insert_alert(
         message         — emberi olvasható üzenet
 
     Visszatérés:
-        True  — új riasztás beszúrva
-        False — már létezett ma ugyanerre (dedup), nem szúrtunk be
+        a beszúrt alert sor (dict) — új riasztás esetén (a router ezt kapja)
+        None                        — már létezett ma ugyanerre (dedup)
     """
     dedup_key = f"{campaign_id}_{metric}_{date.today().isoformat()}"
     sb = get_supabase()
@@ -71,7 +72,7 @@ def insert_alert(
     )
     if existing.data:
         log.debug("Alert dedup — ma már létezik: %s", dedup_key)
-        return False
+        return None
 
     payload = {
         "campaign_id": campaign_id,
@@ -83,9 +84,36 @@ def insert_alert(
         "status": "pending",
         "dedup_key": dedup_key,
     }
-    sb.table(_TABLE).insert(payload).execute()
+    res = sb.table(_TABLE).insert(payload).execute()
+    row = res.data[0] if res.data else None
     log.info(
         "Új alert: %s (severity=%s, metric=%s, campaign=%s)",
         dedup_key, severity, metric, campaign_id,
     )
-    return True
+    return row
+
+
+def mark_alert_routed(
+    alert_id: int,
+    *,
+    discord_message_id: str | None = None,
+    clickup_task_id: str | None = None,
+    routed_to_discord_user_id: str | None = None,
+) -> None:
+    """Az alert megjelölése elküldöttként (a router hívja sikeres kiküldés után).
+
+    Beállítja: status='sent', sent_at=now, és (ha van) a Discord üzenet /
+    ClickUp task / címzett azonosítókat.
+    """
+    payload: dict[str, Any] = {
+        "status": "sent",
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if discord_message_id:
+        payload["discord_message_id"] = discord_message_id
+    if clickup_task_id:
+        payload["clickup_task_id"] = clickup_task_id
+    if routed_to_discord_user_id:
+        payload["routed_to_discord_user_id"] = routed_to_discord_user_id
+
+    get_supabase().table(_TABLE).update(payload).eq("id", alert_id).execute()
