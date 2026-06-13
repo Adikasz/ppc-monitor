@@ -2,15 +2,15 @@
 KPI (campaign_kpis tábla) adathozzáférés.
 
 A KPI-ok verziózottak: minden `set_kpis` hívás EGY ÚJ sort szúr be
-(INSERT, nem UPDATE). A legújabb aktív sor az, amelyiknek `valid_to` NULL.
-Az előző aktív sort lezárja a `set_kpis` (valid_to = NOW()), így megmarad
+(INSERT, nem UPDATE). A legújabb aktív sor az, amelynek `is_active` = true.
+Az előző aktív sort a `set_kpis` lezárja (is_active = false), így megmarad
 a historikus változáskövetés.
 
 Struktúra (campaign_kpis tábla legfontosabb mezői):
     id                         — DB PK
     campaign_id                — FK campaigns.id
-    valid_from                 — mikor lett aktív ez a KPI-verzió
-    valid_to                   — NULL = jelenleg aktív; kitöltve = archivált
+    is_active                  — true = jelenleg aktív verzió; false = archivált
+    created_at                 — mikor jött létre ez a KPI-verzió
     target_roas                — célzott ROAS (%)
     max_cpa                    — max CPA (Ft)
     max_cpl                    — max CPL (Ft, lead kampányhoz)
@@ -39,7 +39,7 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 def get_active_kpis(campaign_id: int) -> dict[str, Any] | None:
-    """Az aktuálisan érvényes KPI-sor lekérdezése (valid_to IS NULL).
+    """Az aktuálisan érvényes KPI-sor lekérdezése (is_active = true).
 
     Visszatér None-nal ha a kampányhoz még nincs beállítva KPI.
     """
@@ -48,8 +48,8 @@ def get_active_kpis(campaign_id: int) -> dict[str, Any] | None:
         .table(_TABLE)
         .select("*")
         .eq("campaign_id", campaign_id)
-        .is_("valid_to", "null")
-        .order("valid_from", desc=True)
+        .eq("is_active", True)
+        .order("created_at", desc=True)
         .limit(1)
         .execute()
     )
@@ -66,7 +66,7 @@ def get_kpi_history(campaign_id: int) -> list[dict[str, Any]]:
         .table(_TABLE)
         .select("*")
         .eq("campaign_id", campaign_id)
-        .order("valid_from", desc=True)
+        .order("created_at", desc=True)
         .execute()
     )
     return res.data or []
@@ -93,8 +93,8 @@ def set_kpis(
     """KPI beállítása verziózással.
 
     Működés:
-        1. A meglévő aktív sort (valid_to IS NULL) lezárja: valid_to = NOW()
-        2. Új sort szúr be a megadott értékekkel (valid_to NULL = aktív)
+        1. A meglévő aktív sort (is_active = true) lezárja: is_active = false
+        2. Új sort szúr be a megadott értékekkel (is_active = true = aktív)
 
     Ha nincs meglévő aktív sor, csak az INSERT fut le — ez az első beállítás.
 
@@ -108,14 +108,14 @@ def set_kpis(
     # 1) Lezárjuk a jelenlegi aktív verziót (ha van)
     existing = get_active_kpis(campaign_id)
     if existing:
-        sb.table(_TABLE).update({"valid_to": "now()"}).eq("id", existing["id"]).execute()
+        sb.table(_TABLE).update({"is_active": False}).eq("id", existing["id"]).execute()
         log.info(
             "KPI verzió lezárva: campaign_id=%s, kpi_id=%s",
             campaign_id, existing["id"],
         )
 
-    # 2) Új verzió INSERT
-    payload: dict[str, Any] = {"campaign_id": campaign_id}
+    # 2) Új verzió INSERT (is_active = true = ez lesz az aktív)
+    payload: dict[str, Any] = {"campaign_id": campaign_id, "is_active": True}
 
     _optional_fields = {
         "target_roas": target_roas,

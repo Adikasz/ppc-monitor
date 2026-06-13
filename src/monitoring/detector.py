@@ -35,11 +35,6 @@ Visszatérés (lista, üres ha nincs anomália):
         "threshold_value": float,
         "message":         str,        # emberi olvasható
     }, ...]
-
-Megjegyzés a KPI-lekérésről:
-    A `kpis.get_active_kpis()` jelenleg a nem létező valid_to/valid_from
-    oszlopokra hivatkozik (DB-séma eltérés), ezért ITT saját, a valós sémához
-    (is_active + created_at) igazodó lekérést használunk (_get_active_kpis).
 """
 from __future__ import annotations
 
@@ -48,6 +43,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from src.storage import campaigns as campaigns_storage
+from src.storage import kpis as kpis_storage
 from src.storage.supabase_client import get_supabase
 from src.utils.logging import get_logger
 
@@ -92,7 +88,7 @@ async def detect_anomalies_for_campaign(
         return []
 
     # 2) Aktív KPI-k (lehet None, ha még nincs beállítva — a szabályok kezelik)
-    kpis = await asyncio.to_thread(_get_active_kpis, campaign_id) or {}
+    kpis = await asyncio.to_thread(kpis_storage.get_active_kpis, campaign_id) or {}
 
     only_critical = lifecycle in _CRITICAL_ONLY_LIFECYCLE
 
@@ -271,22 +267,3 @@ def _before_data_valid_from(campaign: dict[str, Any]) -> bool:
     except ValueError:
         return False
     return date.today() < valid_from
-
-
-def _get_active_kpis(campaign_id: int) -> dict[str, Any] | None:
-    """Aktuális KPI-sor a valós séma szerint (is_active + created_at desc).
-
-    Szándékosan NEM a kpis.get_active_kpis()-t hívja, mert az a nem létező
-    valid_to oszlopra hivatkozik (lásd modul-docstring).
-    """
-    res = (
-        get_supabase()
-        .table("campaign_kpis")
-        .select("*")
-        .eq("campaign_id", campaign_id)
-        .eq("is_active", True)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    return res.data[0] if res.data else None
