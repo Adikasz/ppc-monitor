@@ -24,38 +24,15 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from src.config import get_config
 from src.monitoring.detector import detect_anomalies_for_campaign
+from src.monitoring.metrics import get_campaign_metrics
 from src.storage.alerts import insert_alert
+from src.storage.insights import insert_campaign_insight, prune_old_insights
 from src.storage.supabase_client import get_supabase
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
 _scheduler: AsyncIOScheduler | None = None
-
-
-# ---------------------------------------------------------------------------
-# Metrics — STUB (9. lépésben valódi Meta/Google API hívásra cseréljük)
-# ---------------------------------------------------------------------------
-
-def get_campaign_metrics(campaign: dict[str, Any]) -> dict[str, Any]:
-    """A kampány aktuális metrikái.
-
-    TBD — 9. lépés: a kampány platformja (meta/google) szerint a megfelelő
-    API kliens (MetaAdsClient.get_campaign_insights / GoogleAdsClient.
-    get_campaign_metrics) hívása. Addig nulla-placeholder, ami a detektorban
-    semmilyen anomáliát nem vált ki (impressions=0 ÉS spend=0 → nincs jelzés).
-    """
-    return {
-        "impressions": 0,
-        "clicks": 0,
-        "spend": 0.0,
-        "conversions": 0.0,
-        "conversion_value": 0.0,
-        "ctr": 0.0,
-        "cpc": 0.0,
-        "cpa": 0.0,
-        "roas": 0.0,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +65,25 @@ async def hourly_monitoring() -> None:
         return
 
     new_alerts = 0
+    fetched = 0
     for campaign in campaigns:
         cid = campaign.get("id")
         try:
-            insights = get_campaign_metrics(campaign)
+            # 1) Valódi metrikák (Meta/Google). None → nem elérhető, skip.
+            insights = await get_campaign_metrics(campaign)
+            if not insights:
+                log.warning("Monitoring: #%s metrics nem elérhető — kihagyva", cid)
+                continue
+            fetched += 1
+            log.info(
+                "Monitoring: #%s metrics OK (impr=%s, spend=%s, conv=%s)",
+                cid, insights["impressions"], insights["spend"], insights["conversions"],
+            )
+
+            # 2) Insight perzisztálás (óránként egy sor kampányonként)
+            await asyncio.to_thread(insert_campaign_insight, cid, insights)
+
+            # 3) Anomália-detektálás + alertek
             anomalies = await detect_anomalies_for_campaign(cid, insights)
             for a in anomalies:
                 inserted = await asyncio.to_thread(
@@ -108,9 +100,15 @@ async def hourly_monitoring() -> None:
         except Exception as exc:  # noqa: BLE001 — egy kampány hibája ne állítsa le a ciklust
             log.error("Monitoring: kampány #%s hiba: %s", cid, exc)
 
+    # History-karbantartás: 1 hétnél régebbi insightok törlése
+    try:
+        await asyncio.to_thread(prune_old_insights, 7)
+    except Exception:  # noqa: BLE001
+        log.exception("Monitoring: insight prune hiba")
+
     log.info(
-        "Monitoring ciklus kész: %d kampány feldolgozva, %d új alert",
-        len(campaigns), new_alerts,
+        "Monitoring ciklus kész: %d kampány, %d metrics OK, %d új alert",
+        len(campaigns), fetched, new_alerts,
     )
 
 

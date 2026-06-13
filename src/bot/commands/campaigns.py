@@ -37,6 +37,7 @@ from src.config import get_config
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import campaigns as campaigns_storage
 from src.storage import clients as clients_storage
+from src.storage import insights as insights_storage
 from src.storage import kpis as kpis_storage
 from src.storage import users as users_storage
 from src.storage import audit
@@ -209,6 +210,24 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             embed.add_field(
                 name="📈 Aktív KPI-ok",
                 value="Még nincs beállítva — használd a `/campaign kpi` parancsot.",
+                inline=False,
+            )
+
+        # Legutóbbi mért metrikák (insights — a scheduler óránként frissíti)
+        insight = await asyncio.to_thread(insights_storage.get_latest_insight, campaign_id)
+        if insight:
+            ctr_pct = (insight.get("ctr") or 0) * 100
+            embed.add_field(
+                name="📊 Utolsó mért adatok",
+                value=(
+                    f"👁 Megjelenés: **{insight.get('impressions') or 0}** · "
+                    f"🖱 Kattintás: **{insight.get('clicks') or 0}**\n"
+                    f"💸 Költés: **{insight.get('spend') or 0} Ft** · "
+                    f"🎯 Konverzió: **{insight.get('conversions') or 0}**\n"
+                    f"CTR: {ctr_pct:.2f}% · CPC: {insight.get('cpc') or 0} Ft · "
+                    f"CPA: {insight.get('cpa') or 0} Ft · ROAS: {insight.get('roas') or 0}\n"
+                    f"*mérve: {str(insight.get('fetched_at'))[:16]}*"
+                ),
                 inline=False,
             )
 
