@@ -2,10 +2,9 @@
 Discord alert-küldő.
 
 A scheduler/alert-router ezen keresztül küld riasztásokat Discord csatornákra:
-  - CRITICAL → kritikus csatorna (config: DISCORD_CRITICAL_ALERTS_CHANNEL_ID),
-               a felelős AM-ek megemlítésével (mention)
-  - WARNING / egyéb → összefoglaló csatorna (DISCORD_MONITORING_SUMMARY_CHANNEL_ID),
-               mention nélkül
+  - MINDEN alert egyetlen csatornára megy (config: DISCORD_ALERTS_CHANNEL_ID)
+  - CRITICAL → a felelős AM-ek megemlítésével (mention)
+  - WARNING / egyéb → mention nélkül
 
 A küldéshez a FUTÓ bot kliensre van szükség — a bot indulásakor (main.py
 on_ready) a `set_client(bot)` köti be. Ha nincs kliens vagy nincs csatorna
@@ -79,8 +78,9 @@ async def send_discord_alert(
     severity = (alert.get("severity") or "warning").lower()
     config = get_config()
 
+    # Minden alert ugyanarra a csatornára megy (CRITICAL + WARNING + egyéb).
+    channel_id = config.discord_alerts_channel_id
     if severity == "critical":
-        channel_id = config.discord_critical_alerts_channel_id
         header_emoji, header_label = "🔴", "CRITICAL"
         mentions = " ".join(
             f"<@{r['discord_user_id']}>"
@@ -88,7 +88,6 @@ async def send_discord_alert(
             if r.get("discord_user_id")
         )
     else:
-        channel_id = config.discord_monitoring_summary_channel_id
         header_emoji = "🟡" if severity == "warning" else "🔵"
         header_label = severity.upper()
         mentions = ""  # WARNING/egyéb: nincs mention

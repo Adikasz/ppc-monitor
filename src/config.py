@@ -60,10 +60,10 @@ class Config:
     discord_bot_token: str
     discord_guild_id: str
     discord_admin_channel_id: str
-    # Alert-routing csatornák (opcionálisak — ha üres, az adott szintű alert
-    # Discord-küldése kimarad warning-gal)
-    discord_critical_alerts_channel_id: str
-    discord_monitoring_summary_channel_id: str
+    # Alert-routing csatorna — MINDEN alert (CRITICAL + WARNING + insight) ide megy.
+    # A betöltésnél opcionális (ha üres, a Discord-küldés warning-gal kimarad),
+    # de a routing tényleges működéséhez be kell állítani.
+    discord_alerts_channel_id: str
 
     # ---- Anthropic ----
     anthropic_api_key: str
@@ -110,8 +110,7 @@ class Config:
             discord_bot_token=_required("DISCORD_BOT_TOKEN"),
             discord_guild_id=_required("DISCORD_GUILD_ID"),
             discord_admin_channel_id=_optional("DISCORD_ADMIN_CHANNEL_ID"),
-            discord_critical_alerts_channel_id=_optional("DISCORD_CRITICAL_ALERTS_CHANNEL_ID"),
-            discord_monitoring_summary_channel_id=_optional("DISCORD_MONITORING_SUMMARY_CHANNEL_ID"),
+            discord_alerts_channel_id=_optional("DISCORD_ALERTS_CHANNEL_ID"),
 
             # Opcionális fejlesztés közben (mock adatok mellett)
             anthropic_api_key=_optional("ANTHROPIC_API_KEY"),
