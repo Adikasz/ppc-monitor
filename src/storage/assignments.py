@@ -32,7 +32,7 @@ def get_assignments_for_client(client_id: int) -> list[dict[str, Any]]:
     res = (
         get_supabase()
         .table(_TABLE)
-        .select("*, users(id, discord_user_id, display_name)")
+        .select("*, users(id, discord_user_id, display_name, alerts_channel_id)")
         .eq("client_id", client_id)
         .is_("campaign_id", "null")
         .execute()
@@ -45,7 +45,7 @@ def get_assignments_for_campaign(campaign_id: int) -> list[dict[str, Any]]:
     res = (
         get_supabase()
         .table(_TABLE)
-        .select("*, users(id, discord_user_id, display_name)")
+        .select("*, users(id, discord_user_id, display_name, alerts_channel_id)")
         .eq("campaign_id", campaign_id)
         .execute()
     )

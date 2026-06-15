@@ -59,11 +59,11 @@ class Config:
     # ---- Discord ----
     discord_bot_token: str
     discord_guild_id: str
+    # Management hub + fallback csatorna. Ide mennek a parancsok, és ide kerül
+    # minden olyan riasztás, aminek nincs (személyes csatornával rendelkező)
+    # címzettje. A személyes alertek az adott OM users.alerts_channel_id-jára
+    # mennek (lásd 0006 migration + src/monitoring/router.py).
     discord_admin_channel_id: str
-    # Alert-routing csatorna — MINDEN alert (CRITICAL + WARNING + insight) ide megy.
-    # A betöltésnél opcionális (ha üres, a Discord-küldés warning-gal kimarad),
-    # de a routing tényleges működéséhez be kell állítani.
-    discord_alerts_channel_id: str
 
     # ---- Anthropic ----
     anthropic_api_key: str
@@ -110,7 +110,6 @@ class Config:
             discord_bot_token=_required("DISCORD_BOT_TOKEN"),
             discord_guild_id=_required("DISCORD_GUILD_ID"),
             discord_admin_channel_id=_optional("DISCORD_ADMIN_CHANNEL_ID"),
-            discord_alerts_channel_id=_optional("DISCORD_ALERTS_CHANNEL_ID"),
 
             # Opcionális fejlesztés közben (mock adatok mellett)
             anthropic_api_key=_optional("ANTHROPIC_API_KEY"),

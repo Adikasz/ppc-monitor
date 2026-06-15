@@ -8,10 +8,14 @@ route_alert(alert) lépései:
     a) Kampány + ügyfél + címzettek (assignments: primary + supporter) lekérése
     b) Némítás-ellenőrzés (muted kampány → skip)
     c) Dedup (a már elküldött — status='sent' — alertet nem küldjük újra)
-    d) Severity szerinti kiküldés:
-        - CRITICAL → Discord (kritikus csatorna, mention) + ClickUp task
-        - WARNING  → Discord (összefoglaló csatorna, mention nélkül)
-        - egyéb    → Discord összefoglaló csatorna (mention nélkül)
+    d) Per-OM kiküldés (CRITICAL + WARNING + INSIGHT egyaránt):
+        - Minden assignee a SAJÁT alert csatornájába kapja a riasztást
+          (users.alerts_channel_id), kiegészítve a többi értesített kolléga
+          megjelölésével ("Értesítve még: …").
+        - Ha egy assignee-nek NINCS beállítva csatornája → admin fallback
+          (DISCORD_ADMIN_CHANNEL_ID) + figyelmeztetés.
+        - Ha a kampánynak NINCS assignee-je → admin fallback + figyelmeztetés.
+        - CRITICAL esetén emellett ClickUp task is készül.
        (Email = 10b. lépés, most kimarad.)
     e) Az alert megjelölése elküldöttként (status='sent', sent_at, msg/task id)
 
@@ -24,6 +28,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
+from src.config import get_config
 from src.integrations import clickup_router, discord_router
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import alerts as alerts_storage
@@ -78,14 +83,51 @@ async def route_alert(alert: dict[str, Any]) -> dict[str, Any]:
     recipients = await asyncio.to_thread(_resolve_recipients, campaign_id, client_id)
     result["recipients"] = [r["discord_user_id"] for r in recipients]
 
-    # d) Severity szerinti kiküldés
-    channels: list[str] = []
+    admin_channel_id = get_config().discord_admin_channel_id
 
-    discord_res = await discord_router.send_discord_alert(
-        alert, recipients, campaign_label=campaign_label,
-    )
-    if discord_res:
-        channels.append("discord")
+    # d) Per-OM kiküldés (lásd modul-docstring)
+    channels: list[str] = []
+    first_message_id: str | None = None
+
+    if recipients:
+        for recipient in recipients:
+            others = _other_recipient_labels(recipients, recipient)
+            personal_channel = recipient.get("alerts_channel_id")
+
+            if personal_channel:
+                log.info(
+                    "Routing: alert #%s → @%s személyes csatornája (%s)",
+                    alert_id, recipient["discord_user_id"], personal_channel,
+                )
+                res = await discord_router.send_discord_alert(
+                    personal_channel, alert,
+                    campaign_label=campaign_label,
+                    other_recipients=others or None,
+                )
+            else:
+                log.info(
+                    "Routing: alert #%s → admin fallback (@%s csatornája nincs beállítva)",
+                    alert_id, recipient["discord_user_id"],
+                )
+                res = await discord_router.send_discord_alert(
+                    admin_channel_id, alert,
+                    campaign_label=campaign_label,
+                    missing_channel_user=recipient["discord_user_id"],
+                )
+
+            if res:
+                channels.append("discord")
+                first_message_id = first_message_id or str(res["message_id"])
+    else:
+        log.info("Routing: alert #%s → admin fallback (nincs assignee)", alert_id)
+        res = await discord_router.send_discord_alert(
+            admin_channel_id, alert,
+            campaign_label=campaign_label,
+            no_assignee=True,
+        )
+        if res:
+            channels.append("discord")
+            first_message_id = first_message_id or str(res["message_id"])
 
     clickup_res = None
     if severity == "critical":
@@ -101,7 +143,7 @@ async def route_alert(alert: dict[str, Any]) -> dict[str, Any]:
         await asyncio.to_thread(
             alerts_storage.mark_alert_routed,
             alert_id,
-            discord_message_id=str(discord_res["message_id"]) if discord_res else None,
+            discord_message_id=first_message_id,
             clickup_task_id=str(clickup_res["task_id"]) if (clickup_res and clickup_res.get("task_id")) else None,
             routed_to_discord_user_id=(result["recipients"][0] if result["recipients"] else None),
         )
@@ -129,6 +171,21 @@ def _resolve_client(campaign: dict[str, Any]) -> dict[str, Any] | None:
     return clients_storage.get_client(account.get("client_id"))
 
 
+def _other_recipient_labels(
+    recipients: list[dict[str, Any]],
+    current: dict[str, Any],
+) -> list[str]:
+    """A `current`-en kívüli címzettek megjelölései: ["<@id> (role)", …].
+
+    Ez a "Értesítve még: …" sorhoz kell — csak vizuális, nem pingel.
+    """
+    return [
+        f"<@{r['discord_user_id']}> ({r.get('role') or 'primary'})"
+        for r in recipients
+        if r["discord_user_id"] != current["discord_user_id"]
+    ]
+
+
 def _resolve_recipients(campaign_id: int, client_id: int | None) -> list[dict[str, Any]]:
     """Címzettek: kampány-szintű + ügyfél-szintű hozzárendelések (duplikátum-mentes).
 
@@ -150,6 +207,7 @@ def _resolve_recipients(campaign_id: int, client_id: int | None) -> list[dict[st
             out.append({
                 "discord_user_id": discord_user_id,
                 "display_name": user.get("display_name"),
-                "role": row.get("role"),
+                "role": row.get("role") or "primary",
+                "alerts_channel_id": user.get("alerts_channel_id"),
             })
     return out

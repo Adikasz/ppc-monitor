@@ -67,6 +67,33 @@ def get_or_create_user(
     return res.data[0], True
 
 
+def set_user_alerts_channel(discord_user_id: int, channel_id: str) -> bool:
+    """Beállítja a felhasználó személyes alert csatornáját (Discord channel ID).
+
+    A `discord_user_id` a Discord snowflake ID (int) — a DB-ben stringként
+    tároljuk, ezért itt konvertáljuk. Csak meglévő felhasználót frissít; ha
+    nincs ilyen, False-szal tér vissza (a hívó előbb hozza létre a usert).
+
+    Visszatérés: True, ha volt mit frissíteni, különben False.
+    """
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .update({"alerts_channel_id": str(channel_id)})
+        .eq("discord_user_id", str(discord_user_id))
+        .execute()
+    )
+    return bool(res.data)
+
+
+def get_user_alerts_channel(user_id: int) -> str | None:
+    """A felhasználó személyes alert csatornája (belső ID alapján). None ha nincs."""
+    user = get_user(user_id)
+    if not user:
+        return None
+    return user.get("alerts_channel_id")
+
+
 def list_users(*, active_only: bool = True) -> list[dict[str, Any]]:
     """Felhasználók listázása display_name szerint rendezve."""
     query = get_supabase().table(_TABLE).select("*").order("display_name")
