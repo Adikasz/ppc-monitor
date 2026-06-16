@@ -139,23 +139,36 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
-        embed = discord.Embed(
-            title=f"📊 {client['name']} — kampányok",
-            color=discord.Color.blue(),
-        )
+        # Description-alapú lista (NEM mezőnként): a Discord embed max. 25 mezőt
+        # enged, így sok kampánynál (pl. Stopvill 36 db) a mezős változat hibára
+        # futna. A description 4096 karakterig bír — ha túlcsordul, csonkítunk.
+        lines: list[str] = []
         for c in rows:
             state = c.get("lifecycle_state", "?")
-            platform = c.get("platform", "?")
+            platform = c.get("platform") or "—"
             campaign_type = c.get("campaign_type") or "—"
-            embed.add_field(
-                name=f"#{c['id']} — {c['name']}",
-                value=(
-                    f"{_lifecycle_emoji(state)} `{state}` · 🖥 `{platform}`\n"
-                    f"típus: `{campaign_type}`"
-                ),
-                inline=False,
+            lines.append(
+                f"{_lifecycle_emoji(state)} **#{c['id']}** — {c['name']}\n"
+                f"　`{state}` · 🖥 `{platform}` · típus: `{campaign_type}`"
             )
-        embed.set_footer(text=f"Összesen: {len(rows)} kampány")
+
+        description = ""
+        shown = 0
+        for line in lines:
+            if len(description) + len(line) + 1 > 3900:  # biztonsági margó a 4096 limit alá
+                break
+            description += line + "\n"
+            shown += 1
+
+        embed = discord.Embed(
+            title=f"📊 {client['name']} — kampányok",
+            description=description or "—",
+            color=discord.Color.blue(),
+        )
+        if shown < len(rows):
+            embed.set_footer(text=f"{shown}/{len(rows)} kampány megjelenítve (a többi nem fért ki)")
+        else:
+            embed.set_footer(text=f"Összesen: {len(rows)} kampány")
         await interaction.followup.send(embed=embed)
 
     # ------------------------------------------------------------------
