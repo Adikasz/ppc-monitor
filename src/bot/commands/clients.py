@@ -30,6 +30,7 @@ from discord.ext import commands
 from src.config import get_config
 from src.monitoring.discovery import discover_campaigns_for_client
 from src.storage import ad_accounts as ad_accounts_storage
+from src.storage import alerts as alerts_storage
 from src.storage import assignments as assignments_storage
 from src.storage import audit
 from src.storage import campaigns as campaigns_storage
@@ -114,6 +115,36 @@ def _pct_int(v: object) -> str:
         return str(v)
 
 
+def _short_account(ext_id: object) -> str:
+    """Hosszú fiók-azonosító rövidítése a listához (act_165789… )."""
+    s = str(ext_id)
+    return s if len(s) <= 11 else s[:8] + "…"
+
+
+def _platform_line(accounts: list[dict], camp_per_acct) -> str:
+    """Egy platform fiók-sora a /client list-hez: '✅ act_165… (36 kampány)' vagy '➖ nincs'."""
+    if not accounts:
+        return "➖ nincs"
+    return ", ".join(
+        f"✅ {_short_account(a['external_account_id'])} "
+        f"({camp_per_acct.get(a['id'], 0)} kampány)"
+        for a in accounts
+    )
+
+
+def _fmt_ts(iso: object) -> str:
+    """ISO időbélyeg → 'YYYY-MM-DD HH:MM'. Üres ha nincs."""
+    if not iso:
+        return "—"
+    return str(iso)[:16].replace("T", " ")
+
+
+def _max_last_seen(campaigns: list[dict]) -> str:
+    """A kampányok közül a legutóbbi last_seen_at, formázva (≈ utolsó discovery)."""
+    values = [c.get("last_seen_at") for c in campaigns if c.get("last_seen_at")]
+    return _fmt_ts(max(values)) if values else "—"
+
+
 # ---------------------------------------------------------------------------
 # Cog
 # ---------------------------------------------------------------------------
@@ -127,8 +158,9 @@ class ClientCog(commands.GroupCog, group_name="client"):
     # ------------------------------------------------------------------
     # /client list
     # ------------------------------------------------------------------
-    @app_commands.command(name="list", description="Összes ügyfél: fiók-/kampányszám + insights")
-    async def list_(self, interaction: discord.Interaction) -> None:
+    @app_commands.command(name="list", description="Kliensek lapozható listája (25/oldal)")
+    @app_commands.describe(page="Oldal száma (1-től), alapból 1")
+    async def list_(self, interaction: discord.Interaction, page: int = 1) -> None:
         await interaction.response.defer(ephemeral=True)
 
         clients = await asyncio.to_thread(clients_storage.list_clients, active_only=False)
@@ -136,51 +168,63 @@ class ClientCog(commands.GroupCog, group_name="client"):
             await interaction.followup.send("Nincs még ügyfél. Hozz létre egyet: `/client add`")
             return
 
-        # Egy lekérdezés az összes aktív fiókra és kampányra → ügyfelenkénti
-        # aggregálás Pythonban (nincs N+1 query).
+        per_page = 25
+        total = len(clients)
+        pages = (total + per_page - 1) // per_page
+        page = max(1, min(page, pages))
+        start = (page - 1) * per_page
+        page_clients = clients[start:start + per_page]
+
+        # Bulk adatok — lapfüggetlenül konstans lekérdezésszám (nincs N+1).
         accounts = await asyncio.to_thread(ad_accounts_storage.list_ad_accounts, active_only=True)
         campaign_acct_ids = await asyncio.to_thread(
             campaigns_storage.list_ad_account_ids, active_only=True
         )
+        kpi_ids = await asyncio.to_thread(client_kpis_storage.list_client_ids_with_kpis)
+        om_rows = await asyncio.to_thread(assignments_storage.list_client_level_assignments)
 
-        acct_ids_by_client: dict[int, list[int]] = defaultdict(list)
+        accounts_by_client: dict[int, list[dict]] = defaultdict(list)
         for a in accounts:
-            acct_ids_by_client[a["client_id"]].append(a["id"])
+            accounts_by_client[a["client_id"]].append(a)
         camp_per_acct = Counter(campaign_acct_ids)
+        om_by_client: dict[int, list[str]] = defaultdict(list)
+        for r in om_rows:
+            name = (r.get("users") or {}).get("display_name")
+            if name:
+                om_by_client[r["client_id"]].append(name)
 
-        lines: list[str] = []
-        for c in clients:
+        blocks: list[str] = []
+        for c in page_clients:
             cid = c["id"]
-            aids = acct_ids_by_client.get(cid, [])
-            n_accounts = len(aids)
-            n_campaigns = sum(camp_per_acct.get(aid, 0) for aid in aids)
-            # insights_enabled hiányozhat, ha a 0008 migráció még nem futott → default true
-            insights = c.get("insights_enabled", True)
-            inactive = "" if c.get("is_active", True) else " · ⏸ inaktív"
-            lines.append(
-                f"**#{cid} — {c['name']}**{inactive}\n"
-                f"　🗂 {n_accounts} fiók · 📊 {n_campaigns} kampány · "
-                f"insights {_insights_emoji(insights)}"
+            accs = accounts_by_client.get(cid, [])
+            meta_line = _platform_line([a for a in accs if a["platform"] == "meta"], camp_per_acct)
+            google_line = _platform_line([a for a in accs if a["platform"] == "google"], camp_per_acct)
+            kpi_emoji = "✅" if cid in kpi_ids else "❌"
+            oms = om_by_client.get(cid, [])
+            om_str = ", ".join(f"@{n}" for n in oms) if oms else "➖ nincs"
+            inactive = " · ⏸ inaktív" if not c.get("is_active", True) else ""
+            blocks.append(
+                f"**#{cid} {c['name']}**{inactive}\n"
+                f"　Meta: {meta_line}\n"
+                f"　Google: {google_line}\n"
+                f"　KPI: {kpi_emoji} | OM: {om_str}"
             )
 
-        # Description-alapú lista (NEM mezőnként) — a 25-mezős embed limit miatt.
-        description = ""
-        shown = 0
-        for line in lines:
-            if len(description) + len(line) + 1 > 3900:
-                break
-            description += line + "\n"
-            shown += 1
+        description = "\n\n".join(blocks)
+        if len(description) > 4000:
+            description = description[:3990] + "\n…"
 
+        first = start + 1
+        last = start + len(page_clients)
         embed = discord.Embed(
-            title="👥 Ügyfelek",
+            title=f"📋 Kliensek ({first}–{last} / {total} total)",
             description=description or "—",
             color=discord.Color.blue(),
         )
-        if shown < len(lines):
-            embed.set_footer(text=f"{shown}/{len(clients)} ügyfél megjelenítve (a többi nem fért ki)")
-        else:
-            embed.set_footer(text=f"Összesen: {len(clients)} ügyfél")
+        footer = f"Lap: {page}/{pages}"
+        if page < pages:
+            footer += f"  |  /client list page:{page + 1}"
+        embed.set_footer(text=footer)
         await interaction.followup.send(embed=embed)
 
     # ------------------------------------------------------------------
@@ -813,6 +857,112 @@ class ClientCog(commands.GroupCog, group_name="client"):
                 f"(kézi `/campaign kpi` override megmaradt)"
             )
         await interaction.followup.send(msg)
+
+    # ------------------------------------------------------------------
+    # /client status client:<név vagy id>
+    # ------------------------------------------------------------------
+    @app_commands.command(name="status", description="Részletes státusz egy kliensről")
+    @app_commands.describe(client="Az ügyfél neve vagy numerikus azonosítója")
+    async def status(self, interaction: discord.Interaction, client: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        c = await asyncio.to_thread(_resolve_client, client)
+        if c is None:
+            await interaction.followup.send(
+                f"❌ Nem található ügyfél: **{client}**\nNézd meg: `/client list`"
+            )
+            return
+
+        accounts = await asyncio.to_thread(
+            ad_accounts_storage.get_ad_accounts_for_client, c["id"], active_only=False
+        )
+        all_campaigns = await asyncio.to_thread(
+            campaigns_storage.list_campaigns, c["id"], active_only=False
+        )
+        kpi = await asyncio.to_thread(client_kpis_storage.get_client_kpis, c["id"])
+        assigns = await asyncio.to_thread(
+            assignments_storage.get_assignments_for_client, c["id"]
+        )
+        campaign_ids = [cm["id"] for cm in all_campaigns]
+        last_alert = (
+            await asyncio.to_thread(alerts_storage.get_latest_alert_for_campaigns, campaign_ids)
+            if campaign_ids else None
+        )
+
+        campaigns_by_acct: dict[int, list[dict]] = defaultdict(list)
+        for cm in all_campaigns:
+            campaigns_by_acct[cm["ad_account_id"]].append(cm)
+
+        is_active = c.get("is_active", True)
+        embed = discord.Embed(
+            title=f"📊 {c['name']} (#{c['id']})",
+            color=discord.Color.blue() if is_active else discord.Color.dark_grey(),
+        )
+
+        # Fiókok + kampányszám (aktív/pausált) + utolsó discovery
+        if accounts:
+            for a in accounts:
+                camps = campaigns_by_acct.get(a["id"], [])
+                active = sum(1 for cm in camps if cm.get("lifecycle_state") not in ("paused", "ended"))
+                paused = sum(1 for cm in camps if cm.get("lifecycle_state") == "paused")
+                icon = "📣" if a["platform"] == "meta" else "🔎"
+                inactive = "" if a.get("is_active", True) else " ⏸"
+                embed.add_field(
+                    name=f"{icon} {a['platform']}: {a['external_account_id']}{inactive}",
+                    value=(
+                        f"Kampányok: {active} aktív / {paused} pausált\n"
+                        f"Utolsó discovery: {_max_last_seen(camps)}"
+                    ),
+                    inline=False,
+                )
+        else:
+            embed.add_field(name="Hirdetési fiókok", value="— nincs", inline=False)
+
+        # KPI
+        if kpi:
+            bits: list[str] = []
+            if kpi.get("target_roas") is not None:
+                bits.append(f"ROAS {_pct_int(kpi['target_roas'])}")
+            if kpi.get("max_cpa") is not None:
+                bits.append(f"Max CPA: {_money(kpi['max_cpa'])} Ft")
+            if kpi.get("monthly_budget") is not None:
+                bits.append(f"Büdzsé: {_money(kpi['monthly_budget'])} Ft")
+            if kpi.get("max_cpl") is not None:
+                bits.append(f"Max CPL: {_money(kpi['max_cpl'])} Ft")
+            if kpi.get("target_ctr") is not None:
+                bits.append(f"Cél CTR: {_pct_int(kpi['target_ctr'])}%")
+            if kpi.get("max_cpc") is not None:
+                bits.append(f"Max CPC: {_money(kpi['max_cpc'])} Ft")
+            kpi_value = (
+                " | ".join(bits) + "\n"
+                f"Warning: -{_pct_int(kpi.get('warning_pct'))}% | "
+                f"Critical: -{_pct_int(kpi.get('critical_pct'))}%"
+            )
+        else:
+            kpi_value = "❌ nincs kliens-szintű KPI — `/client kpi`"
+        embed.add_field(name="🎯 KPI", value=kpi_value, inline=False)
+
+        # OM-ek
+        if assigns:
+            om_value = ", ".join(
+                f"@{(r.get('users') or {}).get('display_name') or '?'} (`{r.get('role') or 'primary'}`)"
+                for r in assigns
+            )
+        else:
+            om_value = "➖ nincs"
+        embed.add_field(name="👤 OM-ek", value=om_value, inline=False)
+
+        # Utolsó alert
+        if last_alert:
+            alert_value = (
+                f"{_fmt_ts(last_alert.get('detected_at'))} | "
+                f"{last_alert.get('metric')} ({last_alert.get('severity')})"
+            )
+        else:
+            alert_value = "nincs"
+        embed.add_field(name="🚨 Utolsó alert", value=alert_value, inline=False)
+
+        await interaction.followup.send(embed=embed)
 
 
 async def setup(bot: commands.Bot) -> None:

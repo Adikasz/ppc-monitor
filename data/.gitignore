@@ -1,0 +1,3 @@
+# Ügyféladatok - ne kerüljön fel!
+*.csv
+!.gitignore

@@ -32,6 +32,7 @@ from src.integrations.meta_ads import MetaAdsClient
 from src.monitoring.detector import detect_anomalies_for_campaign
 from src.monitoring.router import route_alert
 from src.monitoring.summary import generate_daily_summary, generate_weekly_summary
+from src.monitoring.token_monitor import token_health_check
 from src.storage import campaigns as campaigns_storage
 from src.storage import users as users_storage
 from src.storage.alerts import insert_alert
@@ -262,6 +263,19 @@ async def weekly_summary_job() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Meta token egészség (17. lépés) — heti ellenőrzés
+# ---------------------------------------------------------------------------
+
+async def weekly_token_check() -> None:
+    """Heti Meta token-ellenőrzés (lejárat/érvénytelenség → admin értesítés)."""
+    log.info("Heti Meta token-ellenőrzés indítva…")
+    try:
+        await token_health_check()
+    except Exception:  # noqa: BLE001 — a token-check sosem buktathatja meg a schedulert
+        log.exception("Heti token-ellenőrzés hiba")
+
+
+# ---------------------------------------------------------------------------
 # Scheduler életciklus
 # ---------------------------------------------------------------------------
 
@@ -313,6 +327,21 @@ def start_scheduler() -> AsyncIOScheduler:
         minute=0,
         day_of_week="mon",
         id="weekly_summary",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # Heti Meta token-ellenőrzés: HÉTFŐ 08:00 (a napi munka előtt, hogy időben
+    # kiderüljön, ha a token lejárt vagy hamarosan lejár).
+    _scheduler.add_job(
+        weekly_token_check,
+        trigger="cron",
+        hour=8,
+        minute=0,
+        day_of_week="mon",
+        id="weekly_token_check",
         replace_existing=True,
         misfire_grace_time=3600,
         coalesce=True,

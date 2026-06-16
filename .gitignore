@@ -34,3 +34,6 @@ logs/
 
 # Railway
 .railway/
+
+# Ügyféladatok (bulk onboarding CSV-k) — SOHA ne committold
+data/*.csv

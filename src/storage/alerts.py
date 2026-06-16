@@ -167,3 +167,22 @@ def mark_alert_suppressed(alert_id: int) -> None:
     egy reggeli összefoglalót; addig is jelzi, hogy szándékosan nem küldtük ki.
     """
     get_supabase().table(_TABLE).update({"status": "suppressed"}).eq("id", alert_id).execute()
+
+
+def get_latest_alert_for_campaigns(campaign_ids: list[int]) -> dict[str, Any] | None:
+    """A legutóbbi alert (detected_at szerint) a megadott kampányokra. None ha nincs.
+
+    A `/client status` használja az ügyfél kampányaira ("Utolsó alert").
+    """
+    if not campaign_ids:
+        return None
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .select("*")
+        .in_("campaign_id", campaign_ids)
+        .order("detected_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None

@@ -91,3 +91,24 @@ def upsert_client_kpis(client_id: int, *, fields: dict[str, Any]) -> dict[str, A
     payload = {"client_id": client_id, **fields}
     res = sb.table(_TABLE).insert(payload).execute()
     return res.data[0]
+
+
+def list_client_ids_with_kpis() -> set[int]:
+    """Azon kliens-ID-k halmaza, amelyeknek van aktív client_kpis soruk.
+
+    A `/client list` KPI-jelzőjéhez (✅/❌), bulk. Védve: ha a tábla még nem
+    létezik (0009 előtt), üres halmazt ad.
+    """
+    try:
+        res = (
+            get_supabase()
+            .table(_TABLE)
+            .select("client_id")
+            .eq("is_active", True)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_relation(exc):
+            return set()
+        raise
+    return {r["client_id"] for r in (res.data or [])}

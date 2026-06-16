@@ -372,3 +372,20 @@ def inherit_client_assignments_for_campaign(client_id: int, campaign_id: int) ->
         })
     _insert_assignment_rows(to_insert)
     return len(to_insert)
+
+
+def list_client_level_assignments() -> list[dict[str, Any]]:
+    """Az ÖSSZES ügyfél-szintű hozzárendelés (campaign_id IS NULL), user adatokkal.
+
+    A `/client list` bulk OM-megjelenítéséhez: egyetlen lekérdezés, a parancs
+    réteg client_id szerint csoportosítja. (Az ilyen sorokban a client_id a
+    sémakényszer miatt mindig kitöltött.)
+    """
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .select("client_id, role, users(display_name, discord_user_id)")
+        .is_("campaign_id", "null")
+        .execute()
+    )
+    return res.data or []

@@ -204,6 +204,36 @@ async def send_discord_alert(
     return None
 
 
+async def send_text_message(channel_id_raw: str, content: str) -> dict[str, Any] | None:
+    """Egyszerű szöveges üzenet küldése egy csatornára (nem alert-formátum).
+
+    A token-figyelő (17. lépés) használja az admin csatornára. A csatorna-
+    feloldás és a 429 retry ugyanaz, mint az alert-küldésnél. Soha nem dob:
+    hiba esetén None.
+    """
+    channel = await _resolve_channel(channel_id_raw)
+    if channel is None:
+        log.warning("send_text_message: nincs feloldható csatorna (id=%r)", channel_id_raw)
+        return None
+
+    allowed = discord.AllowedMentions.none()
+    for attempt in range(3):
+        try:
+            msg = await channel.send(content, allowed_mentions=allowed)
+            log.info("Szöveges üzenet kiküldve (csatorna=%s, msg=%s)", channel.id, msg.id)
+            return {"channel_id": channel.id, "message_id": msg.id}
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 429 and attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            log.error("send_text_message hiba: %s", exc)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log.error("send_text_message váratlan hiba: %s", exc)
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Napi / heti összefoglaló (13. lépés)
 # ---------------------------------------------------------------------------
