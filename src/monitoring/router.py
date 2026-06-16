@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.config import get_config
-from src.integrations import clickup_router, discord_router
+from src.integrations import clickup_router, discord_router, email_router
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import alerts as alerts_storage
 from src.storage import assignments as assignments_storage
@@ -155,8 +155,15 @@ async def route_alert(
         clickup_res = await clickup_router.create_clickup_task(alert, campaign)
         if clickup_res:
             channels.append("clickup")
-        # Email az ügyfélnek → 10b. lépés (clients.contact_email = %r)
-        # itt majd: if client and client.get("contact_email"): ...
+
+        # Ügyfél-email (CRITICAL) — csak ha van contact_email és még nem ment email
+        # erről az alertről (dedup: alerts.email_sent_at, 0007 migration).
+        if client and client.get("contact_email") and not alert.get("email_sent_at"):
+            email_ok = await email_router.send_client_email(alert, client, campaign)
+            if email_ok:
+                channels.append("email")
+                if alert_id is not None:
+                    await asyncio.to_thread(alerts_storage.mark_alert_emailed, alert_id)
 
     # e) Alert megjelölése elküldöttként (csak ha legalább egy csatorna sikerült).
     # A manuális /alert test fake anomáliának nincs DB id-ja → nem jelölünk.

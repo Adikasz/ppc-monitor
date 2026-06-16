@@ -88,6 +88,15 @@ class Config:
     clickup_default_list_id: str
     clickup_anomalies_list_id: str          # "Anomalies" lista — CRITICAL taskokhoz
 
+    # ---- Email (SMTP) ----
+    # Opcionális — ha nincs beállítva, a CRITICAL ügyfél-email warninggal kimarad.
+    # A jelszó Gmail App Password (nem a fiók jelszava).
+    smtp_host: str
+    smtp_port: int
+    smtp_user: str
+    smtp_password: str
+    smtp_from: str
+
     # ---- Általános ----
     timezone: str
     quiet_hours_start: int
@@ -129,6 +138,12 @@ class Config:
             clickup_team_id=_optional("CLICKUP_TEAM_ID"),
             clickup_default_list_id=_optional("CLICKUP_DEFAULT_LIST_ID"),
             clickup_anomalies_list_id=_optional("CLICKUP_ANOMALIES_LIST_ID"),
+
+            smtp_host=_optional("SMTP_HOST"),
+            smtp_port=_int("SMTP_PORT", 587),
+            smtp_user=_optional("SMTP_USER"),
+            smtp_password=_optional("SMTP_PASSWORD"),
+            smtp_from=_optional("SMTP_FROM"),
 
             timezone=_optional("TIMEZONE", "Europe/Budapest"),
             quiet_hours_start=_int("QUIET_HOURS_START", 18),

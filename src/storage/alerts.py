@@ -153,6 +153,13 @@ def get_alerts_for_user_in_range(
     return res.data or []
 
 
+def mark_alert_emailed(alert_id: int) -> None:
+    """Az alert ügyfél-email kiküldésének időbélyege (email-dedup, 0007 migration)."""
+    get_supabase().table(_TABLE).update(
+        {"email_sent_at": datetime.now(timezone.utc).isoformat()}
+    ).eq("id", alert_id).execute()
+
+
 def mark_alert_suppressed(alert_id: int) -> None:
     """Az alert megjelölése elnyomottként (csendes időben keletkezett, nem-kritikus).
 
