@@ -130,3 +130,77 @@ def get_or_create_ad_account(
         platform, external_account_id, row["id"],
     )
     return row, True
+
+
+def list_ad_accounts(*, active_only: bool = False) -> list[dict[str, Any]]:
+    """Az összes hirdetési fiók (minden ügyfélé), client_id szerint rendezve.
+
+    A `/client list` overview használja: egy lekérdezéssel beolvassa az összes
+    fiókot, majd a parancs-réteg ügyfelenként aggregálja (nincs N+1 query).
+    """
+    query = get_supabase().table(_TABLE).select("*").order("client_id")
+    if active_only:
+        query = query.eq("is_active", True)
+    return query.execute().data or []
+
+
+def set_ad_account_active(ad_account_id: int, is_active: bool) -> dict[str, Any] | None:
+    """Hirdetési fiók aktív/inaktív állapotának állítása (soft delete).
+
+    A `/adaccount remove` ezt használja `is_active=False`-szal — fizikai törlés
+    NEM történik, az előzmény-adat (kampányok, insightok) megmarad.
+
+    Visszaadja a frissített sort, vagy None-t, ha nincs ilyen fiók.
+    """
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .update({"is_active": is_active})
+        .eq("id", ad_account_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def find_ad_accounts_by_external_id(candidates: list[str]) -> list[dict[str, Any]]:
+    """Hirdetési fiók(ok) keresése külső azonosító alapján, platform NÉLKÜL.
+
+    A `/adaccount remove account_id:<>` csak a külső azonosítót kapja meg
+    (platform nélkül), és a felhasználó többféleképp is beírhatja
+    (act_ prefixszel/anélkül, Google customer ID kötőjelekkel/anélkül).
+    Ezért a hívó több normalizált változatot ad át, és bármelyikre illeszkedő
+    sort visszaadunk. Általában 0 vagy 1 találat (a (platform, external) pár
+    egyedi, de két platform elvileg oszthat azonos stringet).
+    """
+    if not candidates:
+        return []
+    # Duplikátumok kiszűrése a lekérdezés előtt.
+    uniq = list(dict.fromkeys(c for c in candidates if c))
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .select("*")
+        .in_("external_account_id", uniq)
+        .execute()
+    )
+    return res.data or []
+
+
+def normalize_external_account_id(platform: str, raw: str) -> str:
+    """Külső fiók-azonosító normalizálása platformonként.
+
+    - meta:   biztosítja az `act_` prefixet (act_123456789). Ha a felhasználó
+              prefix nélkül (123456789) vagy prefixszel írta, egységes lesz.
+    - google: kötőjelek eltávolítása (123-456-7890 → 1234567890).
+    - egyéb:  csak whitespace-trim.
+
+    Ez a kanonikus tárolási forma — így a discovery és a duplikáció-ellenőrzés
+    konzisztens marad, függetlenül attól, hogy a felhasználó hogyan gépelte be.
+    """
+    value = (raw or "").strip()
+    if platform == "meta":
+        digits = value[4:] if value.lower().startswith("act_") else value
+        return f"act_{digits}"
+    if platform == "google":
+        return value.replace("-", "")
+    return value

@@ -307,3 +307,22 @@ def remove_supporter(
         .execute()
     )
     return True
+
+
+# ---------------------------------------------------------------------------
+# Aggregáló segédfüggvények (overview / számlálás)
+# ---------------------------------------------------------------------------
+
+def list_ad_account_ids(*, active_only: bool = True) -> list[int]:
+    """Minden kampány ad_account_id-ja (egy elem / kampány).
+
+    A `/client list` overview ebből számol fiókonkénti / ügyfelenkénti
+    kampányszámot (Counter), egyetlen lekérdezésből — nincs N+1 query.
+
+    active_only=True esetén az 'ended' lifecycle-ű kampányokat kihagyja
+    (ugyanaz a láthatóság, mint a `/campaign list`-nél).
+    """
+    query = get_supabase().table(_TABLE).select("ad_account_id")
+    if active_only:
+        query = query.neq("lifecycle_state", "ended")
+    return [r["ad_account_id"] for r in (query.execute().data or [])]

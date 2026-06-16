@@ -56,6 +56,7 @@ def get_client_by_name(name: str) -> dict[str, Any] | None:
 def create_client(
     name: str,
     *,
+    contact_email: str | None = None,
     discord_channel_id: str | None = None,
     notes: str | None = None,
 ) -> dict[str, Any]:
@@ -63,8 +64,15 @@ def create_client(
 
     A `name` egyedi a sémában — duplikátum esetén a Supabase 23505 hibát dob,
     a hívó (parancs-réteg) felelős a felhasználóbarát üzenetért.
+
+    A `contact_email` opcionális — ide megy a CRITICAL ügyfél-email (lásd 0003
+    migration + email router). `insights_enabled` szándékosan NINCS beállítva
+    INSERT-kor: a DB DEFAULT true (0008 migration) gondoskodik róla, így a kód
+    akkor is működik, ha a migráció még nem futott le.
     """
     payload: dict[str, Any] = {"name": name}
+    if contact_email is not None:
+        payload["contact_email"] = contact_email
     if discord_channel_id is not None:
         payload["discord_channel_id"] = discord_channel_id
     if notes is not None:
@@ -72,3 +80,20 @@ def create_client(
 
     res = get_supabase().table(_TABLE).insert(payload).execute()
     return res.data[0]
+
+
+def set_insights_enabled(client_id: int, enabled: bool) -> dict[str, Any] | None:
+    """Az ügyfél `insights_enabled` kapcsolójának frissítése.
+
+    Visszaadja a frissített sort, vagy None-t, ha nincs ilyen ügyfél.
+    Megjegyzés: a `insights_enabled` oszlopot a 0008 migration veszi fel — ha
+    az még nem futott le, a Supabase hibát dob, amit a parancs-réteg kezel.
+    """
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .update({"insights_enabled": enabled})
+        .eq("id", client_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None

@@ -113,7 +113,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
     # /campaign list client_name:<név>
     # ------------------------------------------------------------------
     @app_commands.command(name="list", description="Ügyfél kampányainak listázása")
-    @app_commands.describe(client_name="Az ügyfél neve (pontosan, ahogy a /clients list mutatja)")
+    @app_commands.describe(client_name="Az ügyfél neve (pontosan, ahogy a /client list mutatja)")
     async def list_(
         self,
         interaction: discord.Interaction,
@@ -127,7 +127,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         if client is None:
             await interaction.followup.send(
                 f"Nem található ügyfél: **{client_name}**\n"
-                f"Ellenőrizd a `/clients list` paranccsal az elérhető ügyfeleket."
+                f"Ellenőrizd a `/client list` paranccsal az elérhető ügyfeleket."
             )
             return
 
@@ -300,7 +300,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         if client is None:
             await interaction.followup.send(
                 f"Nem található ügyfél: **{client_name}**\n"
-                f"Ellenőrizd a `/clients list` paranccsal."
+                f"Ellenőrizd a `/client list` paranccsal."
             )
             return
 
