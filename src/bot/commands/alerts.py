@@ -1,9 +1,10 @@
 """
-/alert slash parancscsoport — kampány-némítás kezelése.
+/alert slash parancscsoport — kampány-némítás + routing-teszt.
 
 Parancsok:
-    /alert mute    campaign_id:<id> [hours:<2>]   — kampány némítása X órára
-    /alert unmute  campaign_id:<id>               — némítás korai feloldása
+    /alert mute    campaign_id:<id> [hours:<2>]              — kampány némítása X órára
+    /alert unmute  campaign_id:<id>                          — némítás korai feloldása
+    /alert test    campaign_id:<id> severity:<…>            — fake riasztás → routing teszt
 
 A némítás a `mutes` táblán keresztül történik (src.storage.mutes). Muted
 kampányra a detektor nem generál, az alert-router nem küld riasztást.
@@ -18,6 +19,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from src.config import get_config
+from src.monitoring import router as alert_router
 from src.storage import audit
 from src.storage import campaigns as campaigns_storage
 from src.storage import mutes as mutes_storage
@@ -27,6 +30,25 @@ log = get_logger(__name__)
 
 _DEFAULT_MUTE_HOURS = 2
 _MAX_MUTE_HOURS = 24 * 30  # 30 nap felső korlát (elgépelés-védelem)
+
+
+def _admin_channel_id() -> int | None:
+    raw = get_config().discord_admin_channel_id
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("DISCORD_ADMIN_CHANNEL_ID nem szám: %r — auth check kikapcsol", raw)
+        return None
+
+
+def _is_admin_channel(interaction: discord.Interaction) -> bool:
+    """True, ha az interakció az admin csatornában történt (vagy nincs konfigurálva)."""
+    admin = _admin_channel_id()
+    if admin is None:
+        return True
+    return interaction.channel_id == admin
 
 
 class AlertsCog(commands.GroupCog, group_name="alert"):
@@ -134,6 +156,75 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
         await interaction.followup.send(
             f"🔔 **#{campaign_id} — {c['name']}** némítása feloldva — újra figyeljük."
         )
+
+    # ------------------------------------------------------------------
+    # /alert test campaign_id:<id> severity:<critical|warning|insight>
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="test",
+        description="Fake riasztás kiküldése a routing ellenőrzéséhez (admin csatorna)",
+    )
+    @app_commands.describe(
+        campaign_id="A kampány numerikus azonosítója",
+        severity="A teszt-riasztás súlyossága",
+    )
+    @app_commands.choices(
+        severity=[
+            app_commands.Choice(name="🔴 critical", value="critical"),
+            app_commands.Choice(name="🟡 warning", value="warning"),
+            app_commands.Choice(name="🔵 insight", value="insight"),
+        ]
+    )
+    async def test(
+        self,
+        interaction: discord.Interaction,
+        campaign_id: int,
+        severity: app_commands.Choice[str],
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható."
+            )
+            return
+
+        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
+        if c is None:
+            await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
+            return
+
+        fake_anomaly = {
+            "campaign_id": campaign_id,
+            "severity": severity.value,
+            "metric": "test_alert",
+            "observed_value": 9999,
+            "threshold_value": 1000,
+            "message": "🧪 TEST ALERT — routing ellenőrzés",
+        }
+
+        # bypass_quiet_hours: a teszt bármikor (csendes időben is) lefuthasson.
+        result = await alert_router.route_alert(fake_anomaly, bypass_quiet_hours=True)
+
+        log.info(
+            "Test alert kiküldve: kampány #%s severity=%s → channels=%s",
+            campaign_id, severity.value, result.get("channels"),
+        )
+
+        if result.get("routed"):
+            recipients = result.get("recipients") or []
+            who = f"{len(recipients)} címzett" if recipients else "admin fallback"
+            await interaction.followup.send(
+                f"✅ Test alert elküldve — **#{campaign_id} — {c['name']}** "
+                f"({severity.value}, {who})."
+            )
+        else:
+            reason = result.get("reason") or "ismeretlen ok"
+            await interaction.followup.send(
+                f"⚠️ Test alert NEM ment ki (ok: `{reason}`).\n"
+                f"Ellenőrizd: van-e beállítva admin/alert csatorna, "
+                f"vagy némítva van-e a kampány."
+            )
 
 
 async def setup(bot: commands.Bot) -> None:

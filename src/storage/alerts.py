@@ -117,3 +117,12 @@ def mark_alert_routed(
         payload["routed_to_discord_user_id"] = routed_to_discord_user_id
 
     get_supabase().table(_TABLE).update(payload).eq("id", alert_id).execute()
+
+
+def mark_alert_suppressed(alert_id: int) -> None:
+    """Az alert megjelölése elnyomottként (csendes időben keletkezett, nem-kritikus).
+
+    A 10. lépés summarizere a 'suppressed' státuszú sorokból állít majd össze
+    egy reggeli összefoglalót; addig is jelzi, hogy szándékosan nem küldtük ki.
+    """
+    get_supabase().table(_TABLE).update({"status": "suppressed"}).eq("id", alert_id).execute()

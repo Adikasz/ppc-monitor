@@ -36,13 +36,23 @@ from src.storage import assignments as assignments_storage
 from src.storage import campaigns as campaigns_storage
 from src.storage import clients as clients_storage
 from src.storage import mutes as mutes_storage
+from src.utils import quiet_hours
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
 
-async def route_alert(alert: dict[str, Any]) -> dict[str, Any]:
-    """Egy riasztás kiküldése a megfelelő csatornákra (lásd modul-docstring)."""
+async def route_alert(
+    alert: dict[str, Any],
+    *,
+    bypass_quiet_hours: bool = False,
+) -> dict[str, Any]:
+    """Egy riasztás kiküldése a megfelelő csatornákra (lásd modul-docstring).
+
+    `bypass_quiet_hours=True` esetén a csendes idő nem nyomja el a nem-kritikus
+    riasztást — a manuális `/alert test` parancs használja, hogy a routing
+    bármikor tesztelhető legyen.
+    """
     alert_id = alert.get("id")
     campaign_id = alert.get("campaign_id")
     severity = (alert.get("severity") or "warning").lower()
@@ -72,6 +82,17 @@ async def route_alert(alert: dict[str, Any]) -> dict[str, Any]:
     if await asyncio.to_thread(mutes_storage.is_muted, campaign_id):
         log.info("Routing skip — kampány némítva (#%s, alert #%s)", campaign_id, alert_id)
         result["reason"] = "muted"
+        return result
+
+    # b2) Csendes idő — a nem-kritikus riasztást elnyomjuk (CRITICAL átmegy).
+    if severity != "critical" and not bypass_quiet_hours and quiet_hours.is_quiet_now():
+        log.info(
+            "Routing skip — csendes idő, nem-kritikus alert elnyomva (#%s, severity=%s)",
+            alert_id, severity,
+        )
+        if alert_id is not None:
+            await asyncio.to_thread(alerts_storage.mark_alert_suppressed, alert_id)
+        result["reason"] = "quiet_hours"
         return result
 
     # Ügyfél (címkéhez) + címzettek
@@ -137,16 +158,18 @@ async def route_alert(alert: dict[str, Any]) -> dict[str, Any]:
         # Email az ügyfélnek → 10b. lépés (clients.contact_email = %r)
         # itt majd: if client and client.get("contact_email"): ...
 
-    # e) Alert megjelölése elküldöttként (csak ha legalább egy csatorna sikerült)
+    # e) Alert megjelölése elküldöttként (csak ha legalább egy csatorna sikerült).
+    # A manuális /alert test fake anomáliának nincs DB id-ja → nem jelölünk.
     dispatched_at = datetime.now(timezone.utc).isoformat()
     if channels:
-        await asyncio.to_thread(
-            alerts_storage.mark_alert_routed,
-            alert_id,
-            discord_message_id=first_message_id,
-            clickup_task_id=str(clickup_res["task_id"]) if (clickup_res and clickup_res.get("task_id")) else None,
-            routed_to_discord_user_id=(result["recipients"][0] if result["recipients"] else None),
-        )
+        if alert_id is not None:
+            await asyncio.to_thread(
+                alerts_storage.mark_alert_routed,
+                alert_id,
+                discord_message_id=first_message_id,
+                clickup_task_id=str(clickup_res["task_id"]) if (clickup_res and clickup_res.get("task_id")) else None,
+                routed_to_discord_user_id=(result["recipients"][0] if result["recipients"] else None),
+            )
         result["routed"] = True
 
     result["channels"] = channels
