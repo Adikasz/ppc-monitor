@@ -10,14 +10,27 @@ végzi.
 Belépő:
     anomalies = await detect_anomalies_for_campaign(campaign_id, insights)
 
-Bemeneti `insights` (a 9. lépésben a Meta/Google metrics adja; addig stub):
-    {
-        "impressions": int, "clicks": int, "spend": float,
-        "conversions": float, "conversion_value": float,
-        "ctr": float, "cpc": float, "cpa": float, "roas": float,
-        # opcionális, ha a metrics réteg számolja (no-conversion szabályhoz):
-        "days_without_conversion": int,
-    }
+KPI-öröklés (15. lépés):
+    A "hatékony" (effective) KPI mezőnként:
+        campaign_kpis aktív érték  →  client_kpis érték  →  default
+    azaz a per-kampány érték felülírja a kliens-szintűt, és ha egyik sincs,
+    a beépített default lép életbe (warning=20%, critical=40%).
+
+Irány-érzékeny küszöbök (15. lépés):
+    - "magasabb a jobb" (ROAS, ROI, CTR):
+        WARNING  ha az érték < cél * (1 − warning_pct/100)
+        CRITICAL ha az érték < cél * (1 − critical_pct/100)
+    - "alacsonyabb a jobb" (CPA, CPL, CPC):
+        WARNING  ha az érték > cél * (1 + warning_pct/100)
+        CRITICAL ha az érték > cél * (1 + critical_pct/100)
+    - büdzsé: WARNING 90%, CRITICAL 100%.
+
+Mértékegységek (fontos a helyes összevetéshez):
+    - target_roas a ROAS szorzó (pl. 3.0 = 3×), az insights `roas` is szorzó → direkt.
+    - target_ctr százalék (pl. 3.5 = 3.5%); az insights `ctr` arány (0.035) → ×100.
+    - CPA/CPL/CPC forint → direkt.
+    - ROI: az insightsban jellemzően nincs `roi` mező, így az ROI-szabály csak
+      akkor aktiválódik, ha a metrics réteg külön szolgáltatja.
 
 Szűrés (lifecycle + mute + data_valid_from):
     - paused / ended            → nem jelez (skip)
@@ -30,7 +43,7 @@ Visszatérés (lista, üres ha nincs anomália):
     [{
         "campaign_id":     int,
         "severity":        "critical" | "warning",
-        "metric":          str,        # pl. "cpa_spike", "budget_depleted"
+        "metric":          str,        # pl. "cpa_spike", "roas_drop", "budget_depleted"
         "observed_value":  float,
         "threshold_value": float,
         "message":         str,        # emberi olvasható
@@ -42,8 +55,10 @@ import asyncio
 from datetime import date, datetime, timezone
 from typing import Any
 
-from src.storage import campaigns as campaigns_storage
+from src.storage import ad_accounts as ad_accounts_storage
+from src.storage import client_kpis as client_kpis_storage
 from src.storage import kpis as kpis_storage
+from src.storage import campaigns as campaigns_storage
 from src.storage.supabase_client import get_supabase
 from src.utils.logging import get_logger
 
@@ -54,11 +69,21 @@ _SKIP_LIFECYCLE = {"paused", "ended"}
 # Lifecycle állapotok, ahol csak CRITICAL megy (tanulási fázis)
 _CRITICAL_ONLY_LIFECYCLE = {"new", "learning"}
 
-# KPI default-ok, ha a campaign_kpis sorban az adott mező NULL
+# KPI default-ok
 _DEFAULT_NO_CONVERSION_DAYS = 3
-_DEFAULT_CPA_SPIKE_PCT = 50.0
+_DEFAULT_WARNING_PCT = 20.0
+_DEFAULT_CRITICAL_PCT = 40.0
 # Büdzsé-figyelmeztetés aránya (90%); a 100% már CRITICAL
 _BUDGET_WARNING_RATIO = 0.9
+
+# A campaign_kpis aktív sor + client_kpis közül „mergelt" mezők (öröklés).
+_KPI_FIELDS = (
+    "target_roas", "target_roi", "target_ctr",
+    "max_cpa", "max_cpl", "max_cpc",
+    "monthly_budget", "primary_conversion_event",
+    "warning_pct", "critical_pct",
+    "no_conversion_critical_days",
+)
 
 
 async def detect_anomalies_for_campaign(
@@ -87,16 +112,15 @@ async def detect_anomalies_for_campaign(
         log.debug("Detektor: #%s data_valid_from előtt — skip", campaign_id)
         return []
 
-    # 2) Aktív KPI-k (lehet None, ha még nincs beállítva — a szabályok kezelik)
-    kpis = await asyncio.to_thread(kpis_storage.get_active_kpis, campaign_id) or {}
+    # 2) Hatékony KPI-k: campaign_kpis aktív sor a kliens-default fölött mergelve.
+    campaign_kpis = await asyncio.to_thread(kpis_storage.get_active_kpis, campaign_id) or {}
+    client_kpis = await asyncio.to_thread(_client_kpis_for_campaign, campaign) or {}
+    effective = _merge_kpis(campaign_kpis, client_kpis)
 
     only_critical = lifecycle in _CRITICAL_ONLY_LIFECYCLE
 
-    # 3) Szabály-kiértékelés (tiszta, szinkron logika)
-    anomalies: list[dict[str, Any]] = []
-    anomalies.extend(_check_critical(campaign_id, insights, kpis))
-    if not only_critical:
-        anomalies.extend(_check_warning(campaign_id, insights, kpis))
+    # 3) Szabály-kiértékelés (tiszta, szinkron, DB-mentes logika → tesztelhető).
+    anomalies = _evaluate_rules(campaign_id, insights, effective, only_critical)
 
     if anomalies:
         log.info(
@@ -107,35 +131,70 @@ async def detect_anomalies_for_campaign(
 
 
 # ---------------------------------------------------------------------------
-# Szabály-kategóriák
+# KPI öröklés (campaign → client → default)
 # ---------------------------------------------------------------------------
 
-def _check_critical(
+def _client_kpis_for_campaign(campaign: dict[str, Any]) -> dict[str, Any] | None:
+    """A kampány kliensének KPI-sora (campaign → ad_account → client → client_kpis).
+
+    None, ha nincs (vagy ha a client_kpis tábla még nem létezik — a storage
+    réteg ezt elnyeli). A `campaigns` táblában NINCS közvetlen client_id, ezért
+    az ad_account-on keresztül oldjuk fel.
+    """
+    ad_account_id = campaign.get("ad_account_id")
+    if not ad_account_id:
+        return None
+    account = ad_accounts_storage.get_ad_account(ad_account_id)
+    if not account:
+        return None
+    return client_kpis_storage.get_client_kpis(account["client_id"])
+
+
+def _merge_kpis(
+    campaign_kpis: dict[str, Any],
+    client_kpis: dict[str, Any],
+) -> dict[str, Any]:
+    """Mezőnkénti öröklés: campaign érték, ha nem None; egyébként a kliens érték."""
+    effective: dict[str, Any] = {}
+    for field in _KPI_FIELDS:
+        camp_val = campaign_kpis.get(field)
+        effective[field] = camp_val if camp_val is not None else client_kpis.get(field)
+    return effective
+
+
+# ---------------------------------------------------------------------------
+# Szabály-kiértékelés (PURE — nincs DB hívás, így önállóan tesztelhető)
+# ---------------------------------------------------------------------------
+
+def _evaluate_rules(
     campaign_id: int,
     insights: dict[str, Any],
-    kpis: dict[str, Any],
+    eff: dict[str, Any],
+    only_critical: bool,
 ) -> list[dict[str, Any]]:
-    """CRITICAL szabályok (minden monitorozott lifecycle-re)."""
+    """A szabályok kiértékelése a hatékony KPI-k alapján."""
     out: list[dict[str, Any]] = []
+
+    warning_pct = _num(eff, "warning_pct")
+    warning_pct = warning_pct if warning_pct is not None else _DEFAULT_WARNING_PCT
+    critical_pct = _num(eff, "critical_pct")
+    critical_pct = critical_pct if critical_pct is not None else _DEFAULT_CRITICAL_PCT
 
     impressions = _num(insights, "impressions")
     spend = _num(insights, "spend")
     conversions = _num(insights, "conversions")
-    cpa = _num(insights, "cpa")
     days_no_conv = _num(insights, "days_without_conversion")
+    monthly_budget = _num(eff, "monthly_budget")
 
-    max_cpa = _num(kpis, "max_cpa")
-    monthly_budget = _num(kpis, "monthly_budget")
-
-    # 1) Leálltak a hirdetések: 0 megjelenés, de van költés
+    # 1) Leálltak a hirdetések: 0 megjelenés, de van költés (CRITICAL)
     if impressions is not None and spend is not None and impressions == 0 and spend > 0:
         out.append(_mk(
             campaign_id, "critical", "ads_stopped", spend, 0.0,
             f"Leálltak a hirdetések: {_fmt(spend)} Ft költés, 0 megjelenés",
         ))
 
-    # 2) X nap óta nincs konverzió (csak ha a metrics réteg adja a napszámot)
-    threshold_days = _int(kpis.get("no_conversion_critical_days"), _DEFAULT_NO_CONVERSION_DAYS)
+    # 2) X nap óta nincs konverzió (CRITICAL)
+    threshold_days = _int(eff.get("no_conversion_critical_days"), _DEFAULT_NO_CONVERSION_DAYS)
     if (
         conversions is not None and conversions == 0
         and days_no_conv is not None and days_no_conv >= threshold_days
@@ -145,52 +204,123 @@ def _check_critical(
             f"{int(days_no_conv)} nap óta nincs konverzió (küszöb: {threshold_days} nap)",
         ))
 
-    # 3) CPA spike: cpa > max_cpa * (1 + spike%/100)
-    if cpa is not None and max_cpa is not None and max_cpa > 0:
-        pct = _num(kpis, "cpa_spike_critical_pct")
-        pct = pct if pct is not None else _DEFAULT_CPA_SPIKE_PCT
-        spike_threshold = max_cpa * (1 + pct / 100)
-        if cpa > spike_threshold:
-            over_pct = round((cpa / max_cpa - 1) * 100)
-            out.append(_mk(
-                campaign_id, "critical", "cpa_spike", cpa, max_cpa,
-                f"CPA +{over_pct}% ({_fmt(cpa)} Ft vs cél {_fmt(max_cpa)} Ft)",
-            ))
+    # 3) "Magasabb a jobb" metrikák (ROAS, CTR, ROI)
+    for obs_key, target_key, metric, label, scale, decimals, unit in (
+        ("roas", "target_roas", "roas_drop", "ROAS", 1.0, 2, ""),
+        ("ctr", "target_ctr", "ctr_low", "CTR", 100.0, 2, "%"),
+        ("roi", "target_roi", "roi_low", "ROI", 1.0, 2, ""),
+    ):
+        anomaly = _higher_is_better(
+            campaign_id, insights, eff, obs_key, target_key, metric, label,
+            scale, decimals, unit, warning_pct, critical_pct, only_critical,
+        )
+        if anomaly:
+            out.append(anomaly)
 
-    # 4) Büdzsé 100%-ban elfogyott
-    if spend is not None and monthly_budget is not None and monthly_budget > 0 and spend >= monthly_budget:
-        out.append(_mk(
-            campaign_id, "critical", "budget_depleted", spend, monthly_budget,
-            f"Büdzsé 100%-ban elfogyott ({_fmt(spend)} / {_fmt(monthly_budget)} Ft)",
-        ))
+    # 4) "Alacsonyabb a jobb" metrikák (CPA, CPL, CPC) — forint
+    for obs_key, target_key, metric, label in (
+        ("cpa", "max_cpa", "cpa_spike", "CPA"),
+        ("cpl", "max_cpl", "cpl_high", "CPL"),
+        ("cpc", "max_cpc", "cpc_high", "CPC"),
+    ):
+        anomaly = _lower_is_better(
+            campaign_id, insights, eff, obs_key, target_key, metric, label,
+            warning_pct, critical_pct, only_critical,
+        )
+        if anomaly:
+            out.append(anomaly)
 
-    return out
-
-
-def _check_warning(
-    campaign_id: int,
-    insights: dict[str, Any],
-    kpis: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """WARNING szabályok (csak mature lifecycle-re)."""
-    out: list[dict[str, Any]] = []
-
-    spend = _num(insights, "spend")
-    monthly_budget = _num(kpis, "monthly_budget")
-
-    # Büdzsé 90%-on (de még nem 100% — azt a CRITICAL viszi)
+    # 5) Büdzsé (fix 90% / 100% küszöb)
     if spend is not None and monthly_budget is not None and monthly_budget > 0:
-        warn_threshold = monthly_budget * _BUDGET_WARNING_RATIO
-        if warn_threshold <= spend < monthly_budget:
+        if spend >= monthly_budget:
             out.append(_mk(
-                campaign_id, "warning", "budget_warning", spend, warn_threshold,
+                campaign_id, "critical", "budget_depleted", spend, monthly_budget,
+                f"Büdzsé 100%-ban elfogyott ({_fmt(spend)} / {_fmt(monthly_budget)} Ft)",
+            ))
+        elif not only_critical and spend >= monthly_budget * _BUDGET_WARNING_RATIO:
+            warn_th = monthly_budget * _BUDGET_WARNING_RATIO
+            out.append(_mk(
+                campaign_id, "warning", "budget_warning", spend, warn_th,
                 f"Büdzsé 90%-on ({_fmt(spend)} / {_fmt(monthly_budget)} Ft)",
             ))
 
-    # Trend-alapú WARNING-ok (ctr↓, cpc↑, roas↓): metrika-history kell hozzá,
-    # ami a napi metrics tárolásával (9. lépés+) lesz elérhető. Akkor ide kerül.
-
     return out
+
+
+def _higher_is_better(
+    campaign_id: int,
+    insights: dict[str, Any],
+    eff: dict[str, Any],
+    obs_key: str,
+    target_key: str,
+    metric: str,
+    label: str,
+    scale: float,
+    decimals: int,
+    unit: str,
+    warning_pct: float,
+    critical_pct: float,
+    only_critical: bool,
+) -> dict[str, Any] | None:
+    """ROAS/ROI/CTR jellegű: a cél ALATT WARNING/CRITICAL."""
+    obs = _num(insights, obs_key)
+    target = _num(eff, target_key)
+    if obs is None or target is None or target <= 0:
+        return None
+
+    value = obs * scale
+    crit_th = target * (1 - critical_pct / 100)
+    warn_th = target * (1 - warning_pct / 100)
+
+    if value < crit_th:
+        return _mk(
+            campaign_id, "critical", metric, value, crit_th,
+            f"{label} {_fmtn(value, decimals)}{unit} a cél {_fmtn(target, decimals)}{unit} alatt "
+            f"(−{_pct(critical_pct)}% kritikus küszöb: {_fmtn(crit_th, decimals)}{unit})",
+        )
+    if not only_critical and value < warn_th:
+        return _mk(
+            campaign_id, "warning", metric, value, warn_th,
+            f"{label} {_fmtn(value, decimals)}{unit} a cél {_fmtn(target, decimals)}{unit} alatt "
+            f"(−{_pct(warning_pct)}% warning küszöb: {_fmtn(warn_th, decimals)}{unit})",
+        )
+    return None
+
+
+def _lower_is_better(
+    campaign_id: int,
+    insights: dict[str, Any],
+    eff: dict[str, Any],
+    obs_key: str,
+    target_key: str,
+    metric: str,
+    label: str,
+    warning_pct: float,
+    critical_pct: float,
+    only_critical: bool,
+) -> dict[str, Any] | None:
+    """CPA/CPL/CPC jellegű (forint): a cél FÖLÖTT WARNING/CRITICAL."""
+    obs = _num(insights, obs_key)
+    target = _num(eff, target_key)
+    if obs is None or target is None or target <= 0:
+        return None
+
+    crit_th = target * (1 + critical_pct / 100)
+    warn_th = target * (1 + warning_pct / 100)
+
+    if obs > crit_th:
+        return _mk(
+            campaign_id, "critical", metric, obs, crit_th,
+            f"{label} {_fmt(obs)} Ft a cél {_fmt(target)} Ft felett "
+            f"(+{_pct(critical_pct)}% kritikus küszöb: {_fmt(crit_th)} Ft)",
+        )
+    if not only_critical and obs > warn_th:
+        return _mk(
+            campaign_id, "warning", metric, obs, warn_th,
+            f"{label} {_fmt(obs)} Ft a cél {_fmt(target)} Ft felett "
+            f"(+{_pct(warning_pct)}% warning küszöb: {_fmt(warn_th)} Ft)",
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +369,18 @@ def _fmt(v: float | None) -> str:
     if v is None:
         return "—"
     return str(int(v)) if float(v).is_integer() else f"{v:.2f}"
+
+
+def _fmtn(v: float, decimals: int) -> str:
+    """Formázás adott tizedesjeggyel (decimals=0 → egész-barát _fmt)."""
+    if decimals <= 0:
+        return _fmt(v)
+    return f"{v:.{decimals}f}"
+
+
+def _pct(x: float) -> str:
+    """Százalék formázása: egész → tizedes nélkül."""
+    return str(int(x)) if float(x).is_integer() else f"{x:.1f}"
 
 
 def _is_muted(campaign_id: int) -> bool:

@@ -33,7 +33,10 @@ from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import assignments as assignments_storage
 from src.storage import audit
 from src.storage import campaigns as campaigns_storage
+from src.storage import client_kpis as client_kpis_storage
 from src.storage import clients as clients_storage
+from src.storage import kpis as kpis_storage
+from src.storage import users as users_storage
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -85,6 +88,30 @@ def _resolve_client(value: str) -> dict | None:
 
 def _insights_emoji(enabled: object) -> str:
     return "🟢" if enabled else "🔴"
+
+
+def _display_name(member: discord.Member | discord.User) -> str:
+    """Emberi olvasható név Discord member/user objektumból."""
+    if isinstance(member, discord.Member) and member.nick:
+        return member.nick
+    return member.display_name or member.name
+
+
+def _money(v: object) -> str:
+    """Forint-összeg formázása ezres szóközzel (150000 → '150 000')."""
+    try:
+        return f"{int(float(v)):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _pct_int(v: object) -> str:
+    """Százalék rövid formázása (20.0 → '20')."""
+    try:
+        f = float(v)
+        return str(int(f)) if f.is_integer() else f"{f:g}"
+    except (TypeError, ValueError):
+        return str(v)
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +494,325 @@ class ClientCog(commands.GroupCog, group_name="client"):
             f"✅ **{name}** onboardolva: {result['inserted']} kampány felfedezve.\n"
             + "\n".join(detail_lines)
         )
+
+    # ------------------------------------------------------------------
+    # /client assign client:<> user:<@OM> [role]
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="assign",
+        description="OM hozzárendelése a kliens MINDEN kampányához (kaszkád, admin)",
+    )
+    @app_commands.describe(
+        client="Az ügyfél neve vagy numerikus azonosítója",
+        user="A hozzárendelendő Discord felhasználó (OM)",
+        role="primary (elsődleges) vagy supporter (helyettes) — alap: primary",
+    )
+    @app_commands.choices(role=[
+        app_commands.Choice(name="primary — elsődleges felelős", value="primary"),
+        app_commands.Choice(name="supporter — helyettes OM", value="supporter"),
+    ])
+    async def assign(
+        self,
+        interaction: discord.Interaction,
+        client: str,
+        user: discord.Member,
+        role: app_commands.Choice[str] | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+
+        role_value = role.value if role else "primary"
+
+        c = await asyncio.to_thread(_resolve_client, client)
+        if c is None:
+            await interaction.followup.send(
+                f"❌ Nem található ügyfél: **{client}**\nNézd meg: `/client list`"
+            )
+            return
+
+        # OM auto-regisztráció
+        user_row, user_created = await asyncio.to_thread(
+            users_storage.get_or_create_user, str(user.id), _display_name(user)
+        )
+        if user_created:
+            log.info("Új felhasználó regisztrálva: %s (%s)", user, user.id)
+
+        # 1) Kliens-szintű hozzárendelés (öröklés forrása — az új kampányok ebből
+        #    öröklik a hozzárendelést a discovery során).
+        await asyncio.to_thread(
+            assignments_storage.create_assignment,
+            user_id=user_row["id"],
+            client_id=c["id"],
+            role=role_value,
+            created_by_discord_user_id=str(interaction.user.id),
+        )
+
+        # 2) Kaszkád a kliens jelenlegi (nem-ended) kampányaira.
+        campaigns = await asyncio.to_thread(campaigns_storage.list_campaigns, c["id"])
+        campaign_ids = [row["id"] for row in campaigns]
+        casc = await asyncio.to_thread(
+            assignments_storage.bulk_assign_campaigns,
+            user_row["id"],
+            campaign_ids,
+            role=role_value,
+            created_by_discord_user_id=str(interaction.user.id),
+        )
+
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "client_assign",
+            entity_type="client",
+            entity_id=c["id"],
+            details={
+                "client_name": c["name"],
+                "user_discord_id": str(user.id),
+                "user_name": _display_name(user),
+                "role": role_value,
+                "campaigns": casc["total"],
+                "created": casc["created"],
+                "updated": casc["updated"],
+            },
+        )
+
+        log.info(
+            "Kliens-assign: %s → %s (%s, %d kampány)",
+            user, c["name"], role_value, casc["total"],
+        )
+        await interaction.followup.send(
+            f"✅ {user.mention} hozzárendelve: **{c['name']}** "
+            f"({casc['total']} kampány, {role_value})"
+        )
+
+    # ------------------------------------------------------------------
+    # /client unassign client:<> user:<@OM>
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="unassign",
+        description="OM eltávolítása a kliens összes kampányáról (admin)",
+    )
+    @app_commands.describe(
+        client="Az ügyfél neve vagy numerikus azonosítója",
+        user="Az eltávolítandó Discord felhasználó",
+    )
+    async def unassign(
+        self,
+        interaction: discord.Interaction,
+        client: str,
+        user: discord.Member,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+
+        c = await asyncio.to_thread(_resolve_client, client)
+        if c is None:
+            await interaction.followup.send(
+                f"❌ Nem található ügyfél: **{client}**\nNézd meg: `/client list`"
+            )
+            return
+
+        user_row = await asyncio.to_thread(
+            users_storage.get_user_by_discord_id, str(user.id)
+        )
+        if user_row is None:
+            await interaction.followup.send(
+                f"**{_display_name(user)}** nincs a rendszerben — nem volt hozzárendelve."
+            )
+            return
+
+        # Kliens-szintű hozzárendelés törlése (öröklés-forrás megszüntetése).
+        await asyncio.to_thread(
+            assignments_storage.delete_assignment,
+            user_id=user_row["id"],
+            client_id=c["id"],
+        )
+
+        # Kampány-szintű hozzárendelések törlése a kliens ÖSSZES kampányáról
+        # (ended-eket is beleértve, hogy ne maradjon árva sor).
+        campaigns = await asyncio.to_thread(
+            campaigns_storage.list_campaigns, c["id"], active_only=False
+        )
+        campaign_ids = [row["id"] for row in campaigns]
+        deleted = await asyncio.to_thread(
+            assignments_storage.bulk_unassign_campaigns, user_row["id"], campaign_ids
+        )
+
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "client_unassign",
+            entity_type="client",
+            entity_id=c["id"],
+            details={
+                "client_name": c["name"],
+                "user_discord_id": str(user.id),
+                "user_name": _display_name(user),
+                "deleted_campaign_assignments": deleted,
+            },
+        )
+
+        log.info("Kliens-unassign: %s ← %s (%d törölve)", user, c["name"], deleted)
+        await interaction.followup.send(
+            f"✅ {user.mention} eltávolítva: **{c['name']}** "
+            f"({deleted} kampány-hozzárendelés törölve)"
+        )
+
+    # ------------------------------------------------------------------
+    # /client kpi client:<> [KPI mezők...]
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="kpi",
+        description="Kliens-szintű KPI + lecsorgatás minden kampányra (admin)",
+    )
+    @app_commands.describe(
+        client="Az ügyfél neve vagy numerikus azonosítója",
+        target_roas="Cél ROAS szorzó (pl. 3.0 = 3×)",
+        max_cpa="Max CPA (Ft)",
+        monthly_budget="Havi büdzsé (Ft)",
+        warning_pct="Warning küszöb százalék (alap: 20)",
+        critical_pct="Critical küszöb százalék (alap: 40)",
+        target_roi="Cél ROI",
+        max_cpl="Max CPL (Ft)",
+        target_ctr="Cél CTR (%)",
+        max_cpc="Max CPC (Ft)",
+        primary_conversion_event="Elsődleges konverzió esemény (pl. Purchase)",
+    )
+    async def kpi(
+        self,
+        interaction: discord.Interaction,
+        client: str,
+        target_roas: float | None = None,
+        max_cpa: float | None = None,
+        monthly_budget: float | None = None,
+        warning_pct: float | None = None,
+        critical_pct: float | None = None,
+        target_roi: float | None = None,
+        max_cpl: float | None = None,
+        target_ctr: float | None = None,
+        max_cpc: float | None = None,
+        primary_conversion_event: str | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+
+        c = await asyncio.to_thread(_resolve_client, client)
+        if c is None:
+            await interaction.followup.send(
+                f"❌ Nem található ügyfél: **{client}**\nNézd meg: `/client list`"
+            )
+            return
+
+        inputs = {
+            k: v for k, v in {
+                "target_roas": target_roas,
+                "max_cpa": max_cpa,
+                "monthly_budget": monthly_budget,
+                "warning_pct": warning_pct,
+                "critical_pct": critical_pct,
+                "target_roi": target_roi,
+                "max_cpl": max_cpl,
+                "target_ctr": target_ctr,
+                "max_cpc": max_cpc,
+                "primary_conversion_event": primary_conversion_event,
+            }.items() if v is not None
+        }
+        if not inputs:
+            await interaction.followup.send("❌ Adj meg legalább egy KPI mezőt.")
+            return
+
+        # 1) Kliens-szintű KPI upsert
+        try:
+            client_row = await asyncio.to_thread(
+                client_kpis_storage.upsert_client_kpis, c["id"], fields=inputs
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Hiba a kliens-KPI mentésekor (#%s)", c["id"])
+            await interaction.followup.send(
+                f"❌ Nem sikerült a kliens-KPI mentése: `{exc}`\n"
+                f"Lehet, hogy a `0009_client_cascade.sql` migráció (client_kpis tábla) "
+                f"még nem futott le."
+            )
+            return
+
+        # 2) Lecsorgatás a kliens kampányaira (a tárolt — defaultokkal kiegészített
+        #    — kliens-értékekből; a kézi /campaign kpi override-okat megőrzi).
+        cascade_values = {
+            f: client_row[f]
+            for f in client_kpis_storage.CASCADE_FIELDS
+            if client_row.get(f) is not None
+        }
+        campaigns = await asyncio.to_thread(campaigns_storage.list_campaigns, c["id"])
+        campaign_ids = [row["id"] for row in campaigns]
+        try:
+            casc = await asyncio.to_thread(
+                kpis_storage.cascade_client_kpis_to_campaigns,
+                campaign_ids,
+                values=cascade_values,
+                set_by_discord_user_id=str(interaction.user.id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Hiba a KPI kaszkádban (#%s)", c["id"])
+            await interaction.followup.send(
+                f"⚠️ A kliens-KPI elmentve, de a kaszkád hibázott: `{exc}`\n"
+                f"(Lehet, hogy a campaign_kpis `warning_pct`/`critical_pct` oszlopok "
+                f"hiányoznak — `0009` migráció.)"
+            )
+            return
+
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "client_kpi",
+            entity_type="client",
+            entity_id=c["id"],
+            details={"client_name": c["name"], "fields": inputs, "cascade": casc},
+        )
+
+        written = casc["updated"] + casc["inserted"]
+        log.info("Kliens-KPI: %s → %d kampány frissítve", c["name"], written)
+
+        # Összefoglaló sorok
+        summary_bits: list[str] = []
+        if client_row.get("target_roas") is not None:
+            summary_bits.append(f"ROAS target: {_pct_int(client_row['target_roas'])}")
+        if client_row.get("target_roi") is not None:
+            summary_bits.append(f"ROI: {_pct_int(client_row['target_roi'])}")
+        if client_row.get("max_cpa") is not None:
+            summary_bits.append(f"Max CPA: {_money(client_row['max_cpa'])} Ft")
+        if client_row.get("max_cpl") is not None:
+            summary_bits.append(f"Max CPL: {_money(client_row['max_cpl'])} Ft")
+        if client_row.get("target_ctr") is not None:
+            summary_bits.append(f"Cél CTR: {_pct_int(client_row['target_ctr'])}%")
+        if client_row.get("max_cpc") is not None:
+            summary_bits.append(f"Max CPC: {_money(client_row['max_cpc'])} Ft")
+        if client_row.get("monthly_budget") is not None:
+            summary_bits.append(f"Büdzsé: {_money(client_row['monthly_budget'])} Ft")
+        if client_row.get("primary_conversion_event"):
+            summary_bits.append(f"Konverzió: {client_row['primary_conversion_event']}")
+
+        w = client_row.get("warning_pct")
+        cr = client_row.get("critical_pct")
+        thr_line = f"Warning: -{_pct_int(w)}% | Critical: -{_pct_int(cr)}%"
+
+        msg = (
+            f"✅ KPI beállítva: **{c['name']}** ({written} kampány frissítve)\n"
+            f"{' | '.join(summary_bits)}\n{thr_line}"
+        )
+        if casc["skipped_override"]:
+            msg += (
+                f"\nℹ️ {casc['skipped_override']} kampány kihagyva "
+                f"(kézi `/campaign kpi` override megmaradt)"
+            )
+        await interaction.followup.send(msg)
 
 
 async def setup(bot: commands.Bot) -> None:

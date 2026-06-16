@@ -141,3 +141,81 @@ def set_kpis(
         campaign_id, new_kpi["id"],
     )
     return new_kpi
+
+
+# ---------------------------------------------------------------------------
+# Kliens-szintű KPI kaszkád (15. lépés)
+# ---------------------------------------------------------------------------
+
+def _chunks(seq: list[Any], size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def cascade_client_kpis_to_campaigns(
+    campaign_ids: list[int],
+    *,
+    values: dict[str, Any],
+    set_by_discord_user_id: str | None = None,
+) -> dict[str, int]:
+    """Kliens KPI-értékek lecsorgatása a megadott kampányok aktív KPI-sorába.
+
+    A `values` a campaign_kpis-kompatibilis mezők (target_roas, max_cpa, …,
+    warning_pct, critical_pct). Kampányonként:
+      - ha van aktív campaign_kpis sor ÉS az KÉZI override (inherited_from_client
+        = false) → KIHAGYJUK (a per-kampány override megmarad);
+      - ha van aktív, de örökölt sor → helyben UPDATE az új kliens-értékekkel;
+      - ha nincs aktív sor → új sort szúrunk be (is_active=true,
+        inherited_from_client=true).
+
+    Visszatérés: {"updated", "inserted", "skipped_override", "total"}.
+    """
+    result = {"updated": 0, "inserted": 0, "skipped_override": 0, "total": len(campaign_ids)}
+    if not campaign_ids:
+        return result
+
+    sb = get_supabase()
+
+    # Aktív sorok bulk-lekérése a kampányokra (egy körrel, nem N+1).
+    active_rows: list[dict[str, Any]] = []
+    for chunk in _chunks(campaign_ids, 200):
+        rows = (
+            sb.table(_TABLE)
+            .select("id, campaign_id, inherited_from_client")
+            .in_("campaign_id", chunk)
+            .eq("is_active", True)
+            .execute()
+            .data
+            or []
+        )
+        active_rows.extend(rows)
+    active_by_cid = {r["campaign_id"]: r for r in active_rows}
+
+    to_insert: list[dict[str, Any]] = []
+    for cid in campaign_ids:
+        row = active_by_cid.get(cid)
+        if row is not None:
+            if not row.get("inherited_from_client", False):
+                result["skipped_override"] += 1
+                continue
+            sb.table(_TABLE).update(
+                {**values, "inherited_from_client": True}
+            ).eq("id", row["id"]).execute()
+            result["updated"] += 1
+        else:
+            payload: dict[str, Any] = {
+                "campaign_id": cid,
+                "is_active": True,
+                "inherited_from_client": True,
+                **values,
+            }
+            if set_by_discord_user_id is not None:
+                payload["set_by_discord_user_id"] = set_by_discord_user_id
+            to_insert.append(payload)
+
+    for chunk in _chunks(to_insert, 500):
+        if chunk:
+            sb.table(_TABLE).insert(chunk).execute()
+            result["inserted"] += len(chunk)
+
+    return result

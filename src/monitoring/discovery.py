@@ -39,6 +39,7 @@ from typing import Any
 from src.integrations.google_ads import GoogleAdsClient
 from src.integrations.meta_ads import MetaAdsClient
 from src.storage import ad_accounts as ad_accounts_storage
+from src.storage import assignments as assignments_storage
 from src.storage import campaigns as campaigns_storage
 from src.storage.supabase_client import get_supabase
 from src.utils.logging import get_logger
@@ -155,6 +156,7 @@ def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
 
             try:
                 _upsert_campaign(
+                    client_id=client_id,
                     db_account_id=db_account_id,
                     ext_campaign_id=ext_campaign_id,
                     api_campaign=api_c,
@@ -250,13 +252,19 @@ def _fetch_campaigns(
 # ---------------------------------------------------------------------------
 
 def _upsert_campaign(
+    client_id: int,
     db_account_id: int,
     ext_campaign_id: str,
     api_campaign: dict[str, Any],
     now: datetime,
     result: dict[str, Any],
 ) -> None:
-    """Egy kampány INSERT vagy UPDATE a DB-be (platform-független)."""
+    """Egy kampány INSERT vagy UPDATE a DB-be (platform-független).
+
+    ÚJ kampány beszúrásakor örökli a kliens-szintű hozzárendeléseket
+    (15. lépés) — így a discovery után felfedezett kampányok automatikusan
+    a megfelelő OM-ekhez kerülnek.
+    """
     sb = get_supabase()
 
     # Létezik-e már?
@@ -273,7 +281,7 @@ def _upsert_campaign(
 
     if not existing_res.data:
         # --- INSERT ---
-        campaigns_storage.create_campaign(
+        new_camp = campaigns_storage.create_campaign(
             ad_account_id=db_account_id,
             external_campaign_id=ext_campaign_id,
             name=api_campaign["name"],
@@ -286,6 +294,21 @@ def _upsert_campaign(
             "Discovery: ÚJ kampány → #%s '%s' (fiók_db=%s, status=%s)",
             ext_campaign_id, api_campaign["name"], db_account_id, status,
         )
+        # Kliens-szintű hozzárendelések öröklése az új kampányra. A hiba nem
+        # buktathatja meg a discovery-t (fault isolation).
+        try:
+            inherited = assignments_storage.inherit_client_assignments_for_campaign(
+                client_id, new_camp["id"]
+            )
+            if inherited:
+                log.info(
+                    "Discovery: %d öröklött hozzárendelés az új kampányra #%s",
+                    inherited, new_camp["id"],
+                )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "Discovery: hozzárendelés-öröklés hiba (kampány #%s)", new_camp["id"]
+            )
     else:
         # --- UPDATE ---
         db_id: int = existing_res.data[0]["id"]

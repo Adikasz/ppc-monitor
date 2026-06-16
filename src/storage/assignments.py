@@ -219,3 +219,156 @@ def delete_assignment(
     )
     query.execute()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Kliens-szintű kaszkád (15. lépés)
+# ---------------------------------------------------------------------------
+
+def _chunks(seq: list[Any], size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _insert_assignment_rows(rows: list[dict[str, Any]]) -> None:
+    """Bulk INSERT, az inherited_from_client oszlop hiányát toleráló degradációval.
+
+    Ha a 0009 migration még nem futott le, a flag nélkül próbáljuk újra — így a
+    kliens-assign a migráció előtt is működik (csak jelöletlen sorokkal).
+    """
+    if not rows:
+        return
+    sb = get_supabase()
+    try:
+        sb.table(_TABLE).insert(rows).execute()
+    except Exception as exc:  # noqa: BLE001
+        if "inherited_from_client" in str(exc).lower():
+            stripped = [
+                {k: v for k, v in r.items() if k != "inherited_from_client"} for r in rows
+            ]
+            sb.table(_TABLE).insert(stripped).execute()
+        else:
+            raise
+
+
+def bulk_assign_campaigns(
+    user_id: int,
+    campaign_ids: list[int],
+    *,
+    role: str = "primary",
+    created_by_discord_user_id: str | None = None,
+) -> dict[str, int]:
+    """A user kampány-szintű hozzárendelése a megadott kampányokhoz (öröklött).
+
+    Idempotens: meglévő (user, campaign) párnál csak a role-t igazítja, ha eltér;
+    egyébként új, inherited_from_client=true sort szúr be (bulk, csonkolva).
+
+    Visszatérés: {"created", "updated", "total"}.
+    """
+    result = {"created": 0, "updated": 0, "total": len(campaign_ids)}
+    if not campaign_ids:
+        return result
+
+    sb = get_supabase()
+
+    existing_by_cid: dict[int, dict[str, Any]] = {}
+    for chunk in _chunks(campaign_ids, 200):
+        rows = (
+            sb.table(_TABLE)
+            .select("id, campaign_id, role")
+            .eq("user_id", user_id)
+            .in_("campaign_id", chunk)
+            .execute()
+            .data
+            or []
+        )
+        for r in rows:
+            existing_by_cid[r["campaign_id"]] = r
+
+    to_insert: list[dict[str, Any]] = []
+    for cid in campaign_ids:
+        row = existing_by_cid.get(cid)
+        if row is None:
+            payload: dict[str, Any] = {
+                "user_id": user_id,
+                "campaign_id": cid,
+                "role": role,
+                "inherited_from_client": True,
+            }
+            if created_by_discord_user_id is not None:
+                payload["created_by_discord_user_id"] = created_by_discord_user_id
+            to_insert.append(payload)
+        elif row.get("role") != role:
+            sb.table(_TABLE).update({"role": role}).eq("id", row["id"]).execute()
+            result["updated"] += 1
+
+    for chunk in _chunks(to_insert, 500):
+        _insert_assignment_rows(chunk)
+        result["created"] += len(chunk)
+
+    return result
+
+
+def bulk_unassign_campaigns(user_id: int, campaign_ids: list[int]) -> int:
+    """A user összes kampány-szintű hozzárendelésének törlése a megadott kampányokról.
+
+    Visszatérés: a törölt sorok száma.
+    """
+    if not campaign_ids:
+        return 0
+    sb = get_supabase()
+    deleted = 0
+    for chunk in _chunks(campaign_ids, 200):
+        existing = (
+            sb.table(_TABLE)
+            .select("id")
+            .eq("user_id", user_id)
+            .in_("campaign_id", chunk)
+            .execute()
+            .data
+            or []
+        )
+        if not existing:
+            continue
+        sb.table(_TABLE).delete().eq("user_id", user_id).in_("campaign_id", chunk).execute()
+        deleted += len(existing)
+    return deleted
+
+
+def inherit_client_assignments_for_campaign(client_id: int, campaign_id: int) -> int:
+    """Egy ÚJ kampányra örökíti a kliens-szintű hozzárendeléseket (discovery hívja).
+
+    Minden userre, akinek van kliens-szintű (client_id, campaign_id=null)
+    hozzárendelése ehhez a klienshez, létrehoz egy öröklött kampány-szintű sort,
+    ha még nincs hozzárendelése a kampányon.
+
+    Visszatérés: a létrehozott öröklött hozzárendelések száma.
+    """
+    client_assigns = get_assignments_for_client(client_id)
+    if not client_assigns:
+        return 0
+
+    sb = get_supabase()
+    existing = (
+        sb.table(_TABLE)
+        .select("user_id")
+        .eq("campaign_id", campaign_id)
+        .execute()
+        .data
+        or []
+    )
+    already = {r["user_id"] for r in existing}
+
+    to_insert: list[dict[str, Any]] = []
+    for a in client_assigns:
+        uid = a["user_id"]
+        if uid in already:
+            continue
+        to_insert.append({
+            "user_id": uid,
+            "campaign_id": campaign_id,
+            "role": a.get("role") or "primary",
+            "inherited_from_client": True,
+        })
+    _insert_assignment_rows(to_insert)
+    return len(to_insert)
