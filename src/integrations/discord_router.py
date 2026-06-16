@@ -40,6 +40,32 @@ def set_client(client: Any) -> None:
     log.info("Discord router kliens beállítva")
 
 
+def _parse_channel_id(raw: str) -> int | None:
+    """Csatorna ID kinyerése nyers ID-ből VAGY Discord URL-ből.
+
+    Elfogad:
+      - "1509567720868417656"                      → 1509567720868417656
+      - ".../channels/<guild>/<channel>"           → <channel> (utolsó szegmens)
+      - "<#1509567720868417656>" mention formátum  → 1509567720868417656
+
+    Így a .env-be véletlenül beillesztett teljes csatorna-URL is működik
+    (gyakori hiba), nem csak a tiszta numerikus ID.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip().strip("<#>")
+    if not text:
+        return None
+    # URL vagy bármilyen elválasztó esetén az utolsó nem-üres szegmenst vesszük.
+    if "/" in text:
+        segments = [s for s in text.split("/") if s]
+        text = segments[-1] if segments else ""
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
 async def _resolve_channel(channel_id_raw: str) -> Any:
     """Csatorna objektum a konfigurált ID-ből (cache vagy API). None ha nem megy."""
     if not channel_id_raw:
@@ -47,10 +73,9 @@ async def _resolve_channel(channel_id_raw: str) -> Any:
     if _client is None:
         log.warning("Discord router: nincs kliens beállítva (set_client) — küldés kihagyva")
         return None
-    try:
-        cid = int(channel_id_raw)
-    except (TypeError, ValueError):
-        log.warning("Discord router: érvénytelen csatorna ID: %r", channel_id_raw)
+    cid = _parse_channel_id(channel_id_raw)
+    if cid is None:
+        log.warning("Discord router: érvénytelen csatorna ID/URL: %r", channel_id_raw)
         return None
 
     channel = _client.get_channel(cid)

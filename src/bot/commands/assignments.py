@@ -1,19 +1,22 @@
 """
 /assign, /unassign, /my-clients slash parancsok.
 
-Ezekkel a parancsokkal rendelhetők hozzá account managerek ügyfelekhez,
-és kérdezhetők le a saját ügyfeleik.
+Ezekkel a parancsokkal rendelhetők hozzá account managerek KAMPÁNYOKHOZ
+(campaign_id alapján), és kérdezhetők le a saját hozzárendeléseik.
 
 Parancsok:
-    /assign   client:<név> manager:<@user>  — OM hozzárendelése ügyfélhez
-    /unassign client:<név> manager:<@user>  — OM eltávolítása ügyfélről
-    /my-clients                             — saját ügyfeleim listája
+    /assign   campaign_id:<id> user:<@user> [role:primary|supporter]
+                                            — OM hozzárendelése kampányhoz
+    /unassign campaign_id:<id> user:<@user> — OM eltávolítása kampányról
+    /my-clients                             — saját (ügyfél-szintű) hozzárendeléseim
 
 Megjegyzések:
   - Az /assign és /unassign az admin csatornára van korlátozva.
   - A /my-clients bárhonnan hívható (ephemeral válasz).
   - Az /assign automatikusan létrehozza a users táblában az érintett
     személyt, ha még nem létezik (auto-registration).
+  - A hozzárendelés a campaigns táblában keresett campaign_id-hez köt
+    (assignments.campaign_id). A role 'primary' vagy 'supporter'.
   - Minden írási művelet auditálva van (audit_log tábla).
   - Minden Supabase hívás asyncio.to_thread()-ben fut, hogy ne blokkolja az event loop-ot.
 """
@@ -27,7 +30,7 @@ from discord.ext import commands
 
 from src.config import get_config
 from src.storage import assignments as assignments_storage
-from src.storage import clients as clients_storage
+from src.storage import campaigns as campaigns_storage
 from src.storage import users as users_storage
 from src.storage import audit
 from src.utils.logging import get_logger
@@ -76,21 +79,29 @@ class AssignmentsCog(commands.Cog):
         self.bot = bot
 
     # ------------------------------------------------------------------
-    # /assign client:<név> manager:<@user>
+    # /assign campaign_id:<id> user:<@user> [role]
     # ------------------------------------------------------------------
     @app_commands.command(
         name="assign",
-        description="Account manager hozzárendelése ügyfélhez (admin csatorna)",
+        description="Account manager hozzárendelése kampányhoz (admin csatorna)",
     )
     @app_commands.describe(
-        client_name="Az ügyfél neve (pontosan, ahogy a /clients list mutatja)",
-        manager="A hozzárendelendő Discord felhasználó",
+        campaign_id="A kampány numerikus azonosítója (/campaign list mutatja)",
+        user="A hozzárendelendő Discord felhasználó",
+        role="primary (elsődleges felelős) vagy supporter (helyettes) — alap: primary",
+    )
+    @app_commands.choices(
+        role=[
+            app_commands.Choice(name="primary — elsődleges felelős", value="primary"),
+            app_commands.Choice(name="supporter — helyettes OM", value="supporter"),
+        ]
     )
     async def assign(
         self,
         interaction: discord.Interaction,
-        client_name: str,
-        manager: discord.Member,
+        campaign_id: int,
+        user: discord.Member,
+        role: app_commands.Choice[str] | None = None,
     ) -> None:
         # ELSŐ sor: defer — azonnal jelzi Discordnak, hogy dolgozunk
         await interaction.response.defer(ephemeral=True)
@@ -101,44 +112,39 @@ class AssignmentsCog(commands.Cog):
             )
             return
 
-        # 1) Ügyfél megkeresése — to_thread: nem blokkolja az event loop-ot
-        client = await asyncio.to_thread(
-            clients_storage.get_client_by_name, client_name.strip()
-        )
-        if client is None:
+        role_value = role.value if role else "primary"
+
+        # 1) Kampány megkeresése — campaign_id alapján a campaigns táblában
+        campaign = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
+        if campaign is None:
             await interaction.followup.send(
-                f"Nem található ügyfél ezzel a névvel: **{client_name}**\n"
-                f"Ellenőrizd a `/clients list` paranccsal az elérhető ügyfeleket."
+                f"❌ Kampány nem található: **#{campaign_id}**\n"
+                f"Ellenőrizd a `/campaign list` paranccsal az elérhető kampányokat."
             )
             return
 
-        if not client.get("is_active", True):
-            await interaction.followup.send(
-                f"Az ügyfél **{client_name}** inaktív, nem rendelhető hozzá manager."
-            )
-            return
-
-        # 2) Manager auto-regisztráció (users tábla)
+        # 2) Felhasználó auto-regisztráció (users tábla)
         user_row, user_created = await asyncio.to_thread(
             users_storage.get_or_create_user,
-            str(manager.id),
-            _display_name(manager),
+            str(user.id),
+            _display_name(user),
         )
         if user_created:
-            log.info("Új felhasználó regisztrálva: %s (%s)", manager, manager.id)
+            log.info("Új felhasználó regisztrálva: %s (%s)", user, user.id)
 
-        # 3) Hozzárendelés létrehozása
+        # 3) Hozzárendelés létrehozása (kampány-szintű)
         assignment, created = await asyncio.to_thread(
             assignments_storage.create_assignment,
             user_id=user_row["id"],
-            client_id=client["id"],
+            campaign_id=campaign_id,
+            role=role_value,
             created_by_discord_user_id=str(interaction.user.id),
         )
 
         if not created:
             await interaction.followup.send(
-                f"**{_display_name(manager)}** már hozzá van rendelve "
-                f"a **{client['name']}** ügyfélhez."
+                f"**{_display_name(user)}** már hozzá van rendelve a "
+                f"**#{campaign_id} — {campaign['name']}** kampányhoz (`{role_value}`)."
             )
             return
 
@@ -150,38 +156,40 @@ class AssignmentsCog(commands.Cog):
             entity_type="assignment",
             entity_id=assignment["id"],
             details={
-                "client_id": client["id"],
-                "client_name": client["name"],
-                "manager_discord_id": str(manager.id),
-                "manager_name": _display_name(manager),
+                "campaign_id": campaign_id,
+                "campaign_name": campaign["name"],
+                "user_discord_id": str(user.id),
+                "user_name": _display_name(user),
+                "role": role_value,
             },
         )
 
         log.info(
-            "Hozzárendelve: %s → ügyfél %s (assignment #%s)",
-            manager, client["name"], assignment["id"],
+            "Hozzárendelve: %s → kampány #%s (%s, assignment #%s)",
+            user, campaign_id, role_value, assignment["id"],
         )
         await interaction.followup.send(
-            f"✅ **{_display_name(manager)}** hozzárendelve a **{client['name']}** ügyfélhez.\n"
+            f"✅ **{_display_name(user)}** hozzárendelve a "
+            f"**#{campaign_id} — {campaign['name']}** kampányhoz (`{role_value}`).\n"
             f"*(assignment #{assignment['id']})*"
         )
 
     # ------------------------------------------------------------------
-    # /unassign client:<név> manager:<@user>
+    # /unassign campaign_id:<id> user:<@user>
     # ------------------------------------------------------------------
     @app_commands.command(
         name="unassign",
-        description="Account manager eltávolítása ügyfélről (admin csatorna)",
+        description="Account manager eltávolítása kampányról (admin csatorna)",
     )
     @app_commands.describe(
-        client_name="Az ügyfél neve",
-        manager="Az eltávolítandó Discord felhasználó",
+        campaign_id="A kampány numerikus azonosítója",
+        user="Az eltávolítandó Discord felhasználó",
     )
     async def unassign(
         self,
         interaction: discord.Interaction,
-        client_name: str,
-        manager: discord.Member,
+        campaign_id: int,
+        user: discord.Member,
     ) -> None:
         # ELSŐ sor: defer — azonnal jelzi Discordnak, hogy dolgozunk
         await interaction.response.defer(ephemeral=True)
@@ -192,38 +200,36 @@ class AssignmentsCog(commands.Cog):
             )
             return
 
-        # 1) Ügyfél megkeresése
-        client = await asyncio.to_thread(
-            clients_storage.get_client_by_name, client_name.strip()
-        )
-        if client is None:
+        # 1) Kampány megkeresése
+        campaign = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
+        if campaign is None:
             await interaction.followup.send(
-                f"Nem található ügyfél: **{client_name}**"
+                f"❌ Kampány nem található: **#{campaign_id}**"
             )
             return
 
         # 2) Felhasználó DB azonosítója
         user_row = await asyncio.to_thread(
-            users_storage.get_user_by_discord_id, str(manager.id)
+            users_storage.get_user_by_discord_id, str(user.id)
         )
         if user_row is None:
             await interaction.followup.send(
-                f"**{_display_name(manager)}** nincs a rendszerben — "
-                f"nem volt hozzárendelve ehhez az ügyfélhez."
+                f"**{_display_name(user)}** nincs a rendszerben — "
+                f"nem volt hozzárendelve ehhez a kampányhoz."
             )
             return
 
-        # 3) Hozzárendelés törlése
+        # 3) Hozzárendelés törlése (kampány-szintű)
         deleted = await asyncio.to_thread(
             assignments_storage.delete_assignment,
             user_id=user_row["id"],
-            client_id=client["id"],
+            campaign_id=campaign_id,
         )
 
         if not deleted:
             await interaction.followup.send(
-                f"**{_display_name(manager)}** nem volt hozzárendelve "
-                f"a **{client['name']}** ügyfélhez."
+                f"**{_display_name(user)}** nem volt hozzárendelve "
+                f"a **#{campaign_id} — {campaign['name']}** kampányhoz."
             )
             return
 
@@ -234,19 +240,20 @@ class AssignmentsCog(commands.Cog):
             "unassign",
             entity_type="assignment",
             details={
-                "client_id": client["id"],
-                "client_name": client["name"],
-                "manager_discord_id": str(manager.id),
-                "manager_name": _display_name(manager),
+                "campaign_id": campaign_id,
+                "campaign_name": campaign["name"],
+                "user_discord_id": str(user.id),
+                "user_name": _display_name(user),
             },
         )
 
         log.info(
-            "Hozzárendelés törölve: %s ← ügyfél %s",
-            manager, client["name"],
+            "Hozzárendelés törölve: %s ← kampány #%s",
+            user, campaign_id,
         )
         await interaction.followup.send(
-            f"✅ **{_display_name(manager)}** eltávolítva a **{client['name']}** ügyfélről."
+            f"✅ **{_display_name(user)}** eltávolítva a "
+            f"**#{campaign_id} — {campaign['name']}** kampányról."
         )
 
     # ------------------------------------------------------------------

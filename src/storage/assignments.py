@@ -100,15 +100,18 @@ def create_assignment(
     *,
     client_id: int | None = None,
     campaign_id: int | None = None,
+    role: str = "primary",
     created_by_discord_user_id: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Hozzárendelés létrehozása.
 
     Visszatérési érték: (assignment_dict, created)
-        created=True  → most hozta létre
-        created=False → már létezett (idempotens)
+        created=True  → most hozta létre (vagy a role-t frissítette)
+        created=False → már létezett ugyanazzal a role-lal (idempotens)
 
     Pontosan az egyik (client_id VAGY campaign_id) legyen megadva.
+    A `role` 'primary' vagy 'supporter'. Ha a hozzárendelés már létezik, de más
+    role-lal, akkor a role frissül (created=True jelzi a változást).
     """
     if client_id is None and campaign_id is None:
         raise ValueError("client_id vagy campaign_id szükséges")
@@ -116,9 +119,19 @@ def create_assignment(
     # Duplikáció-ellenőrzés
     existing = get_assignment(user_id, client_id=client_id, campaign_id=campaign_id)
     if existing:
-        return existing, False
+        if existing.get("role") == role:
+            return existing, False
+        # Role változott → frissítjük a meglévő sort.
+        updated = (
+            get_supabase()
+            .table(_TABLE)
+            .update({"role": role})
+            .eq("id", existing["id"])
+            .execute()
+        )
+        return (updated.data[0] if updated.data else {**existing, "role": role}), True
 
-    payload: dict[str, Any] = {"user_id": user_id}
+    payload: dict[str, Any] = {"user_id": user_id, "role": role}
     if client_id is not None:
         payload["client_id"] = client_id
     if campaign_id is not None:

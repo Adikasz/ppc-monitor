@@ -172,6 +172,17 @@ async def route_alert(
             )
         result["routed"] = True
 
+    if not channels:
+        # Egyetlen csatornára sem ment ki — tipikusan a cél csatorna (személyes
+        # vagy admin fallback) nem feloldható: nincs konfigurálva, rossz ID/URL,
+        # vagy a bot nem éri el. Ezt jelezzük (a /alert test ezt mutatja).
+        result["reason"] = "no_channel"
+        log.warning(
+            "Routing: alert #%s egyetlen csatornára sem ment ki "
+            "(csatorna nem feloldható — config/jogosultság?)",
+            alert_id,
+        )
+
     result["channels"] = channels
     result["dispatched_at"] = dispatched_at
 

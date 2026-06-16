@@ -174,6 +174,30 @@ async def test_route_alert_multi_assignee_formats_notified_line():
     assert any("Értesítve még:" in c for c in sent_contents)
 
 
+async def test_parse_channel_id_accepts_url_and_raw():
+    """A _parse_channel_id nyers ID-t, Discord URL-t és mention-t is elfogad."""
+    from src.integrations.discord_router import _parse_channel_id
+
+    assert _parse_channel_id("1509567720868417656") == 1509567720868417656
+    assert _parse_channel_id(
+        "https://discordapp.com/channels/1509562591305924709/1509567720868417656"
+    ) == 1509567720868417656
+    assert _parse_channel_id("<#1509567720868417656>") == 1509567720868417656
+    assert _parse_channel_id("") is None
+    assert _parse_channel_id("nem-szam") is None
+
+
+async def test_route_alert_reason_no_channel_when_send_fails():
+    """Ha egyetlen küldés sem sikerül (pl. nem feloldható csatorna) → reason='no_channel'."""
+    with contextlib.ExitStack() as stack:
+        send = _patch_router(stack, recipients=[_recipient("david", "111")])
+        send.return_value = None  # minden küldés sikertelen
+        result = await router.route_alert(_alert("critical"))
+
+    assert result["routed"] is False
+    assert result["reason"] == "no_channel"
+
+
 async def test_quiet_hours_suppresses_warning():
     """Csendes időben a WARNING elnyomódik (status='suppressed'), de a CRITICAL kimegy."""
     # WARNING — csendes időben NEM megy ki
