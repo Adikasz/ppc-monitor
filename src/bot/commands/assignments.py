@@ -1,7 +1,7 @@
 """
 /assign, /unassign, /my-clients slash parancsok.
 
-Ezekkel a parancsokkal rendelhetők hozzá account managerek KAMPÁNYOKHOZ
+Ezekkel a parancsokkal rendelhetők hozzá userek (felhasználók) KAMPÁNYOKHOZ
 (campaign_id alapján), és kérdezhetők le a saját hozzárendeléseik.
 
 Parancsok:
@@ -83,7 +83,7 @@ class AssignmentsCog(commands.Cog):
     # ------------------------------------------------------------------
     @app_commands.command(
         name="assign",
-        description="Account manager hozzárendelése kampányhoz (admin csatorna)",
+        description="Felhasználó hozzárendelése kampányhoz (admin csatorna)",
     )
     @app_commands.describe(
         campaign_id="A kampány numerikus azonosítója (/campaign list mutatja)",
@@ -179,7 +179,7 @@ class AssignmentsCog(commands.Cog):
     # ------------------------------------------------------------------
     @app_commands.command(
         name="unassign",
-        description="Account manager eltávolítása kampányról (admin csatorna)",
+        description="Felhasználó eltávolítása kampányról (admin csatorna)",
     )
     @app_commands.describe(
         campaign_id="A kampány numerikus azonosítója",
