@@ -149,19 +149,24 @@ class UsersCog(commands.GroupCog, group_name="user"):
     async def list_cmd(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
 
-        rows = await asyncio.to_thread(users_storage.list_users, active_only=True)
+        # Közvetlenül a Supabase users táblát listázzuk (NINCS Discord guild
+        # member lookup / @mention feloldás). active_only=False: az inaktív
+        # usereket is mutatjuk (⏸ jelzéssel), hogy SENKI ne maradjon ki némán.
+        rows = await asyncio.to_thread(users_storage.list_users, active_only=False)
         if not rows:
             await interaction.followup.send("Még nincs egyetlen felhasználó sem a rendszerben.")
             return
 
         lines: list[str] = []
         for row in rows:
-            name = row.get("display_name") or f"#{row.get('id', '?')}"
+            uid = row.get("id", "?")
+            name = row.get("display_name") or f"#{uid}"
+            inactive = "" if row.get("is_active", True) else " ⏸ *(inaktív)*"
             channel_id = row.get("alerts_channel_id")
             if channel_id:
-                lines.append(f"- **{name}** ✅ <#{channel_id}>")
+                lines.append(f"- **{name}** (#{uid}) ✅ <#{channel_id}>{inactive}")
             else:
-                lines.append(f"- **{name}** ❌ (nincs beállítva)")
+                lines.append(f"- **{name}** (#{uid}) ❌ (nincs beállítva){inactive}")
 
         embed = discord.Embed(
             title="👥 Felhasználók — alert csatornák",
