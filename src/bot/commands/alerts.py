@@ -20,10 +20,13 @@ from discord import app_commands
 from discord.ext import commands
 
 from src.config import get_config
+from src.integrations import discord_router
 from src.monitoring import router as alert_router
+from src.monitoring import summary as summary_gen
 from src.storage import audit
 from src.storage import campaigns as campaigns_storage
 from src.storage import mutes as mutes_storage
+from src.storage import users as users_storage
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -227,6 +230,98 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
             )
 
 
+class SummaryCog(commands.Cog):
+    """A `/summary` parancs — manuális napi/heti összefoglaló (13. lépés).
+
+    NEM az /alert csoport alatt van (top-level /summary), ezért külön cog.
+    """
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+
+    @app_commands.command(
+        name="summary",
+        description="Napi vagy heti összefoglaló kérése (saját, vagy admin: mindenkinek)",
+    )
+    @app_commands.describe(
+        type="daily (tegnapi) vagy weekly (hétvégi) — alap: daily",
+        scope="me (csak nekem) vagy all (minden user — csak admin csatornában)",
+    )
+    @app_commands.choices(
+        type=[
+            app_commands.Choice(name="daily — napi (tegnap)", value="daily"),
+            app_commands.Choice(name="weekly — hétvégi", value="weekly"),
+        ],
+        scope=[
+            app_commands.Choice(name="me — csak nekem", value="me"),
+            app_commands.Choice(name="all — minden user (admin)", value="all"),
+        ],
+    )
+    async def summary(
+        self,
+        interaction: discord.Interaction,
+        type: app_commands.Choice[str] | None = None,
+        scope: app_commands.Choice[str] | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        is_weekly = bool(type and type.value == "weekly")
+        scope_value = scope.value if scope else "me"
+
+        async def _gen(uid: int) -> dict:
+            if is_weekly:
+                return await summary_gen.generate_weekly_summary(uid)
+            return await summary_gen.generate_daily_summary(uid)
+
+        kind_label = "Hétvégi" if is_weekly else "Napi"
+
+        # --- scope: all (minden aktív user) — csak admin csatornában ---
+        if scope_value == "all":
+            if not _is_admin_channel(interaction):
+                await interaction.followup.send(
+                    "A `/summary scope:all` csak az admin csatornában használható."
+                )
+                return
+
+            users = await asyncio.to_thread(users_storage.list_users, active_only=True)
+            sent = 0
+            for user in users:
+                try:
+                    summary = await _gen(user["id"])
+                    res = await discord_router.send_summary_to_user(
+                        user, summary, is_weekly=is_weekly
+                    )
+                    if res:
+                        sent += 1
+                except Exception as exc:  # noqa: BLE001
+                    log.error("Summary (all) hiba user #%s: %s", user.get("id"), exc)
+            await interaction.followup.send(
+                f"✅ {kind_label} összefoglaló elküldve **{sent}/{len(users)}** usernek."
+            )
+            return
+
+        # --- scope: me (saját) ---
+        user_row, _ = await asyncio.to_thread(
+            users_storage.get_or_create_user,
+            str(interaction.user.id),
+            interaction.user.display_name or interaction.user.name,
+        )
+        summary = await _gen(user_row["id"])
+        res = await discord_router.send_summary_to_user(
+            user_row, summary, is_weekly=is_weekly
+        )
+        if res:
+            await interaction.followup.send(
+                f"✅ {kind_label} összefoglaló elküldve a csatornádba."
+            )
+        else:
+            await interaction.followup.send(
+                f"⚠️ {kind_label} összefoglaló NEM ment ki — nincs feloldható alert "
+                f"csatornád (állítsd be: `/user set-channel`), és admin fallback sem elérhető."
+            )
+
+
 async def setup(bot: commands.Bot) -> None:
     """Discord.py extension entry point."""
     await bot.add_cog(AlertsCog(bot))
+    await bot.add_cog(SummaryCog(bot))

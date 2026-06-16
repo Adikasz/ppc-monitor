@@ -23,9 +23,12 @@ from typing import Any
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from src.config import get_config
+from src.integrations.discord_router import send_summary_to_user
 from src.monitoring.detector import detect_anomalies_for_campaign
 from src.monitoring.metrics import get_campaign_metrics
 from src.monitoring.router import route_alert
+from src.monitoring.summary import generate_daily_summary, generate_weekly_summary
+from src.storage import users as users_storage
 from src.storage.alerts import insert_alert
 from src.storage.insights import insert_campaign_insight, prune_old_insights
 from src.storage.supabase_client import get_supabase
@@ -122,6 +125,48 @@ async def hourly_monitoring() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Napi / heti összefoglaló jobok (13. lépés)
+# ---------------------------------------------------------------------------
+
+async def _send_summaries(*, is_weekly: bool) -> None:
+    """Minden aktív usernek összefoglaló kiküldése (daily vagy weekly)."""
+    label = "heti" if is_weekly else "napi"
+    try:
+        users = await asyncio.to_thread(users_storage.list_users, active_only=True)
+    except Exception:
+        log.exception("Összefoglaló (%s): a userlista lekérése sikertelen — kihagyva", label)
+        return
+
+    sent = 0
+    for user in users:
+        uid = user.get("id")
+        try:
+            if is_weekly:
+                summary = await generate_weekly_summary(uid)
+            else:
+                summary = await generate_daily_summary(uid)
+            res = await send_summary_to_user(user, summary, is_weekly=is_weekly)
+            if res:
+                sent += 1
+        except Exception as exc:  # noqa: BLE001 — egy user hibája ne állítsa le a kört
+            log.error("Összefoglaló (%s) hiba user #%s: %s", label, uid, exc)
+
+    log.info("Összefoglaló kész (%s): %d/%d usernek kiküldve", label, sent, len(users))
+
+
+async def daily_summary_job() -> None:
+    """Napi összefoglaló (kedd–péntek reggel; hétfőn a heti összefoglaló váltja)."""
+    log.info("Napi összefoglaló job indítva…")
+    await _send_summaries(is_weekly=False)
+
+
+async def weekly_summary_job() -> None:
+    """Hétvégi összefoglaló (hétfő reggel) — a hétfői napi összefoglalót VÁLTJA."""
+    log.info("Hétvégi összefoglaló job indítva…")
+    await _send_summaries(is_weekly=True)
+
+
+# ---------------------------------------------------------------------------
 # Scheduler életciklus
 # ---------------------------------------------------------------------------
 
@@ -149,8 +194,41 @@ def start_scheduler() -> AsyncIOScheduler:
         coalesce=True,
         max_instances=1,
     )
+
+    # Napi összefoglaló: KEDD–PÉNTEK 09:00. Hétfőn SZÁNDÉKOSAN nem fut, mert a
+    # heti (hétvégi) összefoglaló váltja — így senki nem kap két üzenetet hétfőn.
+    _scheduler.add_job(
+        daily_summary_job,
+        trigger="cron",
+        hour=9,
+        minute=0,
+        day_of_week="tue-fri",
+        id="daily_summary",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # Hétvégi összefoglaló: HÉTFŐ 09:00 (péntek 22:00 → hétfő 08:00 ablak).
+    _scheduler.add_job(
+        weekly_summary_job,
+        trigger="cron",
+        hour=9,
+        minute=0,
+        day_of_week="mon",
+        id="weekly_summary",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
     _scheduler.start()
-    log.info("Monitoring scheduler indítva (óránkénti ciklus, tz=%s)", timezone)
+    log.info(
+        "Monitoring scheduler indítva (óránkénti ciklus + napi/heti összefoglaló, tz=%s)",
+        timezone,
+    )
     return _scheduler
 
 

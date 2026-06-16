@@ -69,6 +69,59 @@ def get_clients_for_user(user_id: int) -> list[dict[str, Any]]:
     return res.data or []
 
 
+def get_campaign_ids_for_user(user_id: int) -> list[int]:
+    """Egy felhasználóhoz tartozó ÖSSZES kampány ID (kampány- + ügyfél-szintű).
+
+    - kampány-szintű hozzárendelés (campaign_id) → közvetlenül
+    - ügyfél-szintű hozzárendelés (client_id)    → kibővítve az ügyfél
+      összes kampányára (clients → ad_accounts → campaigns)
+
+    A napi/heti összefoglaló ezt használja: "mely kampányokért felel a user".
+    """
+    sb = get_supabase()
+    rows = (
+        sb.table(_TABLE)
+        .select("campaign_id, client_id")
+        .eq("user_id", user_id)
+        .execute()
+        .data
+        or []
+    )
+
+    campaign_ids: set[int] = set()
+    client_ids: set[int] = set()
+    for r in rows:
+        if r.get("campaign_id") is not None:
+            campaign_ids.add(r["campaign_id"])
+        elif r.get("client_id") is not None:
+            client_ids.add(r["client_id"])
+
+    # Ügyfél-szintű hozzárendelések kibővítése kampányokra.
+    if client_ids:
+        accounts = (
+            sb.table("ad_accounts")
+            .select("id")
+            .in_("client_id", list(client_ids))
+            .execute()
+            .data
+            or []
+        )
+        account_ids = [a["id"] for a in accounts]
+        if account_ids:
+            camps = (
+                sb.table("campaigns")
+                .select("id")
+                .in_("ad_account_id", account_ids)
+                .execute()
+                .data
+                or []
+            )
+            for c in camps:
+                campaign_ids.add(c["id"])
+
+    return sorted(campaign_ids)
+
+
 def get_assignment(
     user_id: int,
     *,

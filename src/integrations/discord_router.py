@@ -202,3 +202,114 @@ async def send_discord_alert(
             return None
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Napi / heti összefoglaló (13. lépés)
+# ---------------------------------------------------------------------------
+
+def _date_label(iso: str | None) -> str:
+    """ISO timestamp → 'YYYY-MM-DD' (a dátum-fejlécekhez). Üres ha nincs."""
+    if not iso:
+        return "?"
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(iso).strftime("%Y-%m-%d")
+    except ValueError:
+        return str(iso)[:10]
+
+
+def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
+    """Összefoglaló Discord-üzenet szövege (napi vagy heti formátum)."""
+    total = summary.get("total_campaigns", 0)
+    crit = summary.get("critical_count", 0)
+    warn = summary.get("warning_count", 0)
+    healthy = summary.get("healthy_campaigns", 0)
+    alert_count = summary.get("alert_count", 0)
+    top_issues = summary.get("top_issues") or []
+
+    from_label = _date_label(summary.get("from"))
+    to_label = _date_label(summary.get("to"))
+
+    # Nincs anomália → rövid, pozitív üzenet.
+    if alert_count == 0:
+        if is_weekly:
+            return (
+                f"✅ **Hétvégi összefoglaló** — {from_label} → {to_label}\n"
+                f"A hétvégén nem volt anomália. Minden kampány rendben. 🎉"
+            )
+        return (
+            f"✅ **Napi összefoglaló** — {from_label}\n"
+            f"Tegnap nem volt anomália. Minden kampány rendben. 🎉"
+        )
+
+    if is_weekly:
+        header = f"📊 **Hétvégi összefoglaló** — {from_label} → {to_label}"
+        issues_title = "**Top problémák hétvégén:**"
+        alerts_label = "Alertek hétvégén"
+    else:
+        header = f"📊 **Napi összefoglaló** — {from_label}"
+        issues_title = "**Top problémák:**"
+        alerts_label = "Alertek tegnap"
+
+    lines = [
+        header,
+        "",
+        f"🔴 Kritikus: {crit}  |  🟡 Figyelmeztetés: {warn}  |  ✅ Egészséges: {healthy}",
+    ]
+
+    if top_issues:
+        lines.append("")
+        lines.append(issues_title)
+        for issue in top_issues:
+            lines.append(f"• {issue.get('campaign', '?')} — {issue.get('message', '')}")
+
+    lines.append("")
+    lines.append(f"**Kampányok figyelve:** {total}  |  **{alerts_label}:** {alert_count}")
+    lines.append("─────────────")
+    return "\n".join(lines)
+
+
+async def send_summary_to_user(
+    user: dict[str, Any],
+    summary: dict[str, Any],
+    *,
+    is_weekly: bool = False,
+) -> dict[str, Any] | None:
+    """Egy összefoglaló kiküldése a user személyes csatornájába (vagy admin fallback).
+
+    Visszatérés: {"channel_id", "message_id"} siker esetén, különben None.
+    """
+    channel_id = user.get("alerts_channel_id") or get_config().discord_admin_channel_id
+    channel = await _resolve_channel(channel_id)
+    if channel is None:
+        log.warning(
+            "Összefoglaló nem küldhető (user #%s) — nincs feloldható csatorna",
+            user.get("id"),
+        )
+        return None
+
+    content = _format_summary(summary, is_weekly)
+    allowed = discord.AllowedMentions.none()
+
+    for attempt in range(3):
+        try:
+            msg = await channel.send(content, allowed_mentions=allowed)
+            log.info(
+                "Összefoglaló kiküldve (user #%s, weekly=%s, csatorna=%s, msg=%s)",
+                user.get("id"), is_weekly, channel.id, msg.id,
+            )
+            return {"channel_id": channel.id, "message_id": msg.id}
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 429 and attempt < 2:
+                wait = 2 ** attempt
+                log.warning("Discord 429 (összefoglaló) — újrapróba %ss múlva", wait)
+                await asyncio.sleep(wait)
+                continue
+            log.error("Összefoglaló küldési hiba (user #%s): %s", user.get("id"), exc)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log.error("Összefoglaló váratlan küldési hiba (user #%s): %s", user.get("id"), exc)
+            return None
+
+    return None

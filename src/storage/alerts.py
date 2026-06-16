@@ -119,6 +119,40 @@ def mark_alert_routed(
     get_supabase().table(_TABLE).update(payload).eq("id", alert_id).execute()
 
 
+def get_alerts_for_user_in_range(
+    user_id: int,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> list[dict[str, Any]]:
+    """A userhez rendelt kampányok alertjei egy időablakban (összefoglalóhoz).
+
+    A felhasználó kampányait az assignments alapján oldjuk fel
+    (kampány- + ügyfél-szintű), majd az alerts táblát szűrjük:
+        campaign_id IN (user kampányai) AND detected_at ∈ [from_dt, to_dt)
+
+    FIGYELEM: az alerts időbélyege `detected_at` (NEM `created_at`).
+    Rendezés: detected_at szerint csökkenő (a severity-prioritást a hívó
+    summary réteg végzi, mert az SQL ABC-sorrendje nem szemantikus).
+    """
+    from src.storage import assignments as assignments_storage
+
+    campaign_ids = assignments_storage.get_campaign_ids_for_user(user_id)
+    if not campaign_ids:
+        return []
+
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .select("*, campaigns(name)")
+        .in_("campaign_id", campaign_ids)
+        .gte("detected_at", from_dt.isoformat())
+        .lt("detected_at", to_dt.isoformat())
+        .order("detected_at", desc=True)
+        .execute()
+    )
+    return res.data or []
+
+
 def mark_alert_suppressed(alert_id: int) -> None:
     """Az alert megjelölése elnyomottként (csendes időben keletkezett, nem-kritikus).
 
