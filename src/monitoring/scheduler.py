@@ -2,12 +2,14 @@
 Monitoring scheduler — óránkénti anomália-ciklus (APScheduler).
 
 A bot event loopjában futó AsyncIOScheduler óránként (minden óra :00-kor)
-végigfut az aktívan monitorozott kampányokon:
+végigfut az aktívan monitorozott kampányokon, ad_account-onként BATCH pull-lal
+(16. lépés — 1 API hívás / fiók, nem 1 / kampány):
 
-    1. Lekéri a kampány aktuális metrikáit (get_campaign_metrics — STUB a 9.
-       lépésig, ott jön a valódi Meta/Google API hívás).
-    2. A detektorral kiértékeli az anomáliákat.
-    3. A talált anomáliákat alertként beszúrja (deduplikációval).
+    1. Aktív kampányok lekérése (ad_account adatokkal), csoportosítás fiókonként.
+    2. Fiókonként EGY batch metrika-hívás (Meta/Google), majd a kampányok
+       összepárosítása external_campaign_id alapján.
+    3. Insight perzisztálás + lifecycle auto-promóció + anomália-detektálás
+       + alertek beszúrása (dedup) és routing.
 
 Indítás:
     A botban (src.bot.main on_ready) a `start_scheduler()` hívja meg, egyszer.
@@ -18,99 +20,191 @@ Hibatűrés:
 from __future__ import annotations
 
 import asyncio
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from src.config import get_config
 from src.integrations.discord_router import send_summary_to_user
+from src.integrations.google_ads import GoogleAdsClient
+from src.integrations.meta_ads import MetaAdsClient
 from src.monitoring.detector import detect_anomalies_for_campaign
-from src.monitoring.metrics import get_campaign_metrics
 from src.monitoring.router import route_alert
 from src.monitoring.summary import generate_daily_summary, generate_weekly_summary
+from src.storage import campaigns as campaigns_storage
 from src.storage import users as users_storage
 from src.storage.alerts import insert_alert
 from src.storage.insights import insert_campaign_insight, prune_old_insights
-from src.storage.supabase_client import get_supabase
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
+
+# Kis szünet ad_account-ok között (gyengéd az API-kra; Google ajánlás ~0.1s).
+_INTER_ACCOUNT_DELAY_S = 0.1
+# Lifecycle auto-promóció: ennyi nap után 'new'/'learning' → 'mature'.
+_AUTO_PROMOTE_AFTER_DAYS = 14
 
 _scheduler: AsyncIOScheduler | None = None
 
 
 # ---------------------------------------------------------------------------
-# Óránkénti ciklus
+# Óránkénti ciklus — batch pull ad_account-onként (16. lépés)
 # ---------------------------------------------------------------------------
 
-def _fetch_monitored_campaigns() -> list[dict[str, Any]]:
-    """Aktívan monitorozott kampányok (is_monitored, nem paused/ended)."""
-    return (
-        get_supabase()
-        .table("campaigns")
-        .select("*")
-        .eq("is_monitored", True)
-        .neq("lifecycle_state", "paused")
-        .neq("lifecycle_state", "ended")
-        .execute()
-        .data
-        or []
+async def _batch_pull(platform: str, ext_account_id: str, day: str) -> list[dict[str, Any]]:
+    """Egy ad_account összes kampányának metrikái EGY API hívással.
+
+    A platform-kliens get_instance() hiányzó token/SDK esetén RuntimeError-t
+    dob — ezt a hívó (hourly_monitoring per-account try) kezeli.
+    """
+    if platform == "meta":
+        client = MetaAdsClient.get_instance()
+        return await asyncio.to_thread(
+            client.get_all_campaigns_insights, ext_account_id, day, day
+        )
+    if platform == "google":
+        client = GoogleAdsClient.get_instance()
+        return await asyncio.to_thread(
+            client.get_all_campaigns_metrics, ext_account_id, day, day
+        )
+    log.warning("Monitoring: ismeretlen platform %r — fiók kihagyva", platform)
+    return []
+
+
+def _older_than_days(iso_value: Any, days: int) -> bool:
+    """True, ha az ISO időbélyeg régebbi mint `days` nap (tz-naiv → UTC)."""
+    if not iso_value:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(iso_value).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt) > timedelta(days=days)
+
+
+async def auto_promote_lifecycle(
+    campaign: dict[str, Any],
+    insight: dict[str, Any],
+) -> bool:
+    """'new'/'learning' kampány automatikus 'mature'-ré léptetése.
+
+    Feltétel: a kampány `_AUTO_PROMOTE_AFTER_DAYS`+ napos (discovered_at vagy
+    created_at alapján) ÉS volt már költése (insight['spend'] > 0). Ilyenkor a
+    tanulási fázis lezárul, és a teljes (WARNING-ot is tartalmazó) monitoring
+    bekapcsol. A scheduler a detektálás ELŐTT hívja.
+
+    Visszatérés: True, ha most promótált; egyébként False.
+    """
+    state = (campaign.get("lifecycle_state") or "").lower()
+    if state not in ("new", "learning"):
+        return False
+
+    try:
+        has_spend = float(insight.get("spend") or 0) > 0
+    except (TypeError, ValueError):
+        has_spend = False
+    if not has_spend:
+        return False
+
+    age_ref = campaign.get("discovered_at") or campaign.get("created_at")
+    if not _older_than_days(age_ref, _AUTO_PROMOTE_AFTER_DAYS):
+        return False
+
+    updated = await asyncio.to_thread(
+        campaigns_storage.set_lifecycle_state, campaign["id"], "mature"
     )
+    if updated:
+        log.info(
+            "Auto-promóció → mature: #%s %s (%d+ nap, spend>0)",
+            campaign["id"], campaign.get("name"), _AUTO_PROMOTE_AFTER_DAYS,
+        )
+        return True
+    return False
 
 
 async def hourly_monitoring() -> None:
-    """Egy monitoring ciklus: minden aktív kampány kiértékelése + alertek."""
-    log.info("Monitoring ciklus indítva…")
+    """Egy monitoring ciklus BATCH pull-lal: 1 API hívás / ad_account."""
+    log.info("Monitoring ciklus indítva (batch)…")
 
     try:
-        campaigns = await asyncio.to_thread(_fetch_monitored_campaigns)
+        campaigns = await asyncio.to_thread(campaigns_storage.get_active_campaigns)
     except Exception:
         log.exception("Monitoring: a kampánylista lekérése sikertelen — ciklus kihagyva")
         return
 
-    new_alerts = 0
+    if not campaigns:
+        log.info("Monitoring: nincs aktívan monitorozott kampány — ciklus kihagyva")
+        return
+
+    accounts = campaigns_storage.group_campaigns_by_account(campaigns)
+    today = date.today().isoformat()
+
     fetched = 0
-    for campaign in campaigns:
-        cid = campaign.get("id")
+    promoted = 0
+    new_alerts = 0
+
+    for account_db_id, account_campaigns in accounts.items():
+        account = account_campaigns[0].get("ad_accounts") or {}
+        platform = account.get("platform")
+        ext_account_id = account.get("external_account_id")
+
+        # 1 hívás / fiók — bármilyen hiba esetén ezt a fiókot kihagyjuk, a
+        # ciklus folytatódik a többivel (fault isolation).
         try:
-            # 1) Valódi metrikák (Meta/Google). None → nem elérhető, skip.
-            insights = await get_campaign_metrics(campaign)
-            if not insights:
-                log.warning("Monitoring: #%s metrics nem elérhető — kihagyva", cid)
+            all_insights = await _batch_pull(platform, ext_account_id, today)
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "Monitoring: account #%s (%s/%s) batch pull hiba: %s — kihagyva",
+                account_db_id, platform, ext_account_id, exc,
+            )
+            await asyncio.sleep(_INTER_ACCOUNT_DELAY_S)
+            continue
+
+        # Match: external_campaign_id → insight
+        insights_map = {str(i["external_campaign_id"]): i for i in all_insights}
+
+        for campaign in account_campaigns:
+            cid = campaign.get("id")
+            insight = insights_map.get(str(campaign.get("external_campaign_id")))
+            if not insight:
                 continue
             fetched += 1
-            log.info(
-                "Monitoring: #%s metrics OK (impr=%s, spend=%s, conv=%s)",
-                cid, insights["impressions"], insights["spend"], insights["conversions"],
-            )
+            try:
+                # 1) Insight perzisztálás (óránként egy sor kampányonként)
+                await asyncio.to_thread(insert_campaign_insight, cid, insight)
 
-            # 2) Insight perzisztálás (óránként egy sor kampányonként)
-            await asyncio.to_thread(insert_campaign_insight, cid, insights)
+                # 2) Lifecycle auto-promóció — a detektálás ELŐTT
+                if await auto_promote_lifecycle(campaign, insight):
+                    promoted += 1
 
-            # 3) Anomália-detektálás + alertek + routing
-            anomalies = await detect_anomalies_for_campaign(cid, insights)
-            for a in anomalies:
-                alert_row = await asyncio.to_thread(
-                    insert_alert,
-                    a["campaign_id"],
-                    a["severity"],
-                    a["metric"],
-                    a.get("observed_value"),
-                    a.get("threshold_value"),
-                    a["message"],
-                )
-                if alert_row:
-                    new_alerts += 1
-                    # ROUTING — kiküldés a megfelelő csatornákra (Discord/ClickUp)
-                    try:
-                        await route_alert(alert_row)
-                    except Exception as exc:  # noqa: BLE001
-                        log.error(
-                            "Monitoring: routing hiba (alert #%s): %s",
-                            alert_row.get("id"), exc,
-                        )
-        except Exception as exc:  # noqa: BLE001 — egy kampány hibája ne állítsa le a ciklust
-            log.error("Monitoring: kampány #%s hiba: %s", cid, exc)
+                # 3) Anomália-detektálás + alertek + routing
+                anomalies = await detect_anomalies_for_campaign(cid, insight)
+                for a in anomalies:
+                    alert_row = await asyncio.to_thread(
+                        insert_alert,
+                        a["campaign_id"],
+                        a["severity"],
+                        a["metric"],
+                        a.get("observed_value"),
+                        a.get("threshold_value"),
+                        a["message"],
+                    )
+                    if alert_row:
+                        new_alerts += 1
+                        try:
+                            await route_alert(alert_row)
+                        except Exception as exc:  # noqa: BLE001
+                            log.error(
+                                "Monitoring: routing hiba (alert #%s): %s",
+                                alert_row.get("id"), exc,
+                            )
+            except Exception as exc:  # noqa: BLE001 — egy kampány hibája ne állítsa le a ciklust
+                log.error("Monitoring: kampány #%s hiba: %s", cid, exc)
+
+        await asyncio.sleep(_INTER_ACCOUNT_DELAY_S)
 
     # History-karbantartás: 1 hétnél régebbi insightok törlése
     try:
@@ -119,8 +213,9 @@ async def hourly_monitoring() -> None:
         log.exception("Monitoring: insight prune hiba")
 
     log.info(
-        "Monitoring ciklus kész: %d kampány, %d metrics OK, %d új alert",
-        len(campaigns), fetched, new_alerts,
+        "Monitoring ciklus kész: %d account, %d kampány, %d metrics, "
+        "%d auto-promóció, %d új alert",
+        len(accounts), len(campaigns), fetched, promoted, new_alerts,
     )
 
 

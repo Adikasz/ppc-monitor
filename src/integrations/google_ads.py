@@ -42,6 +42,45 @@ from src.utils.logging import get_logger
 log = get_logger(__name__)
 
 
+def _normalize_insight(
+    external_campaign_id: str,
+    impressions: Any,
+    clicks: Any,
+    spend: Any,
+    conversions: Any,
+    conversion_value: Any,
+) -> dict[str, Any]:
+    """Nyers metrikák → közös, normalizált insight-dict (származtatottakkal).
+
+    A számított mezők (ctr, cpc, cpa, roas) PONTOSAN úgy állnak elő, mint a
+    `src.monitoring.metrics`-ben és a Meta integrációban (arány-alapú ctr),
+    hogy a detektor és a campaign_insights tábla egységesen viselkedjen.
+    """
+    impressions = int(impressions or 0)
+    clicks = int(clicks or 0)
+    spend = float(spend or 0.0)
+    conversions = float(conversions or 0.0)
+    conversion_value = float(conversion_value or 0.0)
+
+    ctr = round(clicks / impressions, 4) if impressions else 0.0
+    cpc = round(spend / clicks, 2) if clicks else 0.0
+    cpa = round(spend / conversions, 2) if conversions else 0.0
+    roas = round(conversion_value / spend, 4) if spend else 0.0
+
+    return {
+        "external_campaign_id": str(external_campaign_id),
+        "impressions": impressions,
+        "clicks": clicks,
+        "spend": round(spend, 2),
+        "conversions": conversions,
+        "conversion_value": round(conversion_value, 2),
+        "ctr": ctr,
+        "cpc": cpc,
+        "cpa": cpa,
+        "roas": roas,
+    }
+
+
 # Kampány-discovery GAQL lekérdezés. A nem törölt (REMOVED) kampányok jönnek.
 _CAMPAIGNS_GAQL = """
     SELECT
@@ -294,6 +333,86 @@ class GoogleAdsClient:
                 campaign_id, exc,
             )
             raise
+
+    # ------------------------------------------------------------------
+    # Batch metrics — 1 GAQL query / customer (16. lépés)
+    # ------------------------------------------------------------------
+
+    def get_all_campaigns_metrics(
+        self,
+        customer_id: str,
+        date_from: str,
+        date_to: str,
+    ) -> list[dict[str, Any]]:
+        """Egy fiók ÖSSZES (ENABLED) kampányának metrikái EGY GAQL query-vel.
+
+        Ez váltja ki a kampányonkénti `get_campaign_metrics` hívásokat.
+
+        Paraméterek:
+            customer_id — Google Ads fiók ID ("1234567890" v. kötőjeles)
+            date_from   — időszak kezdete "YYYY-MM-DD"
+            date_to     — időszak vége   "YYYY-MM-DD"
+
+        Visszatérés: normalizált insight-dict lista (`external_campaign_id`
+        kulccsal). Hiba (auth / kvóta / hálózat) esetén ÜRES lista — NEM dob
+        kivételt, hogy a scheduler ciklusa ne álljon le.
+
+        Megjegyzés: a `segments.date` csak szűrőként szerepel (nincs a SELECT-ben),
+        így az API kampányonként a teljes időszakra aggregál. Biztonságból
+        Pythonban is összegezzük campaign.id szerint (ha mégis több sor jönne).
+        """
+        cid = _normalize_customer_id(customer_id)
+        query = (
+            "SELECT campaign.id, campaign.name, metrics.impressions, "
+            "metrics.clicks, metrics.cost_micros, metrics.conversions, "
+            "metrics.conversions_value "
+            "FROM campaign "
+            "WHERE campaign.status = 'ENABLED' "
+            f"AND segments.date BETWEEN '{date_from}' AND '{date_to}'"
+        )
+
+        # Aggregálás campaign.id szerint (id → összegzett nyers metrikák).
+        agg: dict[str, dict[str, Any]] = {}
+        try:
+            ga_service = self._client.get_service("GoogleAdsService")
+            response = ga_service.search(customer_id=cid, query=query)
+            for row in response:
+                camp_id = str(row.campaign.id)
+                m = row.metrics
+                bucket = agg.setdefault(
+                    camp_id,
+                    {"impressions": 0, "clicks": 0, "spend": 0.0,
+                     "conversions": 0.0, "conversion_value": 0.0},
+                )
+                bucket["impressions"] += int(m.impressions)
+                bucket["clicks"] += int(m.clicks)
+                bucket["spend"] += m.cost_micros / 1_000_000
+                bucket["conversions"] += float(m.conversions)
+                bucket["conversion_value"] += float(m.conversions_value)
+
+        except self._GoogleAdsException as exc:
+            self._handle_google_ads_exception(exc, cid)
+            return []
+        except Exception as exc:  # noqa: BLE001 — sosem dobjuk ki a schedulert
+            log.error(
+                "Google Ads batch metrics váratlan hiba (fiók=%s): %s — üres lista",
+                cid, exc,
+            )
+            return []
+
+        results = [
+            _normalize_insight(
+                camp_id,
+                b["impressions"], b["clicks"], b["spend"],
+                b["conversions"], b["conversion_value"],
+            )
+            for camp_id, b in agg.items()
+        ]
+        log.info(
+            "Google Ads batch metrics: fiók=%s, %d kampány (%s–%s)",
+            cid, len(results), date_from, date_to,
+        )
+        return results
 
     # ------------------------------------------------------------------
     # Belső segédfüggvények

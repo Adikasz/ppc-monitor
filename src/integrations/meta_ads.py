@@ -20,6 +20,7 @@ Hibakezelés:
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from facebook_business.api import FacebookAdsApi
@@ -31,6 +32,78 @@ from src.config import get_config
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
+
+# Konverziónak számító Meta action típusok (purchase + lead variánsok).
+_CONVERSION_TYPES = {
+    "purchase",
+    "lead",
+    "omni_purchase",
+    "offsite_conversion.fb_pixel_purchase",
+    "offsite_conversion.fb_pixel_lead",
+}
+
+# Batch insights rate-limit kezelés: exponenciális backoff (1s, 2s, 4s).
+_INSIGHTS_MAX_RETRIES = 3
+# Meta rate-limit API hibakódok (app / user / account szintű korlátok).
+_RATE_LIMIT_API_CODES = {4, 17, 32, 613}
+
+
+def _normalize_insight(
+    external_campaign_id: str,
+    impressions: Any,
+    clicks: Any,
+    spend: Any,
+    conversions: Any,
+    conversion_value: Any,
+) -> dict[str, Any]:
+    """Nyers metrikák → közös, normalizált insight-dict (származtatottakkal).
+
+    A számított mezők (ctr, cpc, cpa, roas) PONTOSAN úgy állnak elő, mint a
+    `src.monitoring.metrics`-ben (arány-alapú ctr, nem százalék), hogy a
+    detektor és a campaign_insights tábla a batch- és a per-kampány úton
+    azonosan viselkedjen.
+    """
+    impressions = int(impressions or 0)
+    clicks = int(clicks or 0)
+    spend = float(spend or 0.0)
+    conversions = float(conversions or 0.0)
+    conversion_value = float(conversion_value or 0.0)
+
+    ctr = round(clicks / impressions, 4) if impressions else 0.0
+    cpc = round(spend / clicks, 2) if clicks else 0.0
+    cpa = round(spend / conversions, 2) if conversions else 0.0
+    roas = round(conversion_value / spend, 4) if spend else 0.0
+
+    return {
+        "external_campaign_id": str(external_campaign_id),
+        "impressions": impressions,
+        "clicks": clicks,
+        "spend": round(spend, 2),
+        "conversions": conversions,
+        "conversion_value": round(conversion_value, 2),
+        "ctr": ctr,
+        "cpc": cpc,
+        "cpa": cpa,
+        "roas": roas,
+    }
+
+
+def _conversions_from_actions(row: Any) -> tuple[int, float]:
+    """(conversions, conversion_value) kiszámítása egy insights sor actions/
+    action_values mezőiből (purchase + lead típusok összegezve)."""
+    actions = row.get("actions") or []
+    action_values = row.get("action_values") or []
+    conversions = sum(
+        int(float(a.get("value", 0)))
+        for a in actions
+        if a.get("action_type") in _CONVERSION_TYPES
+    )
+    conversion_value = sum(
+        float(v.get("value", 0.0))
+        for v in action_values
+        if v.get("action_type") in _CONVERSION_TYPES
+    )
+    return conversions, conversion_value
 
 
 class MetaAdsClient:
@@ -275,3 +348,103 @@ class MetaAdsClient:
                 campaign_id, exc,
             )
             raise
+
+    # ------------------------------------------------------------------
+    # Batch insights — 1 API hívás / ad_account (16. lépés)
+    # ------------------------------------------------------------------
+
+    def get_all_campaigns_insights(
+        self,
+        ad_account_id: str,
+        date_from: str,
+        date_to: str,
+    ) -> list[dict[str, Any]]:
+        """Egy fiók ÖSSZES kampányának metrikái EGY hívással (level=campaign).
+
+        Ez váltja ki a kampányonkénti `get_campaign_insights` hívásokat: 2000+
+        helyett ~1 hívás / ad_account.
+
+        Paraméterek:
+            ad_account_id — Meta fiók ID ("act_123456789")
+            date_from     — időszak kezdete "YYYY-MM-DD"
+            date_to       — időszak vége   "YYYY-MM-DD"
+
+        Visszatérés: normalizált insight-dict lista (lásd `_normalize_insight`),
+        minden elem `external_campaign_id` kulccsal. Hiba esetén — a rate-limit
+        retry kimerülése vagy bármilyen API/hálózati hiba után — ÜRES listát ad
+        (NEM dob kivételt), hogy a scheduler ciklusa ne álljon le.
+
+        Rate limit: 429 / rate-limit API kód esetén exponenciális backoff
+        (1s, 2s, 4s; max 3 retry).
+        """
+        last_error: Exception | None = None
+        for attempt in range(_INSIGHTS_MAX_RETRIES + 1):
+            try:
+                account = AdAccount(ad_account_id)
+                cursor = account.get_insights(
+                    fields=[
+                        "campaign_id",
+                        "campaign_name",
+                        "impressions",
+                        "clicks",
+                        "spend",
+                        "actions",
+                        "action_values",
+                    ],
+                    params={
+                        "time_range": {"since": date_from, "until": date_to},
+                        "level": "campaign",
+                    },
+                )
+
+                results: list[dict[str, Any]] = []
+                for row in cursor:
+                    conversions, conversion_value = _conversions_from_actions(row)
+                    results.append(_normalize_insight(
+                        str(row.get("campaign_id")),
+                        row.get("impressions", 0),
+                        row.get("clicks", 0),
+                        row.get("spend", 0.0),
+                        conversions,
+                        conversion_value,
+                    ))
+
+                log.info(
+                    "Meta batch insights: fiók=%s, %d kampány (%s–%s)",
+                    ad_account_id, len(results), date_from, date_to,
+                )
+                return results
+
+            except FacebookRequestError as exc:
+                http_code = exc.http_status()
+                api_code = exc.api_error_code()
+                is_rate_limited = http_code == 429 or api_code in _RATE_LIMIT_API_CODES
+                if is_rate_limited and attempt < _INSIGHTS_MAX_RETRIES:
+                    backoff = 2 ** attempt  # 1s, 2s, 4s
+                    log.warning(
+                        "Meta batch rate limit (fiók=%s, http=%s, code=%s) — "
+                        "retry %d/%d %ds múlva",
+                        ad_account_id, http_code, api_code,
+                        attempt + 1, _INSIGHTS_MAX_RETRIES, backoff,
+                    )
+                    last_error = exc
+                    time.sleep(backoff)
+                    continue
+                log.error(
+                    "Meta batch insights hiba (fiók=%s, http=%s, code=%s): %s — üres lista",
+                    ad_account_id, http_code, api_code, exc,
+                )
+                return []
+
+            except Exception as exc:  # noqa: BLE001 — sosem dobjuk ki a schedulert
+                log.error(
+                    "Meta batch insights váratlan hiba (fiók=%s): %s — üres lista",
+                    ad_account_id, exc,
+                )
+                return []
+
+        log.error(
+            "Meta batch insights: rate-limit retry kimerült (fiók=%s): %s — üres lista",
+            ad_account_id, last_error,
+        )
+        return []

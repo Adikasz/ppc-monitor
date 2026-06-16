@@ -26,6 +26,7 @@ Függvények — írás:
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
@@ -326,3 +327,48 @@ def list_ad_account_ids(*, active_only: bool = True) -> list[int]:
     if active_only:
         query = query.neq("lifecycle_state", "ended")
     return [r["ad_account_id"] for r in (query.execute().data or [])]
+
+
+# ---------------------------------------------------------------------------
+# Batch monitoring (16. lépés) — kampányok az ad_account adataival együtt
+# ---------------------------------------------------------------------------
+
+def get_active_campaigns() -> list[dict[str, Any]]:
+    """Aktívan monitorozott kampányok, az ad_account adataival JOIN-olva.
+
+    Szűrés: is_monitored = true ÉS lifecycle_state NOT IN ('paused', 'ended').
+    Minden sor tartalmazza a beágyazott `ad_accounts` objektumot
+    (id, external_account_id, platform, is_active) — ebből csoportosít a
+    scheduler ad_account-onként (batch pull, 1 API hívás / fiók).
+
+    A `!inner` join miatt csak azok a kampányok jönnek, amelyeknek van
+    (létező) ad_account-juk.
+    """
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .select("*, ad_accounts!inner(id, external_account_id, platform, is_active)")
+        .eq("is_monitored", True)
+        .neq("lifecycle_state", "paused")
+        .neq("lifecycle_state", "ended")
+        .execute()
+    )
+    return res.data or []
+
+
+def group_campaigns_by_account(
+    campaigns: list[dict[str, Any]],
+) -> dict[int, list[dict[str, Any]]]:
+    """Kampányok csoportosítása ad_account belső ID szerint (tiszta Python).
+
+    A `get_active_campaigns` által visszaadott (beágyazott ad_accounts-os)
+    sorokra számít. Visszatérés: {ad_account_db_id: [campaign, ...]}.
+    """
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for c in campaigns:
+        account = c.get("ad_accounts") or {}
+        account_id = account.get("id") or c.get("ad_account_id")
+        if account_id is None:
+            continue
+        grouped[account_id].append(c)
+    return dict(grouped)
