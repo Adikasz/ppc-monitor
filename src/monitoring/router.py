@@ -152,7 +152,16 @@ async def route_alert(
 
     clickup_res = None
     if severity == "critical":
-        clickup_res = await clickup_router.create_clickup_task(alert, campaign)
+        # Platform a ClickUp leíráshoz: a campaigns táblában nincs platform, a
+        # fiókon keresztül oldjuk fel. Csak CRITICAL esetén fut (ritka) → 1 olcsó
+        # extra query elfogadható.
+        account = await asyncio.to_thread(
+            ad_accounts_storage.get_ad_account, campaign.get("ad_account_id")
+        )
+        platform = account.get("platform") if account else None
+        clickup_res = await clickup_router.create_clickup_task(
+            alert, campaign, client, platform=platform,
+        )
         if clickup_res:
             channels.append("clickup")
 

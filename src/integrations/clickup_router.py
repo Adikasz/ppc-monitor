@@ -37,12 +37,21 @@ _DUE_HOURS = 2
 async def create_clickup_task(
     alert: dict[str, Any],
     campaign: dict[str, Any],
+    client: dict[str, Any] | None = None,
     *,
+    platform: str | None = None,
     assignee_ids: list[int] | None = None,
 ) -> dict[str, Any] | None:
     """ClickUp task létrehozása egy CRITICAL alerthez.
 
-    Visszatérés: {"task_id": "..."} siker esetén, különben None.
+    Visszatérés: {"task_id": "..."} siker esetén, különben None. A hívó truthy-
+    ként kezeli (van task / nincs), és a task_id-t el is tárolja az
+    alerts.clickup_task_id mezőbe — ezért adunk vissza dict-et bool helyett.
+
+    `client` → a task címében a kliensnév; `platform` → a leírásban. Mindkettő
+    opcionális: ha hiányzik, "?" kerül a helyére.
+
+    Hiányzó token vagy lista-ID → graceful skip (warning), sosem dob.
 
     Megjegyzés: az assignee ClickUp user_id-t igényel; Discord→ClickUp user
     leképezés még nincs, ezért alapból assignee nélkül jön létre a task
@@ -60,7 +69,7 @@ async def create_clickup_task(
         return None
 
     return await asyncio.to_thread(
-        _create_task_sync, token, list_id, alert, campaign, assignee_ids
+        _create_task_sync, token, list_id, alert, campaign, client, platform, assignee_ids
     )
 
 
@@ -69,21 +78,27 @@ def _create_task_sync(
     list_id: str,
     alert: dict[str, Any],
     campaign: dict[str, Any],
+    client: dict[str, Any] | None,
+    platform: str | None,
     assignee_ids: list[int] | None,
 ) -> dict[str, Any] | None:
-    severity = (alert.get("severity") or "").upper()
+    severity = (alert.get("severity") or "critical").upper()
     campaign_name = campaign.get("name") or "?"
-    metric = alert.get("metric") or "anomaly"
+    client_name = (client or {}).get("name") or "?"
+    # A campaigns táblában nincs platform — a hívó (router) adja a fiókból; a
+    # campaign dict-en is megengedjük (enriched), végső fallback "?".
+    platform = platform or campaign.get("platform") or "?"
+    detected_at = alert.get("detected_at") or datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
 
-    title = f"[{severity}] {campaign_name} - {metric}"
+    title = f"[{severity}] {client_name} — {campaign_name}"
     description = (
-        f"Campaign: {campaign.get('campaign_type') or campaign_name}\n"
-        f"Metric: {metric}\n"
-        f"Observed: {alert.get('observed_value')}\n"
-        f"Threshold: {alert.get('threshold_value')}\n\n"
-        f"{alert.get('message', '')}\n\n"
-        f"Alert ID: {alert.get('id')}\n"
-        f"Timestamp: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        f"Kampány: {campaign_name}\n"
+        f"Platform: {platform}\n"
+        f"Probléma: {alert.get('message', '')}\n"
+        f"Észlelés: {detected_at}\n"
+        f"Alert ID: {alert.get('id')}\n\n"
         f"/campaign info campaign_id:{alert.get('campaign_id')}"
     )
     due_date_ms = int(
@@ -111,7 +126,10 @@ def _create_task_sync(
         return None
 
     if resp.status_code == 401:
-        log.warning("ClickUp 401 — érvénytelen API token, task kihagyva")
+        log.warning("ClickUp token invalid (401) — task kihagyva")
+        return None
+    if resp.status_code == 429:
+        log.warning("ClickUp rate limit (429) — task kihagyva")
         return None
     if resp.status_code not in (200, 201):
         log.warning("ClickUp task hiba (%s): %s", resp.status_code, resp.text[:200])

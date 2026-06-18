@@ -46,6 +46,11 @@ def _patch_router(
     stack.enter_context(mock.patch.object(
         router, "_resolve_client", return_value={"id": 10, "name": "TestÜgyfél"},
     ))
+    # CRITICAL ág a ClickUp leíráshoz a fiókból oldja fel a platformot.
+    stack.enter_context(mock.patch.object(
+        router.ad_accounts_storage, "get_ad_account",
+        return_value={"id": 5, "platform": "meta", "client_id": 10},
+    ))
     stack.enter_context(mock.patch.object(router, "_resolve_recipients", return_value=recipients))
     stack.enter_context(mock.patch.object(
         router, "get_config", return_value=SimpleNamespace(discord_admin_channel_id=admin_channel_id),
