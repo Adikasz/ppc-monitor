@@ -28,6 +28,23 @@ def get_user_by_discord_id(discord_user_id: str) -> dict[str, Any] | None:
     return res.data[0] if res.data else None
 
 
+def get_user_by_alerts_channel(channel_id: str | int) -> dict[str, Any] | None:
+    """A user, akinek az `alerts_channel_id`-ja a megadott csatorna. None ha nincs.
+
+    A 22. lépés csatorna-szkópolt `/my` parancsai ezzel azonosítják az "aktuális
+    OM"-et: melyik OM saját #alerts csatornájából fut a parancs.
+    """
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .select("*")
+        .eq("alerts_channel_id", str(channel_id))
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
 def get_user(user_id: int) -> dict[str, Any] | None:
     """Felhasználó lekérdezése belső ID alapján. None ha nincs ilyen."""
     res = (

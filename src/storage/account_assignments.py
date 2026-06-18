@@ -80,6 +80,49 @@ def list_all_account_assignments() -> list[dict[str, Any]]:
     return res.data or []
 
 
+def get_account_ids_for_user(user_id: int) -> set[int]:
+    """Azon ad_account-ID-k halmaza, amelyek ehhez a userhez vannak rendelve.
+
+    A `/my` parancsok jogosultság-ellenőrzéséhez. Védve: ha a tábla még nem
+    létezik (0010 előtt), üres halmaz.
+    """
+    try:
+        res = (
+            get_supabase().table(_TABLE).select("ad_account_id").eq("user_id", user_id).execute()
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_relation(exc):
+            return set()
+        raise
+    return {r["ad_account_id"] for r in (res.data or [])}
+
+
+def get_accounts_for_user(user_id: int) -> list[dict[str, Any]]:
+    """A userhez rendelt hirdetési fiókok (ad_account sorok + szerep).
+
+    Minden elem a teljes ad_account sor, kiegészítve `_role` kulccsal. A `/my
+    accounts` használja. Védve: ha a tábla még nem létezik, üres lista.
+    """
+    try:
+        res = (
+            get_supabase()
+            .table(_TABLE)
+            .select("role, ad_accounts(*)")
+            .eq("user_id", user_id)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_relation(exc):
+            return []
+        raise
+    out: list[dict[str, Any]] = []
+    for r in (res.data or []):
+        acc = r.get("ad_accounts")
+        if acc:
+            out.append({**acc, "_role": r.get("role")})
+    return out
+
+
 def upsert_account_assignment(
     ad_account_id: int,
     user_id: int,
