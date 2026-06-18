@@ -93,6 +93,50 @@ def insert_alert(
     return row
 
 
+def recent_insight_metrics(campaign_id: int, *, days: int = 7) -> set[str]:
+    """A kampányra az utolsó `days` napban kiküldött INSIGHT metrikák halmaza.
+
+    Az insight-motor 7 napos deduplikációjához: ha egy metrika (pl.
+    'scaling_opportunity' vagy 'ai_recommendation') szerepel a halmazban, azt a
+    motor kihagyja (ne spammeljen ugyanazzal a javaslattal hetente többször).
+    Csak severity='insight' sorokat néz (az anomáliák nem zavarnak be).
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .select("metric")
+        .eq("campaign_id", campaign_id)
+        .eq("severity", "insight")
+        .gt("detected_at", cutoff)
+        .execute()
+    )
+    return {r["metric"] for r in (res.data or []) if r.get("metric")}
+
+
+def count_metric_today(metric: str) -> int:
+    """Ma (UTC nap eleje óta) hány alert keletkezett ezzel a metrikával.
+
+    Az AI insight napi globális limitjéhez (cost control): a scan csak addig hív
+    Claude-ot, amíg a `metric='ai_recommendation'` napi darabszám el nem éri a
+    küszöböt.
+    """
+    start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .select("id", count="exact")
+        .eq("metric", metric)
+        .gte("detected_at", start)
+        .execute()
+    )
+    if res.count is not None:
+        return res.count
+    return len(res.data or [])
+
+
 def mark_alert_routed(
     alert_id: int,
     *,

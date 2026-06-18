@@ -29,11 +29,16 @@ from src.config import get_config
 from src.integrations.discord_router import send_summary_to_user
 from src.integrations.google_ads import GoogleAdsClient
 from src.integrations.meta_ads import MetaAdsClient
+from src.monitoring.ai_insights import generate_ai_insight
 from src.monitoring.detector import detect_anomalies_for_campaign
+from src.monitoring.insight_engine import detect_insights_for_campaign
 from src.monitoring.router import route_alert
 from src.monitoring.summary import generate_daily_summary, generate_weekly_summary
 from src.monitoring.token_monitor import token_health_check
+from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import campaigns as campaigns_storage
+from src.storage import clients as clients_storage
+from src.storage import insights_history as insights_history_storage
 from src.storage import users as users_storage
 from src.storage.alerts import insert_alert
 from src.storage.insights import insert_campaign_insight, prune_old_insights
@@ -276,6 +281,135 @@ async def weekly_token_check() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Napi INSIGHT scan (18. lépés) — szabály-alapú + AI optimalizálási javaslatok
+# ---------------------------------------------------------------------------
+
+# Insight csak 'mature' kampányra (a 'new'/'learning' tanulási fázis kihagyva).
+_INSIGHT_LIFECYCLE = "mature"
+# Ennyi history sor kell legalább, hogy értelmes insightot adjunk.
+_INSIGHT_MIN_HISTORY_ROWS = 3
+
+
+def _resolve_client_for_account(ad_account_id: int | None) -> dict[str, Any] | None:
+    """Fiók → ügyfél (insights_enabled + név) az AI insighthoz. None ha nem feloldható."""
+    if not ad_account_id:
+        return None
+    account = ad_accounts_storage.get_ad_account(ad_account_id)
+    if not account:
+        return None
+    return clients_storage.get_client(account.get("client_id"))
+
+
+async def daily_insight_scan(*, limit: int | None = None) -> None:
+    """Napi INSIGHT scan (02:00, hétköznap) — szabály-alapú + AI javaslatok.
+
+    Csak 'mature' lifecycle-ú kampányokat néz (a tanulási fázis nem kap insightot).
+    Kampányonként:
+      1. utolsó 7 napi history (>= 3 sor kell, különben skip),
+      2. hatékony KPI (campaign→account→client→default),
+      3. szabály-alapú insightok (peer = ugyanazon fiók kampányai, ROAS-szal),
+      4. AI javaslat, ha a kliensnél insights_enabled=True,
+      5. alert beszúrás (dedup) + routing.
+
+    A routing `bypass_quiet_hours=True`: a 02:00 a csendes időbe esik, az insight
+    viszont csak csatorna-poszt (nem pingel), így a csendes idő nem nyomhatja el.
+
+    `limit`: legfeljebb ennyi mature kampányt dolgoz fel (teszt/manuális futtatás).
+    """
+    log.info("Napi insight scan indítva…")
+
+    try:
+        campaigns = await asyncio.to_thread(campaigns_storage.get_active_campaigns)
+    except Exception:
+        log.exception("Insight scan: a kampánylista lekérése sikertelen — kihagyva")
+        return
+
+    by_account = campaigns_storage.group_campaigns_by_account(campaigns)
+    mature = [
+        c for c in campaigns
+        if (c.get("lifecycle_state") or "").lower() == _INSIGHT_LIFECYCLE
+    ]
+    if limit is not None:
+        mature = mature[:limit]
+
+    if not mature:
+        log.info("Insight scan: nincs 'mature' kampány — kihagyva")
+        return
+
+    client_cache: dict[int, dict[str, Any] | None] = {}
+    roas_cache: dict[int, dict[int, float | None]] = {}
+
+    insight_count = 0
+    for campaign in mature:
+        cid = campaign.get("id")
+        acct_id = campaign.get("ad_account_id")
+        try:
+            history = await asyncio.to_thread(
+                insights_history_storage.get_insights_history, cid, 7
+            )
+            if len(history) < _INSIGHT_MIN_HISTORY_ROWS:
+                continue  # nincs elég adat
+
+            kpi = await asyncio.to_thread(insights_history_storage.get_merged_kpis, cid)
+
+            # Peer ROAS map fiókonként cache-elve (büdzsé-átcsoportosítás insighthoz).
+            peers_raw = by_account.get(acct_id, [])
+            if acct_id not in roas_cache:
+                peer_ids = [p["id"] for p in peers_raw if p.get("id") is not None]
+                roas_cache[acct_id] = await asyncio.to_thread(
+                    insights_history_storage.get_latest_roas_map, peer_ids
+                )
+            rmap = roas_cache[acct_id]
+            peers = [{**p, "roas": rmap.get(p.get("id"))} for p in peers_raw]
+
+            # 1) szabály-alapú insightok (7 napos deduppal)
+            insights = await detect_insights_for_campaign(campaign, history, kpi, peers)
+
+            # 2) AI javaslat — csak ha a kliensnél engedélyezett
+            if acct_id not in client_cache:
+                client_cache[acct_id] = await asyncio.to_thread(
+                    _resolve_client_for_account, acct_id
+                )
+            client = client_cache[acct_id]
+            if client and client.get("insights_enabled"):
+                enriched = {**campaign, "client_name": client.get("name")}
+                ai = await generate_ai_insight(enriched, history, kpi)
+                if ai:
+                    insights.append({
+                        "campaign_id": cid,
+                        "severity": "insight",
+                        "metric": "ai_recommendation",
+                        "observed_value": None,
+                        "threshold_value": None,
+                        "message": f"🤖 AI javaslat: {ai}",
+                    })
+
+            # 3) beszúrás + routing (ugyanaz a csővezeték, mint az anomáliáknál)
+            for ins in insights:
+                alert_row = await asyncio.to_thread(
+                    insert_alert,
+                    ins["campaign_id"], ins["severity"], ins["metric"],
+                    ins.get("observed_value"), ins.get("threshold_value"), ins["message"],
+                )
+                if alert_row:
+                    insight_count += 1
+                    try:
+                        await route_alert(alert_row, bypass_quiet_hours=True)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error(
+                            "Insight routing hiba (alert #%s): %s",
+                            alert_row.get("id"), exc,
+                        )
+        except Exception as exc:  # noqa: BLE001 — egy kampány hibája ne állítsa le a scant
+            log.error("Insight scan: kampány #%s hiba: %s", cid, exc)
+
+    log.info(
+        "Insight scan kész: %d mature kampány vizsgálva, %d insight",
+        len(mature), insight_count,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Scheduler életciklus
 # ---------------------------------------------------------------------------
 
@@ -348,9 +482,26 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
     )
 
+    # Napi INSIGHT scan: HÉTKÖZNAP 02:00 (18. lépés). Éjjel fut, hogy reggelre a
+    # friss optimalizálási javaslatok ott legyenek az OM csatornáiban. Hétvégén
+    # nem fut (akkor nincs aktív kampánykezelés).
+    _scheduler.add_job(
+        daily_insight_scan,
+        trigger="cron",
+        hour=2,
+        minute=0,
+        day_of_week="mon-fri",
+        id="daily_insight_scan",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
     _scheduler.start()
     log.info(
-        "Monitoring scheduler indítva (óránkénti ciklus + napi/heti összefoglaló, tz=%s)",
+        "Monitoring scheduler indítva (óránkénti ciklus + napi/heti összefoglaló "
+        "+ napi insight scan 02:00, tz=%s)",
         timezone,
     )
     return _scheduler
