@@ -55,6 +55,7 @@ import asyncio
 from datetime import date, datetime, timezone
 from typing import Any
 
+from src.storage import ad_account_kpis as ad_account_kpis_storage
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import client_kpis as client_kpis_storage
 from src.storage import kpis as kpis_storage
@@ -112,10 +113,11 @@ async def detect_anomalies_for_campaign(
         log.debug("Detektor: #%s data_valid_from előtt — skip", campaign_id)
         return []
 
-    # 2) Hatékony KPI-k: campaign_kpis aktív sor a kliens-default fölött mergelve.
+    # 2) Hatékony KPI-k: campaign_kpis → ad_account_kpis → client_kpis öröklés.
     campaign_kpis = await asyncio.to_thread(kpis_storage.get_active_kpis, campaign_id) or {}
+    account_kpis = await asyncio.to_thread(_account_kpis_for_campaign, campaign) or {}
     client_kpis = await asyncio.to_thread(_client_kpis_for_campaign, campaign) or {}
-    effective = _merge_kpis(campaign_kpis, client_kpis)
+    effective = _merge_kpis(campaign_kpis, account_kpis, client_kpis)
 
     only_critical = lifecycle in _CRITICAL_ONLY_LIFECYCLE
 
@@ -131,15 +133,23 @@ async def detect_anomalies_for_campaign(
 
 
 # ---------------------------------------------------------------------------
-# KPI öröklés (campaign → client → default)
+# KPI öröklés (campaign → ad_account → client → default) — 21. lépés
 # ---------------------------------------------------------------------------
+
+def _account_kpis_for_campaign(campaign: dict[str, Any]) -> dict[str, Any] | None:
+    """A kampány fiókjának KPI-sora (ad_account_kpis). None ha nincs / nincs tábla."""
+    ad_account_id = campaign.get("ad_account_id")
+    if not ad_account_id:
+        return None
+    return ad_account_kpis_storage.get_ad_account_kpis(ad_account_id)
+
 
 def _client_kpis_for_campaign(campaign: dict[str, Any]) -> dict[str, Any] | None:
     """A kampány kliensének KPI-sora (campaign → ad_account → client → client_kpis).
 
-    None, ha nincs (vagy ha a client_kpis tábla még nem létezik — a storage
-    réteg ezt elnyeli). A `campaigns` táblában NINCS közvetlen client_id, ezért
-    az ad_account-on keresztül oldjuk fel.
+    Másodlagos fallback a FIÓK-szintű KPI mögött. A `campaigns` táblában NINCS
+    közvetlen client_id, ezért az ad_account-on keresztül oldjuk fel. None, ha
+    nincs (vagy ha a client_kpis tábla nem létezik — a storage elnyeli).
     """
     ad_account_id = campaign.get("ad_account_id")
     if not ad_account_id:
@@ -152,13 +162,19 @@ def _client_kpis_for_campaign(campaign: dict[str, Any]) -> dict[str, Any] | None
 
 def _merge_kpis(
     campaign_kpis: dict[str, Any],
+    account_kpis: dict[str, Any],
     client_kpis: dict[str, Any],
 ) -> dict[str, Any]:
-    """Mezőnkénti öröklés: campaign érték, ha nem None; egyébként a kliens érték."""
+    """Mezőnkénti öröklés: campaign → ad_account → client (az első nem-None nyer)."""
     effective: dict[str, Any] = {}
     for field in _KPI_FIELDS:
-        camp_val = campaign_kpis.get(field)
-        effective[field] = camp_val if camp_val is not None else client_kpis.get(field)
+        value = None
+        for source in (campaign_kpis, account_kpis, client_kpis):
+            v = source.get(field)
+            if v is not None:
+                value = v
+                break
+        effective[field] = value
     return effective
 
 

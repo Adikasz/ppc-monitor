@@ -2,14 +2,18 @@
 Bulk onboarding CSV-ből (17. lépés).
 
 71 Meta + 28 Google ügyfél bekötése egy lépésben, CSV fájlokból. Soronként:
-  1. ügyfél upsert (név alapján; meglévőnél a contact_email frissül)
+  1. ügyfél upsert (név alapján; egy klienshez TÖBB sor = több fiók)
   2. hirdetési fiók regisztrálása (normalizált external id, idempotens)
   3. discovery (hacsak --skip-discovery)
   4. log: "✅ {name}: {X} kampány felfedezve"
 
-CSV formátum:
-    data/clients_meta.csv     → client_name,contact_email,meta_account_id
-    data/clients_google.csv   → client_name,contact_email,google_customer_id
+CSV formátum (21. lépés — contact_email NÉLKÜL):
+    data/clients_meta.csv     → client_name,meta_account_id
+    data/clients_google.csv   → client_name,google_customer_id
+
+Egy klienshez több fiók ugyanazon a platformon = több sor azonos client_name-mel
+(mind külön ad_account, a kliens alá vonva). Az OM-eket később Discordon
+rendelik hozzá (`/account assign`).
 
 Futtatás:
     python -m scripts.bulk_onboard --meta data/clients_meta.csv --google data/clients_google.csv
@@ -22,53 +26,71 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import sys
 
 from src.config import get_config  # noqa: F401 — .env betöltése
 from src.monitoring.discovery import discover_campaigns_for_client
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import clients as clients_storage
-from src.storage.supabase_client import get_supabase
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
 _REQUIRED = {
-    "meta": ("client_name", "contact_email", "meta_account_id"),
-    "google": ("client_name", "contact_email", "google_customer_id"),
+    "meta": ("client_name", "meta_account_id"),
+    "google": ("client_name", "google_customer_id"),
 }
 _ID_COLUMN = {"meta": "meta_account_id", "google": "google_customer_id"}
 
 
+def _read_text(path: str) -> str:
+    """CSV szöveg beolvasása kódolás-toleránsan (Excel/Windows gyakran cp1250).
+
+    Sorrend: utf-8-sig → cp1250 → latin-1 (utóbbi minden bájtot dekódol, így
+    sosem dob UnicodeDecodeError-t). Az ügyfélnevek ékezetei így nem törnek el.
+    """
+    for enc in ("utf-8-sig", "cp1250", "latin-1"):
+        try:
+            with open(path, encoding=enc, newline="") as fh:
+                return fh.read()
+        except UnicodeDecodeError:
+            continue
+    with open(path, encoding="utf-8", errors="replace", newline="") as fh:
+        return fh.read()
+
+
 def _read_csv(path: str, platform: str) -> list[dict[str, str]]:
-    """CSV beolvasása + fejléc-validáció. Üres client_name-ű sorok kimaradnak."""
+    """CSV beolvasása + fejléc-validáció. Üres client_name-ű sorok kimaradnak.
+
+    Az extra oszlopok (pl. egy maradék 'om' fejléc) figyelmen kívül maradnak.
+    """
     required = _REQUIRED[platform]
-    with open(path, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        header = reader.fieldnames or []
-        missing = [c for c in required if c not in header]
-        if missing:
-            raise ValueError(
-                f"Hiányzó oszlop(ok) a {path} fájlban: {missing} (fejléc: {header})"
-            )
-        rows = []
-        for row in reader:
-            if not (row.get("client_name") or "").strip():
-                continue
-            rows.append({k: (v or "").strip() for k, v in row.items()})
+    reader = csv.DictReader(io.StringIO(_read_text(path)))
+    header = reader.fieldnames or []
+    missing = [c for c in required if c not in header]
+    if missing:
+        raise ValueError(
+            f"Hiányzó oszlop(ok) a {path} fájlban: {missing} (fejléc: {header})"
+        )
+    rows = []
+    for row in reader:
+        if not (row.get("client_name") or "").strip():
+            continue
+        rows.append({k: (v or "").strip() for k, v in row.items() if k is not None})
     return rows
 
 
-def _upsert_client(name: str, contact_email: str) -> tuple[dict, bool]:
-    """Ügyfél upsert név alapján. Meglévőnél frissíti a contact_emailt, ha eltér."""
+def _upsert_client(name: str) -> tuple[dict, bool]:
+    """Ügyfél upsert név alapján (contact_email nélkül — 21. lépés).
+
+    Idempotens: meglévő névnél a meglévő sort adja vissza (created=False), így
+    ugyanazon client_name-mel több CSV-sor mind ugyanahhoz a klienshez köt.
+    """
     existing = clients_storage.get_client_by_name(name)
     if existing:
-        if contact_email and existing.get("contact_email") != contact_email:
-            get_supabase().table("clients").update(
-                {"contact_email": contact_email}
-            ).eq("id", existing["id"]).execute()
         return existing, False
-    return clients_storage.create_client(name, contact_email=contact_email or None), True
+    return clients_storage.create_client(name), True
 
 
 def _process(path: str, platform: str, *, dry_run: bool, skip_discovery: bool) -> dict[str, int]:
@@ -79,7 +101,6 @@ def _process(path: str, platform: str, *, dry_run: bool, skip_discovery: bool) -
     stats = {"clients": 0, "accounts": 0, "campaigns": 0, "errors": 0}
     for row in rows:
         name = row["client_name"]
-        email = row.get("contact_email", "")
         raw_id = row.get(id_col, "")
         norm_id = ad_accounts_storage.normalize_external_account_id(platform, raw_id)
 
@@ -90,12 +111,11 @@ def _process(path: str, platform: str, *, dry_run: bool, skip_discovery: bool) -
 
         if dry_run:
             disc = "" if skip_discovery else " + discovery"
-            print(f"  [DRY] client='{name}' email='{email or '—'}' "
-                  f"{platform}=`{norm_id}`{disc}")
+            print(f"  [DRY] client='{name}' {platform}=`{norm_id}`{disc}")
             continue
 
         try:
-            client, created = _upsert_client(name, email)
+            client, created = _upsert_client(name)
             if created:
                 stats["clients"] += 1
             _account, acc_created = ad_accounts_storage.get_or_create_ad_account(
@@ -122,8 +142,8 @@ def _process(path: str, platform: str, *, dry_run: bool, skip_discovery: bool) -
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bulk onboarding CSV-ből (Meta/Google).")
-    parser.add_argument("--meta", metavar="CSV", help="Meta CSV (client_name,contact_email,meta_account_id)")
-    parser.add_argument("--google", metavar="CSV", help="Google CSV (client_name,contact_email,google_customer_id)")
+    parser.add_argument("--meta", metavar="CSV", help="Meta CSV (client_name,meta_account_id)")
+    parser.add_argument("--google", metavar="CSV", help="Google CSV (client_name,google_customer_id)")
     parser.add_argument("--dry-run", action="store_true", help="DB írás nélkül, csak listázás")
     parser.add_argument("--skip-discovery", action="store_true", help="Csak ügyfél + fiók, discovery nélkül")
     args = parser.parse_args()

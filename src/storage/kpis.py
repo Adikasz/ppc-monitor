@@ -219,3 +219,72 @@ def cascade_client_kpis_to_campaigns(
             result["inserted"] += len(chunk)
 
     return result
+
+
+def cascade_account_kpis_to_campaigns(
+    campaign_ids: list[int],
+    *,
+    values: dict[str, Any],
+    set_by_discord_user_id: str | None = None,
+) -> dict[str, int]:
+    """Fiók-szintű KPI-értékek lecsorgatása a megadott kampányok aktív KPI-sorába (21. lépés).
+
+    Kampányonként:
+      - KÉZI override (inherited_from_account=false ÉS inherited_from_client=false)
+        → KIHAGYJUK (a per-kampány /campaign kpi megmarad);
+      - örökölt aktív sor → helyben UPDATE + inherited_from_account=true;
+      - nincs aktív sor → új sor (is_active=true, inherited_from_account=true).
+
+    Visszatérés: {"updated", "inserted", "skipped_override", "total"}.
+    """
+    result = {"updated": 0, "inserted": 0, "skipped_override": 0, "total": len(campaign_ids)}
+    if not campaign_ids:
+        return result
+
+    sb = get_supabase()
+
+    active_rows: list[dict[str, Any]] = []
+    for chunk in _chunks(campaign_ids, 200):
+        rows = (
+            sb.table(_TABLE)
+            .select("id, campaign_id, inherited_from_client, inherited_from_account")
+            .in_("campaign_id", chunk)
+            .eq("is_active", True)
+            .execute()
+            .data
+            or []
+        )
+        active_rows.extend(rows)
+    active_by_cid = {r["campaign_id"]: r for r in active_rows}
+
+    to_insert: list[dict[str, Any]] = []
+    for cid in campaign_ids:
+        row = active_by_cid.get(cid)
+        if row is not None:
+            is_manual = not (
+                row.get("inherited_from_client") or row.get("inherited_from_account")
+            )
+            if is_manual:
+                result["skipped_override"] += 1
+                continue
+            sb.table(_TABLE).update(
+                {**values, "inherited_from_account": True}
+            ).eq("id", row["id"]).execute()
+            result["updated"] += 1
+        else:
+            payload: dict[str, Any] = {
+                "campaign_id": cid,
+                "is_active": True,
+                "inherited_from_account": True,
+                **values,
+            }
+            if set_by_discord_user_id is not None:
+                payload["set_by_discord_user_id"] = set_by_discord_user_id
+            to_insert.append(payload)
+
+    for chunk in _chunks(to_insert, 500):
+        if chunk:
+            sb.table(_TABLE).insert(chunk).execute()
+            result["inserted"] += len(chunk)
+
+    return result

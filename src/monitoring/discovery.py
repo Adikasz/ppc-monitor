@@ -38,6 +38,7 @@ from typing import Any
 
 from src.integrations.google_ads import GoogleAdsClient
 from src.integrations.meta_ads import MetaAdsClient
+from src.storage import account_assignments as account_assignments_storage
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import assignments as assignments_storage
 from src.storage import campaigns as campaigns_storage
@@ -294,16 +295,21 @@ def _upsert_campaign(
             "Discovery: ÚJ kampány → #%s '%s' (fiók_db=%s, status=%s)",
             ext_campaign_id, api_campaign["name"], db_account_id, status,
         )
-        # Kliens-szintű hozzárendelések öröklése az új kampányra. A hiba nem
-        # buktathatja meg a discovery-t (fault isolation).
+        # Hozzárendelés-öröklés az új kampányra: elsődlegesen FIÓK-szintű
+        # (21. lépés), majd a megmaradt kliens-szintű (visszafelé kompatibilis).
+        # A hiba nem buktathatja meg a discovery-t (fault isolation).
         try:
-            inherited = assignments_storage.inherit_client_assignments_for_campaign(
+            n_acct = account_assignments_storage.inherit_account_assignments_for_campaign(
+                db_account_id, new_camp["id"]
+            )
+            n_client = assignments_storage.inherit_client_assignments_for_campaign(
                 client_id, new_camp["id"]
             )
-            if inherited:
+            if n_acct or n_client:
                 log.info(
-                    "Discovery: %d öröklött hozzárendelés az új kampányra #%s",
-                    inherited, new_camp["id"],
+                    "Discovery: öröklött hozzárendelés az új kampányra #%s "
+                    "(fiók=%d, kliens=%d)",
+                    new_camp["id"], n_acct, n_client,
                 )
         except Exception:  # noqa: BLE001
             log.exception(

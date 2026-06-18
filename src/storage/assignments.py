@@ -242,9 +242,13 @@ def _insert_assignment_rows(rows: list[dict[str, Any]]) -> None:
     try:
         sb.table(_TABLE).insert(rows).execute()
     except Exception as exc:  # noqa: BLE001
-        if "inherited_from_client" in str(exc).lower():
+        msg = str(exc).lower()
+        if "inherited_from_client" in msg or "inherited_from_account" in msg:
+            # 0009/0010 migration még nem futott — a flag(ek) nélkül újrapróbáljuk.
             stripped = [
-                {k: v for k, v in r.items() if k != "inherited_from_client"} for r in rows
+                {k: v for k, v in r.items()
+                 if k not in ("inherited_from_client", "inherited_from_account")}
+                for r in rows
             ]
             sb.table(_TABLE).insert(stripped).execute()
         else:
@@ -256,12 +260,14 @@ def bulk_assign_campaigns(
     campaign_ids: list[int],
     *,
     role: str = "primary",
+    inherited_field: str = "inherited_from_client",
     created_by_discord_user_id: str | None = None,
 ) -> dict[str, int]:
     """A user kampány-szintű hozzárendelése a megadott kampányokhoz (öröklött).
 
     Idempotens: meglévő (user, campaign) párnál csak a role-t igazítja, ha eltér;
-    egyébként új, inherited_from_client=true sort szúr be (bulk, csonkolva).
+    egyébként új, öröklött sort szúr be (bulk, csonkolva). Az `inherited_field`
+    jelzi a forrást: 'inherited_from_client' vagy 'inherited_from_account'.
 
     Visszatérés: {"created", "updated", "total"}.
     """
@@ -293,7 +299,7 @@ def bulk_assign_campaigns(
                 "user_id": user_id,
                 "campaign_id": cid,
                 "role": role,
-                "inherited_from_client": True,
+                inherited_field: True,
             }
             if created_by_discord_user_id is not None:
                 payload["created_by_discord_user_id"] = created_by_discord_user_id
@@ -335,17 +341,22 @@ def bulk_unassign_campaigns(user_id: int, campaign_ids: list[int]) -> int:
     return deleted
 
 
-def inherit_client_assignments_for_campaign(client_id: int, campaign_id: int) -> int:
-    """Egy ÚJ kampányra örökíti a kliens-szintű hozzárendeléseket (discovery hívja).
+def inherit_assignments_for_campaign(
+    campaign_id: int,
+    source_user_roles: list[dict[str, Any]],
+    *,
+    inherited_field: str = "inherited_from_client",
+) -> int:
+    """Öröklött kampány-szintű hozzárendelések létrehozása egy ÚJ kampányra.
 
-    Minden userre, akinek van kliens-szintű (client_id, campaign_id=null)
-    hozzárendelése ehhez a klienshez, létrehoz egy öröklött kampány-szintű sort,
-    ha még nincs hozzárendelése a kampányon.
+    `source_user_roles`: [{"user_id": int, "role": str}, …] — a forrás (kliens-
+    vagy fiók-szintű) hozzárendelések. Csak azokra a userekre szúr be, akiknek
+    még NINCS hozzárendelése a kampányon. Az `inherited_field`
+    ('inherited_from_client' | 'inherited_from_account') jelzi a forrást.
 
     Visszatérés: a létrehozott öröklött hozzárendelések száma.
     """
-    client_assigns = get_assignments_for_client(client_id)
-    if not client_assigns:
+    if not source_user_roles:
         return 0
 
     sb = get_supabase()
@@ -360,18 +371,31 @@ def inherit_client_assignments_for_campaign(client_id: int, campaign_id: int) ->
     already = {r["user_id"] for r in existing}
 
     to_insert: list[dict[str, Any]] = []
-    for a in client_assigns:
-        uid = a["user_id"]
+    for src in source_user_roles:
+        uid = src["user_id"]
         if uid in already:
             continue
         to_insert.append({
             "user_id": uid,
             "campaign_id": campaign_id,
-            "role": a.get("role") or "primary",
-            "inherited_from_client": True,
+            "role": src.get("role") or "primary",
+            inherited_field: True,
         })
     _insert_assignment_rows(to_insert)
     return len(to_insert)
+
+
+def inherit_client_assignments_for_campaign(client_id: int, campaign_id: int) -> int:
+    """Kliens-szintű hozzárendelések öröklése egy új kampányra (visszafelé kompat.).
+
+    A fiók-szintű öröklés a `storage.account_assignments`-ban van — a discovery
+    mindkettőt meghívja az új kampányra.
+    """
+    client_assigns = get_assignments_for_client(client_id)
+    source = [{"user_id": a["user_id"], "role": a.get("role")} for a in client_assigns]
+    return inherit_assignments_for_campaign(
+        campaign_id, source, inherited_field="inherited_from_client"
+    )
 
 
 def list_client_level_assignments() -> list[dict[str, Any]]:

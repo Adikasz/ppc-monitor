@@ -29,12 +29,13 @@ from discord.ext import commands
 
 from src.config import get_config
 from src.monitoring.discovery import discover_campaigns_for_client
+from src.storage import account_assignments as account_assignments_storage
+from src.storage import ad_account_kpis as ad_account_kpis_storage
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import alerts as alerts_storage
 from src.storage import assignments as assignments_storage
 from src.storage import audit
 from src.storage import campaigns as campaigns_storage
-from src.storage import client_kpis as client_kpis_storage
 from src.storage import clients as clients_storage
 from src.storage import kpis as kpis_storage
 from src.storage import users as users_storage
@@ -145,6 +146,27 @@ def _max_last_seen(campaigns: list[dict]) -> str:
     return _fmt_ts(max(values)) if values else "—"
 
 
+def _format_account_kpi(kpi: dict | None) -> str:
+    """Fiók-szintű KPI sor a /client status-hoz. '❌ nincs' ha nincs beállítva."""
+    if not kpi:
+        return "❌ nincs (`/account kpi`)"
+    bits: list[str] = []
+    if kpi.get("target_roas") is not None:
+        bits.append(f"ROAS {_pct_int(kpi['target_roas'])}")
+    if kpi.get("max_cpa") is not None:
+        bits.append(f"CPA {_money(kpi['max_cpa'])} Ft")
+    if kpi.get("monthly_budget") is not None:
+        bits.append(f"Büdzsé {_money(kpi['monthly_budget'])} Ft")
+    if kpi.get("target_ctr") is not None:
+        bits.append(f"CTR {_pct_int(kpi['target_ctr'])}%")
+    if kpi.get("max_cpc") is not None:
+        bits.append(f"CPC {_money(kpi['max_cpc'])} Ft")
+    if kpi.get("max_cpl") is not None:
+        bits.append(f"CPL {_money(kpi['max_cpl'])} Ft")
+    thr = f"W-{_pct_int(kpi.get('warning_pct'))}% / C-{_pct_int(kpi.get('critical_pct'))}%"
+    return (" | ".join(bits) + " | " + thr) if bits else thr
+
+
 # ---------------------------------------------------------------------------
 # Cog
 # ---------------------------------------------------------------------------
@@ -176,39 +198,43 @@ class ClientCog(commands.GroupCog, group_name="client"):
         page_clients = clients[start:start + per_page]
 
         # Bulk adatok — lapfüggetlenül konstans lekérdezésszám (nincs N+1).
+        # A KPI és az OM mostantól FIÓK-szintű (21. lépés).
         accounts = await asyncio.to_thread(ad_accounts_storage.list_ad_accounts, active_only=True)
         campaign_acct_ids = await asyncio.to_thread(
             campaigns_storage.list_ad_account_ids, active_only=True
         )
-        kpi_ids = await asyncio.to_thread(client_kpis_storage.list_client_ids_with_kpis)
-        om_rows = await asyncio.to_thread(assignments_storage.list_client_level_assignments)
+        kpi_acct_ids = await asyncio.to_thread(ad_account_kpis_storage.list_account_ids_with_kpis)
+        om_rows = await asyncio.to_thread(account_assignments_storage.list_all_account_assignments)
 
         accounts_by_client: dict[int, list[dict]] = defaultdict(list)
         for a in accounts:
             accounts_by_client[a["client_id"]].append(a)
         camp_per_acct = Counter(campaign_acct_ids)
-        om_by_client: dict[int, list[str]] = defaultdict(list)
+        om_by_acct: dict[int, list[str]] = defaultdict(list)
         for r in om_rows:
             name = (r.get("users") or {}).get("display_name")
             if name:
-                om_by_client[r["client_id"]].append(name)
+                om_by_acct[r["ad_account_id"]].append(name)
 
         blocks: list[str] = []
         for c in page_clients:
             cid = c["id"]
-            accs = accounts_by_client.get(cid, [])
-            meta_line = _platform_line([a for a in accs if a["platform"] == "meta"], camp_per_acct)
-            google_line = _platform_line([a for a in accs if a["platform"] == "google"], camp_per_acct)
-            kpi_emoji = "✅" if cid in kpi_ids else "❌"
-            oms = om_by_client.get(cid, [])
-            om_str = ", ".join(f"@{n}" for n in oms) if oms else "➖ nincs"
+            accs = sorted(accounts_by_client.get(cid, []), key=lambda a: (a["platform"], a["id"]))
             inactive = " · ⏸ inaktív" if not c.get("is_active", True) else ""
-            blocks.append(
-                f"**#{cid} {c['name']}**{inactive}\n"
-                f"　Meta: {meta_line}\n"
-                f"　Google: {google_line}\n"
-                f"　KPI: {kpi_emoji} | OM: {om_str}"
-            )
+            lines = [f"**#{cid} {c['name']}**{inactive}"]
+            if accs:
+                for a in accs:
+                    aid = a["id"]
+                    oms = om_by_acct.get(aid, [])
+                    om_str = ", ".join(f"@{n}" for n in oms) if oms else "—"
+                    kpi_emoji = "✅" if aid in kpi_acct_ids else "❌"
+                    lines.append(
+                        f"　`{a['platform']}` `{_short_account(a['external_account_id'])}` "
+                        f"(#{aid}, {camp_per_acct.get(aid, 0)} kampány) · KPI {kpi_emoji} · OM: {om_str}"
+                    )
+            else:
+                lines.append("　➖ nincs fiók")
+            blocks.append("\n".join(lines))
 
         description = "\n\n".join(blocks)
         if len(description) > 4000:
@@ -279,7 +305,7 @@ class ClientCog(commands.GroupCog, group_name="client"):
                 )
             acc_value = "\n".join(acc_lines)
         else:
-            acc_value = "— (nincs fiók — `/adaccount add` vagy `/client onboard`)"
+            acc_value = "— (nincs fiók — `/account add` vagy `/client onboard`)"
         embed.add_field(
             name=f"Hirdetési fiókok ({len(accounts)})", value=acc_value, inline=False
         )
@@ -584,26 +610,42 @@ class ClientCog(commands.GroupCog, group_name="client"):
         if user_created:
             log.info("Új felhasználó regisztrálva: %s (%s)", user, user.id)
 
-        # 1) Kliens-szintű hozzárendelés (öröklés forrása — az új kampányok ebből
-        #    öröklik a hozzárendelést a discovery során).
-        await asyncio.to_thread(
-            assignments_storage.create_assignment,
-            user_id=user_row["id"],
-            client_id=c["id"],
-            role=role_value,
-            created_by_discord_user_id=str(interaction.user.id),
+        # Kényelmi parancs: a kliens MINDEN (aktív) fiókjára fiók-szintű
+        # hozzárendelés + kaszkád a fiók kampányaira (21. lépés — az egység a fiók).
+        accounts = await asyncio.to_thread(
+            ad_accounts_storage.get_ad_accounts_for_client, c["id"], active_only=True
         )
+        if not accounts:
+            await interaction.followup.send(
+                f"**{c['name']}**-hez nincs aktív hirdetési fiók — előbb `/account add`."
+            )
+            return
 
-        # 2) Kaszkád a kliens jelenlegi (nem-ended) kampányaira.
-        campaigns = await asyncio.to_thread(campaigns_storage.list_campaigns, c["id"])
-        campaign_ids = [row["id"] for row in campaigns]
-        casc = await asyncio.to_thread(
-            assignments_storage.bulk_assign_campaigns,
-            user_row["id"],
-            campaign_ids,
-            role=role_value,
-            created_by_discord_user_id=str(interaction.user.id),
-        )
+        total_campaigns = 0
+        per_account: list[str] = []
+        for a in accounts:
+            try:
+                await asyncio.to_thread(
+                    account_assignments_storage.upsert_account_assignment,
+                    a["id"], user_row["id"], role=role_value,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Kliens-assign: fiók-hozzárendelés hiba (#%s)", a["id"])
+                per_account.append(f"`{a['platform']}` #{a['id']} — ❌ `{exc}`")
+                continue
+            campaign_ids = [
+                cm["id"]
+                for cm in await asyncio.to_thread(campaigns_storage.get_campaigns_by_ad_account, a["id"])
+                if cm.get("lifecycle_state") != "ended"
+            ]
+            casc = await asyncio.to_thread(
+                assignments_storage.bulk_assign_campaigns,
+                user_row["id"], campaign_ids,
+                role=role_value, inherited_field="inherited_from_account",
+                created_by_discord_user_id=str(interaction.user.id),
+            )
+            total_campaigns += casc["total"]
+            per_account.append(f"`{a['platform']}` #{a['id']} — {casc['total']} kampány")
 
         await asyncio.to_thread(
             audit.log_action,
@@ -616,19 +658,19 @@ class ClientCog(commands.GroupCog, group_name="client"):
                 "user_discord_id": str(user.id),
                 "user_name": _display_name(user),
                 "role": role_value,
-                "campaigns": casc["total"],
-                "created": casc["created"],
-                "updated": casc["updated"],
+                "accounts": len(accounts),
+                "campaigns": total_campaigns,
             },
         )
 
         log.info(
-            "Kliens-assign: %s → %s (%s, %d kampány)",
-            user, c["name"], role_value, casc["total"],
+            "Kliens-assign (fiókonként): %s → %s (%d fiók, %d kampány)",
+            user, c["name"], len(accounts), total_campaigns,
         )
         await interaction.followup.send(
-            f"✅ {user.mention} hozzárendelve: **{c['name']}** "
-            f"({casc['total']} kampány, {role_value})"
+            f"✅ {user.mention} hozzárendelve: **{c['name']}** — "
+            f"{len(accounts)} fiók, {total_campaigns} kampány ({role_value})\n"
+            + "\n".join(f"　• {line}" for line in per_account)
         )
 
     # ------------------------------------------------------------------
@@ -670,15 +712,19 @@ class ClientCog(commands.GroupCog, group_name="client"):
             )
             return
 
-        # Kliens-szintű hozzárendelés törlése (öröklés-forrás megszüntetése).
+        # Fiók-szintű hozzárendelések törlése a kliens MINDEN fiókján, plusz a
+        # régi kliens-szintű sor (visszafelé kompat.), majd a kampány-szintű sorok.
+        accounts = await asyncio.to_thread(
+            ad_accounts_storage.get_ad_accounts_for_client, c["id"], active_only=False
+        )
+        for a in accounts:
+            await asyncio.to_thread(
+                account_assignments_storage.delete_account_assignment, a["id"], user_row["id"]
+            )
         await asyncio.to_thread(
-            assignments_storage.delete_assignment,
-            user_id=user_row["id"],
-            client_id=c["id"],
+            assignments_storage.delete_assignment, user_id=user_row["id"], client_id=c["id"]
         )
 
-        # Kampány-szintű hozzárendelések törlése a kliens ÖSSZES kampányáról
-        # (ended-eket is beleértve, hogy ne maradjon árva sor).
         campaigns = await asyncio.to_thread(
             campaigns_storage.list_campaigns, c["id"], active_only=False
         )
@@ -697,14 +743,18 @@ class ClientCog(commands.GroupCog, group_name="client"):
                 "client_name": c["name"],
                 "user_discord_id": str(user.id),
                 "user_name": _display_name(user),
+                "accounts": len(accounts),
                 "deleted_campaign_assignments": deleted,
             },
         )
 
-        log.info("Kliens-unassign: %s ← %s (%d törölve)", user, c["name"], deleted)
+        log.info(
+            "Kliens-unassign (fiókonként): %s ← %s (%d fiók, %d kampány törölve)",
+            user, c["name"], len(accounts), deleted,
+        )
         await interaction.followup.send(
-            f"✅ {user.mention} eltávolítva: **{c['name']}** "
-            f"({deleted} kampány-hozzárendelés törölve)"
+            f"✅ {user.mention} eltávolítva: **{c['name']}** — {len(accounts)} fiók, "
+            f"{deleted} kampány-hozzárendelés törölve"
         )
 
     # ------------------------------------------------------------------
@@ -773,44 +823,57 @@ class ClientCog(commands.GroupCog, group_name="client"):
             await interaction.followup.send("❌ Adj meg legalább egy KPI mezőt.")
             return
 
-        # 1) Kliens-szintű KPI upsert
-        try:
-            client_row = await asyncio.to_thread(
-                client_kpis_storage.upsert_client_kpis, c["id"], fields=inputs
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Hiba a kliens-KPI mentésekor (#%s)", c["id"])
+        # Kényelmi parancs: ugyanazt a KPI-t állítja a kliens MINDEN (aktív)
+        # fiókjára — a tárolás FIÓK-szinten történik (21. lépés).
+        accounts = await asyncio.to_thread(
+            ad_accounts_storage.get_ad_accounts_for_client, c["id"], active_only=True
+        )
+        if not accounts:
             await interaction.followup.send(
-                f"❌ Nem sikerült a kliens-KPI mentése: `{exc}`\n"
-                f"Lehet, hogy a `0009_client_cascade.sql` migráció (client_kpis tábla) "
-                f"még nem futott le."
+                f"**{c['name']}**-hez nincs aktív hirdetési fiók — előbb `/account add`."
             )
             return
 
-        # 2) Lecsorgatás a kliens kampányaira (a tárolt — defaultokkal kiegészített
-        #    — kliens-értékekből; a kézi /campaign kpi override-okat megőrzi).
-        cascade_values = {
-            f: client_row[f]
-            for f in client_kpis_storage.CASCADE_FIELDS
-            if client_row.get(f) is not None
-        }
-        campaigns = await asyncio.to_thread(campaigns_storage.list_campaigns, c["id"])
-        campaign_ids = [row["id"] for row in campaigns]
-        try:
-            casc = await asyncio.to_thread(
-                kpis_storage.cascade_client_kpis_to_campaigns,
-                campaign_ids,
-                values=cascade_values,
-                set_by_discord_user_id=str(interaction.user.id),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Hiba a KPI kaszkádban (#%s)", c["id"])
-            await interaction.followup.send(
-                f"⚠️ A kliens-KPI elmentve, de a kaszkád hibázott: `{exc}`\n"
-                f"(Lehet, hogy a campaign_kpis `warning_pct`/`critical_pct` oszlopok "
-                f"hiányoznak — `0009` migráció.)"
-            )
-            return
+        total_written = 0
+        last_row: dict = {}
+        per_account: list[str] = []
+        for a in accounts:
+            try:
+                row = await asyncio.to_thread(
+                    ad_account_kpis_storage.upsert_ad_account_kpis, a["id"], fields=inputs
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Kliens-KPI: fiók-KPI mentés hiba (#%s)", a["id"])
+                await interaction.followup.send(
+                    f"❌ Nem sikerült a fiók-KPI mentése (#{a['id']}): `{exc}`\n"
+                    f"Lehet, hogy a `0010_account_level.sql` migráció még nem futott le."
+                )
+                return
+            last_row = row
+            cascade_values = {
+                f: row[f] for f in ad_account_kpis_storage.CASCADE_FIELDS if row.get(f) is not None
+            }
+            campaign_ids = [
+                cm["id"]
+                for cm in await asyncio.to_thread(campaigns_storage.get_campaigns_by_ad_account, a["id"])
+                if cm.get("lifecycle_state") != "ended"
+            ]
+            try:
+                casc = await asyncio.to_thread(
+                    kpis_storage.cascade_account_kpis_to_campaigns,
+                    campaign_ids, values=cascade_values,
+                    set_by_discord_user_id=str(interaction.user.id),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Kliens-KPI: kaszkád hiba (#%s)", a["id"])
+                await interaction.followup.send(
+                    f"⚠️ A fiók-KPI (#{a['id']}) elmentve, de a kaszkád hibázott: `{exc}`\n"
+                    f"(Lehet, hogy a campaign_kpis `inherited_from_account` oszlop hiányzik — `0010`.)"
+                )
+                return
+            written = casc["updated"] + casc["inserted"]
+            total_written += written
+            per_account.append(f"`{a['platform']}` #{a['id']} — {written} kampány")
 
         await asyncio.to_thread(
             audit.log_action,
@@ -818,45 +881,32 @@ class ClientCog(commands.GroupCog, group_name="client"):
             "client_kpi",
             entity_type="client",
             entity_id=c["id"],
-            details={"client_name": c["name"], "fields": inputs, "cascade": casc},
+            details={"client_name": c["name"], "fields": inputs,
+                     "accounts": len(accounts), "campaigns": total_written},
         )
+        log.info("Kliens-KPI (fiókonként): %s → %d fiók, %d kampány",
+                 c["name"], len(accounts), total_written)
 
-        written = casc["updated"] + casc["inserted"]
-        log.info("Kliens-KPI: %s → %d kampány frissítve", c["name"], written)
+        bits: list[str] = []
+        if last_row.get("target_roas") is not None:
+            bits.append(f"ROAS {_pct_int(last_row['target_roas'])}")
+        if last_row.get("max_cpa") is not None:
+            bits.append(f"Max CPA {_money(last_row['max_cpa'])} Ft")
+        if last_row.get("monthly_budget") is not None:
+            bits.append(f"Büdzsé {_money(last_row['monthly_budget'])} Ft")
+        if last_row.get("target_ctr") is not None:
+            bits.append(f"CTR {_pct_int(last_row['target_ctr'])}%")
+        if last_row.get("max_cpc") is not None:
+            bits.append(f"Max CPC {_money(last_row['max_cpc'])} Ft")
+        if last_row.get("max_cpl") is not None:
+            bits.append(f"Max CPL {_money(last_row['max_cpl'])} Ft")
+        thr_line = f"W-{_pct_int(last_row.get('warning_pct'))}% / C-{_pct_int(last_row.get('critical_pct'))}%"
 
-        # Összefoglaló sorok
-        summary_bits: list[str] = []
-        if client_row.get("target_roas") is not None:
-            summary_bits.append(f"ROAS target: {_pct_int(client_row['target_roas'])}")
-        if client_row.get("target_roi") is not None:
-            summary_bits.append(f"ROI: {_pct_int(client_row['target_roi'])}")
-        if client_row.get("max_cpa") is not None:
-            summary_bits.append(f"Max CPA: {_money(client_row['max_cpa'])} Ft")
-        if client_row.get("max_cpl") is not None:
-            summary_bits.append(f"Max CPL: {_money(client_row['max_cpl'])} Ft")
-        if client_row.get("target_ctr") is not None:
-            summary_bits.append(f"Cél CTR: {_pct_int(client_row['target_ctr'])}%")
-        if client_row.get("max_cpc") is not None:
-            summary_bits.append(f"Max CPC: {_money(client_row['max_cpc'])} Ft")
-        if client_row.get("monthly_budget") is not None:
-            summary_bits.append(f"Büdzsé: {_money(client_row['monthly_budget'])} Ft")
-        if client_row.get("primary_conversion_event"):
-            summary_bits.append(f"Konverzió: {client_row['primary_conversion_event']}")
-
-        w = client_row.get("warning_pct")
-        cr = client_row.get("critical_pct")
-        thr_line = f"Warning: -{_pct_int(w)}% | Critical: -{_pct_int(cr)}%"
-
-        msg = (
-            f"✅ KPI beállítva: **{c['name']}** ({written} kampány frissítve)\n"
-            f"{' | '.join(summary_bits)}\n{thr_line}"
+        await interaction.followup.send(
+            f"✅ KPI beállítva: **{c['name']}** — {len(accounts)} fiók, {total_written} kampány\n"
+            f"{' | '.join(bits)} | {thr_line}\n"
+            + "\n".join(f"　• {line}" for line in per_account)
         )
-        if casc["skipped_override"]:
-            msg += (
-                f"\nℹ️ {casc['skipped_override']} kampány kihagyva "
-                f"(kézi `/campaign kpi` override megmaradt)"
-            )
-        await interaction.followup.send(msg)
 
     # ------------------------------------------------------------------
     # /client status client:<név vagy id>
@@ -879,10 +929,6 @@ class ClientCog(commands.GroupCog, group_name="client"):
         all_campaigns = await asyncio.to_thread(
             campaigns_storage.list_campaigns, c["id"], active_only=False
         )
-        kpi = await asyncio.to_thread(client_kpis_storage.get_client_kpis, c["id"])
-        assigns = await asyncio.to_thread(
-            assignments_storage.get_assignments_for_client, c["id"]
-        )
         campaign_ids = [cm["id"] for cm in all_campaigns]
         last_alert = (
             await asyncio.to_thread(alerts_storage.get_latest_alert_for_campaigns, campaign_ids)
@@ -899,7 +945,7 @@ class ClientCog(commands.GroupCog, group_name="client"):
             color=discord.Color.blue() if is_active else discord.Color.dark_grey(),
         )
 
-        # Fiókok + kampányszám (aktív/pausált) + utolsó discovery
+        # FIÓKONKÉNT: kampányszám + KPI + OM + utolsó discovery (21. lépés)
         if accounts:
             for a in accounts:
                 camps = campaigns_by_acct.get(a["id"], [])
@@ -907,50 +953,28 @@ class ClientCog(commands.GroupCog, group_name="client"):
                 paused = sum(1 for cm in camps if cm.get("lifecycle_state") == "paused")
                 icon = "📣" if a["platform"] == "meta" else "🔎"
                 inactive = "" if a.get("is_active", True) else " ⏸"
+
+                kpi = await asyncio.to_thread(ad_account_kpis_storage.get_ad_account_kpis, a["id"])
+                oms = await asyncio.to_thread(
+                    account_assignments_storage.get_account_assignments, a["id"]
+                )
+                om_line = ", ".join(
+                    f"@{(r.get('users') or {}).get('display_name') or '?'} (`{r.get('role') or 'primary'}`)"
+                    for r in oms
+                ) if oms else "➖ nincs"
+
                 embed.add_field(
-                    name=f"{icon} {a['platform']}: {a['external_account_id']}{inactive}",
+                    name=f"{icon} {a['platform']}: {a['external_account_id']} (#{a['id']}){inactive}",
                     value=(
                         f"Kampányok: {active} aktív / {paused} pausált\n"
+                        f"🎯 KPI: {_format_account_kpi(kpi)}\n"
+                        f"👤 OM: {om_line}\n"
                         f"Utolsó discovery: {_max_last_seen(camps)}"
                     ),
                     inline=False,
                 )
         else:
             embed.add_field(name="Hirdetési fiókok", value="— nincs", inline=False)
-
-        # KPI
-        if kpi:
-            bits: list[str] = []
-            if kpi.get("target_roas") is not None:
-                bits.append(f"ROAS {_pct_int(kpi['target_roas'])}")
-            if kpi.get("max_cpa") is not None:
-                bits.append(f"Max CPA: {_money(kpi['max_cpa'])} Ft")
-            if kpi.get("monthly_budget") is not None:
-                bits.append(f"Büdzsé: {_money(kpi['monthly_budget'])} Ft")
-            if kpi.get("max_cpl") is not None:
-                bits.append(f"Max CPL: {_money(kpi['max_cpl'])} Ft")
-            if kpi.get("target_ctr") is not None:
-                bits.append(f"Cél CTR: {_pct_int(kpi['target_ctr'])}%")
-            if kpi.get("max_cpc") is not None:
-                bits.append(f"Max CPC: {_money(kpi['max_cpc'])} Ft")
-            kpi_value = (
-                " | ".join(bits) + "\n"
-                f"Warning: -{_pct_int(kpi.get('warning_pct'))}% | "
-                f"Critical: -{_pct_int(kpi.get('critical_pct'))}%"
-            )
-        else:
-            kpi_value = "❌ nincs kliens-szintű KPI — `/client kpi`"
-        embed.add_field(name="🎯 KPI", value=kpi_value, inline=False)
-
-        # OM-ek
-        if assigns:
-            om_value = ", ".join(
-                f"@{(r.get('users') or {}).get('display_name') or '?'} (`{r.get('role') or 'primary'}`)"
-                for r in assigns
-            )
-        else:
-            om_value = "➖ nincs"
-        embed.add_field(name="👤 OM-ek", value=om_value, inline=False)
 
         # Utolsó alert
         if last_alert:
