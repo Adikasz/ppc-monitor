@@ -1,6 +1,8 @@
 # Környezeti változók — SOHA ne committold
 .env
 *.env
+.env.new
+.env.backup
 !.env.example
 
 # Python
@@ -37,3 +39,6 @@ logs/
 
 # Ügyféladatok (bulk onboarding CSV-k) — SOHA ne committold
 data/*.csv
+
+# Migráció — generált SQL artifactok (regenerálható: python -m scripts.create_schema)
+scripts/_*.sql
