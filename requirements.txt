@@ -16,13 +16,11 @@ supabase==2.17.0
 facebook-business==21.0.0
 
 # Google Ads API
-# Az integráció kódja (src/integrations/google_ads.py) KÉSZ, de az SDK importja
-# lazy (csak a GoogleAdsClient.__init__-ben) — így a bot/discovery telepített SDK
-# nélkül is elindul, a Google hívás kontrollált RuntimeError-t ad token/SDK híján.
-# A csomag itt KIKOMMENTELVE marad, mert google-ads még nem szállít Python 3.14
-# wheelt (`pip install` elhasalna). Aktiváld (google-ads>=31.0.0), amint van
-# 3.14-kompatibilis wheel VAGY Python 3.12/3.13 alatt futtatod a discovery-t.
-# google-ads==31.0.0
+# Railway-en Python 3.12 alatt fut → ott TELEPÜL (a discovery/metrika ehhez kell).
+# A marker miatt LOKÁLISAN (Python 3.14, ahol nincs google-ads wheel) automatikusan
+# KIMARAD, így a `pip install -r requirements.txt` nem hasal el a fejlesztői gépen.
+# Az SDK importja amúgy is lazy (GoogleAdsClient.__init__), a bot SDK nélkül is elindul.
+google-ads==31.0.0; python_version < "3.14"
 
 # Claude (Anthropic)
 anthropic==0.39.0
