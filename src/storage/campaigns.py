@@ -343,17 +343,33 @@ def get_active_campaigns() -> list[dict[str, Any]]:
 
     A `!inner` join miatt csak azok a kampányok jönnek, amelyeknek van
     (létező) ad_account-juk.
+
+    Lapozás: a PostgREST egy kérésre max 1000 sort ad vissza. ~4000+ aktív
+    kampánynál ez csak az első 1000-et hozná (a scheduler a többit nem látná),
+    ezért `range()`-dzsel addig lapozunk, amíg egy oldal 1000-nél kevesebbet ad.
     """
-    res = (
-        get_supabase()
-        .table(_TABLE)
-        .select("*, ad_accounts!inner(id, external_account_id, platform, is_active)")
-        .eq("is_monitored", True)
-        .neq("lifecycle_state", "paused")
-        .neq("lifecycle_state", "ended")
-        .execute()
-    )
-    return res.data or []
+    page = 1000
+    start = 0
+    out: list[dict[str, Any]] = []
+    while True:
+        rows = (
+            get_supabase()
+            .table(_TABLE)
+            .select("*, ad_accounts!inner(id, external_account_id, platform, is_active)")
+            .eq("is_monitored", True)
+            .neq("lifecycle_state", "paused")
+            .neq("lifecycle_state", "ended")
+            .order("id")
+            .range(start, start + page - 1)
+            .execute()
+            .data
+            or []
+        )
+        out.extend(rows)
+        if len(rows) < page:
+            break
+        start += page
+    return out
 
 
 def group_campaigns_by_account(
