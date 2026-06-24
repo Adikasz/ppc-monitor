@@ -103,6 +103,43 @@ def resolve_accounts(token: str) -> dict[str, Any]:
     }
 
 
+def search_account_choices(query: str, *, limit: int = 25) -> list[dict[str, Any]]:
+    """Discord autocomplete-hez: kliensnév ILIKE → fiók-jelöltek listája.
+
+    Két lekérdezés (nincs N+1): kliensek név szerint, majd EGY `in_` a fiókokra.
+    Üres `query` az összesre illeszt (a hívó vágja 25-re). Visszatérés elemei:
+        {"id", "client_name", "platform", "external_account_id"}
+    kliensnév + #id szerint rendezve.
+    """
+    q = (query or "").strip()
+    sb = get_supabase()
+    clients = (
+        sb.table("clients").select("id, name")
+        .ilike("name", f"%{q}%").eq("is_active", True)
+        .order("name").limit(15).execute().data
+        or []
+    )
+    if not clients:
+        return []
+    names = {c["id"]: c["name"] for c in clients}
+    accts = (
+        sb.table("ad_accounts").select("id, platform, external_account_id, client_id")
+        .in_("client_id", list(names)).eq("is_active", True).execute().data
+        or []
+    )
+    out = [
+        {
+            "id": a["id"],
+            "client_name": names.get(a["client_id"], "?"),
+            "platform": a["platform"],
+            "external_account_id": a["external_account_id"],
+        }
+        for a in accts
+    ]
+    out.sort(key=lambda r: (r["client_name"].lower(), r["id"]))
+    return out[:limit]
+
+
 def _is_missing_relation(exc: Exception) -> bool:
     msg = str(exc).lower()
     return _TABLE in msg and any(

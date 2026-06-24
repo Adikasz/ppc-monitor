@@ -514,6 +514,49 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             f"({n} kampány, {role_value})"
         )
 
+    # --- Autocomplete: kliensnév gépelése közben felugró fiók-lista ---
+    @staticmethod
+    def _ac_label(row: dict) -> str:
+        return f"{row['client_name']} ({row['platform']} · {_short_account(row['external_account_id'])})"[:100]
+
+    @assign.autocomplete("account")
+    async def assign_account_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Az `account` mezőhöz: a beírt szövegre illeszkedő fiókok (#id az érték)."""
+        rows = await asyncio.to_thread(
+            account_assignments_storage.search_account_choices, current
+        )
+        return [
+            app_commands.Choice(name=self._ac_label(r), value=str(r["id"]))
+            for r in rows
+        ]
+
+    @assign.autocomplete("accounts")
+    async def assign_accounts_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Az `accounts` (vesszős lista) mezőhöz: az UTOLSÓ token alapján keres,
+        és a választott #id-t a már beírt tokenek MÖGÉ fűzi."""
+        parts = (current or "").split(",")
+        active = parts[-1].strip()
+        prefix = ",".join(p.strip() for p in parts[:-1])
+        if prefix:
+            prefix += ","
+        if len(active) < 1:
+            return []
+        rows = await asyncio.to_thread(
+            account_assignments_storage.search_account_choices, active
+        )
+        return [
+            app_commands.Choice(name=self._ac_label(r), value=f"{prefix}{r['id']}"[:100])
+            for r in rows
+        ]
+
     # ------------------------------------------------------------------
     # /account unassign account:<#id> user:<@OM>
     # ------------------------------------------------------------------
