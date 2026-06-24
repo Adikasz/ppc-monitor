@@ -349,58 +349,28 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         )
 
     # ------------------------------------------------------------------
-    # /account assign account:<#id> user:<@OM> [role]
+    # /account assign — #id VAGY név VAGY több fiók (accounts:...) (admin)
     # ------------------------------------------------------------------
-    @app_commands.command(name="assign", description="OM hozzárendelése a fiók MINDEN kampányához (admin)")
-    @app_commands.describe(
-        account="A fiók #azonosítója (a `/account list` mutatja)",
-        user="A hozzárendelendő Discord felhasználó (OM)",
-        role="primary (elsődleges) vagy supporter (helyettes) — alap: primary",
-    )
-    @app_commands.choices(role=_ROLE_CHOICES)
-    async def assign(
+    async def _assign_one(
         self,
         interaction: discord.Interaction,
-        account: int,
+        acct: dict,
+        user_row: dict,
+        role_value: str,
         user: discord.Member,
-        role: app_commands.Choice[str] | None = None,
-    ) -> None:
-        await interaction.response.defer(ephemeral=True)
+    ) -> tuple[int, str]:
+        """Egy fiókhoz rendeli a usert + lecsorgatja a kampányokra + auditál.
 
-        if not _is_admin_channel(interaction):
-            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
-            return
-
-        acct = await asyncio.to_thread(ad_accounts_storage.get_ad_account, account)
-        if acct is None:
-            await interaction.followup.send(
-                f"❌ Nincs ilyen hirdetési fiók: **#{account}**\nNézd meg: `/account list`"
-            )
-            return
-
-        role_value = role.value if role else "primary"
+        Visszatérés: (kampányszám, kliensnév). Hibát DOB (a hívó kezeli — pl.
+        hiányzó 0010 migráció).
+        """
         cname = (await asyncio.to_thread(clients_storage.get_client, acct["client_id"]) or {}).get("name", "?")
 
-        user_row, user_created = await asyncio.to_thread(
-            users_storage.get_or_create_user, str(user.id), _display_name(user)
-        )
-        if user_created:
-            log.info("Új felhasználó regisztrálva: %s (%s)", user, user.id)
-
         # 1) Fiók-szintű hozzárendelés (öröklés-forrás az új kampányokhoz)
-        try:
-            await asyncio.to_thread(
-                account_assignments_storage.upsert_account_assignment,
-                acct["id"], user_row["id"], role=role_value,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Fiók-assign hiba (#%s)", acct["id"])
-            await interaction.followup.send(
-                f"❌ Nem sikerült a fiók-hozzárendelés: `{exc}`\n"
-                f"Lehet, hogy a `0010_account_level.sql` migráció még nem futott le."
-            )
-            return
-
+        await asyncio.to_thread(
+            account_assignments_storage.upsert_account_assignment,
+            acct["id"], user_row["id"], role=role_value,
+        )
         # 2) Kaszkád a fiók jelenlegi (nem-ended) kampányaira
         campaign_ids = await asyncio.to_thread(_account_campaign_ids, acct["id"], active_only=True)
         casc = await asyncio.to_thread(
@@ -409,7 +379,6 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             role=role_value, inherited_field="inherited_from_account",
             created_by_discord_user_id=str(interaction.user.id),
         )
-
         await asyncio.to_thread(
             audit.log_action, str(interaction.user.id), "account_assign",
             entity_type="ad_account", entity_id=acct["id"],
@@ -419,9 +388,130 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         )
         log.info("Fiók-assign: %s → %s · %s (%s, %d kampány)",
                  user, cname, acct["platform"], role_value, casc["total"])
+        return casc["total"], cname
+
+    @app_commands.command(
+        name="assign",
+        description="OM hozzárendelése fiók(ok) MINDEN kampányához — #id vagy név, több is (admin)",
+    )
+    @app_commands.describe(
+        user="A hozzárendelendő Discord felhasználó (OM)",
+        account="Egy fiók: #id, külső azonosító VAGY kliensnév (pl. 2 / act_165… / Stopvill)",
+        accounts="Több fiók vesszővel: pl. Stopvill,MyMins,Brands",
+        role="primary (elsődleges) vagy supporter (helyettes) — alap: primary",
+    )
+    @app_commands.choices(role=_ROLE_CHOICES)
+    async def assign(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        account: str | None = None,
+        accounts: str | None = None,
+        role: app_commands.Choice[str] | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+
+        if not account and not accounts:
+            await interaction.followup.send(
+                "❌ Adj meg egy fiókot (`account:`) vagy többet (`accounts:Stopvill,MyMins`)."
+            )
+            return
+
+        role_value = role.value if role else "primary"
+        user_row, user_created = await asyncio.to_thread(
+            users_storage.get_or_create_user, str(user.id), _display_name(user)
+        )
+        if user_created:
+            log.info("Új felhasználó regisztrálva: %s (%s)", user, user.id)
+
+        # ---- MULTI mód: accounts:Stopvill,MyMins,... → minden feloldott fiók ----
+        if accounts:
+            tokens = [t.strip() for t in accounts.split(",") if t.strip()]
+            assigned: list[str] = []
+            total_campaigns = 0
+            not_found: list[str] = []
+            failed: list[str] = []
+            seen: set[int] = set()
+
+            for tok in tokens:
+                res = await asyncio.to_thread(account_assignments_storage.resolve_accounts, tok)
+                if res["status"] == "not_found":
+                    not_found.append(tok)
+                    continue
+                for acct in res["accounts"]:
+                    if acct["id"] in seen:
+                        continue
+                    seen.add(acct["id"])
+                    try:
+                        n, cname = await self._assign_one(interaction, acct, user_row, role_value, user)
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("Fiók-assign hiba (#%s)", acct["id"])
+                        failed.append(f"#{acct['id']} (`{exc}`)")
+                        continue
+                    total_campaigns += n
+                    assigned.append(f"• {cname} · `{acct['platform']}` ({n} kampány, {role_value})")
+
+            if not assigned:
+                msg = "❌ Egyetlen fiókot sem sikerült hozzárendelni."
+                if not_found:
+                    msg += f"\nNem található: {', '.join(not_found)}"
+                if failed:
+                    msg += f"\nHiba: {', '.join(failed)} — lehet, hogy a `0010` migráció hiányzik."
+                await interaction.followup.send(msg)
+                return
+
+            msg = f"✅ {user.mention} hozzárendelve:\n" + "\n".join(assigned)
+            msg += f"\n**Összesen: {total_campaigns} kampány**"
+            if not_found:
+                msg += f"\n⚠️ Nem található: {', '.join(not_found)}"
+            if failed:
+                msg += f"\n⚠️ Hiba: {', '.join(failed)}"
+            await interaction.followup.send(msg)
+            return
+
+        # ---- EGYES mód: account:<#id | external | kliensnév> ----
+        res = await asyncio.to_thread(account_assignments_storage.resolve_accounts, account)
+
+        if res["status"] == "not_found":
+            await interaction.followup.send(
+                f"❌ Nem található fiók vagy kliens: **{account}**\nNézd meg: `/account list`"
+            )
+            return
+
+        if res["status"] == "ambiguous":
+            who = res.get("client_name") or account
+            lines = []
+            for a in res["accounts"]:
+                n = len(await asyncio.to_thread(_account_campaign_ids, a["id"], active_only=True))
+                lines.append(
+                    f"**#{a['id']}** `{a['platform']}` `{_short_account(a['external_account_id'])}` ({n} kampány)"
+                )
+            await interaction.followup.send(
+                f"**{who}** több fiókkal rendelkezik ({len(res['accounts'])}):\n"
+                + "\n".join(lines)
+                + f"\nMelyiket? `/account assign account:<#id> user:@{_display_name(user)}`"
+                + f"\n…vagy mindet egyszerre: `/account assign accounts:{who} user:@{_display_name(user)}`"
+            )
+            return
+
+        acct = res["accounts"][0]
+        try:
+            n, cname = await self._assign_one(interaction, acct, user_row, role_value, user)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Fiók-assign hiba (#%s)", acct["id"])
+            await interaction.followup.send(
+                f"❌ Nem sikerült a fiók-hozzárendelés: `{exc}`\n"
+                f"Lehet, hogy a `0010_account_level.sql` migráció még nem futott le."
+            )
+            return
+
         await interaction.followup.send(
             f"✅ {user.mention} hozzárendelve: **{cname} · {acct['platform']}** "
-            f"({casc['total']} kampány, {role_value})"
+            f"({n} kampány, {role_value})"
         )
 
     # ------------------------------------------------------------------

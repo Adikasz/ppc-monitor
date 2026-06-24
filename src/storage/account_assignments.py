@@ -14,13 +14,93 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import assignments as assignments_storage
+from src.storage import clients as clients_storage
 from src.storage.supabase_client import get_supabase
 from src.utils.logging import get_logger
 
 _TABLE = "account_assignments"
 
 log = get_logger(__name__)
+
+
+def _find_clients_ilike(token: str) -> list[dict[str, Any]]:
+    """Aktív kliensek név szerinti, kis/nagybetű-független részleges keresése."""
+    try:
+        res = (
+            get_supabase()
+            .table("clients")
+            .select("*")
+            .ilike("name", f"%{token}%")
+            .eq("is_active", True)
+            .order("name")
+            .execute()
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    return res.data or []
+
+
+def resolve_accounts(token: str) -> dict[str, Any]:
+    """Feloldja az `/account assign` `account` paraméterét ad_account sorokká (23. lépés).
+
+    Sorrend:
+      a) szám → #id (ad_accounts.id) — backward compat
+      b) szöveg: pontos external_account_id egyezés (act_ prefix toleráns)
+      c) ha nincs: kliensnév ILIKE → a kliens(ek) ÖSSZES aktív fiókja
+      d) 1 találat → "ok"; több → "ambiguous"; nincs → "not_found"
+
+    Visszatérés:
+        {"status": "ok"|"ambiguous"|"not_found",
+         "accounts": [ad_account, ...], "token": str,
+         "via": "id"|"external"|"client"|None,
+         "client_name": str}   # csak egyértelmű kliens-egyezésnél
+    """
+    token = (token or "").strip()
+    if not token:
+        return {"status": "not_found", "accounts": [], "token": token, "via": None}
+
+    # a) szám → #id (backward compat — aktivitástól függetlenül, mint eddig)
+    if token.isdigit():
+        acct = ad_accounts_storage.get_ad_account(int(token))
+        if acct:
+            return {"status": "ok", "accounts": [acct], "token": token, "via": "id"}
+        return {"status": "not_found", "accounts": [], "token": token, "via": "id"}
+
+    # b) pontos external_account_id egyezés (nyers + normalizált alakok)
+    candidates = [
+        token,
+        ad_accounts_storage.normalize_external_account_id("meta", token),
+        ad_accounts_storage.normalize_external_account_id("google", token),
+    ]
+    ext = [
+        a for a in ad_accounts_storage.find_ad_accounts_by_external_id(candidates)
+        if a.get("is_active", True)
+    ]
+    if ext:
+        return {
+            "status": "ok" if len(ext) == 1 else "ambiguous",
+            "accounts": ext, "token": token, "via": "external",
+        }
+
+    # c) kliensnév ILIKE → a kliens(ek) összes aktív fiókja
+    matched_clients = _find_clients_ilike(token)
+    accounts: list[dict[str, Any]] = []
+    for c in matched_clients:
+        accounts.extend(
+            ad_accounts_storage.get_ad_accounts_for_client(c["id"], active_only=True)
+        )
+    if not accounts:
+        return {"status": "not_found", "accounts": [], "token": token, "via": "client"}
+
+    return {
+        "status": "ok" if len(accounts) == 1 else "ambiguous",
+        "accounts": accounts,
+        "token": token,
+        "via": "client",
+        "client_name": matched_clients[0]["name"] if len(matched_clients) == 1 else token,
+    }
 
 
 def _is_missing_relation(exc: Exception) -> bool:
