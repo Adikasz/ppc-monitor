@@ -341,6 +341,26 @@ def bulk_unassign_campaigns(user_id: int, campaign_ids: list[int]) -> int:
     return deleted
 
 
+def delete_assignments_for_campaigns(campaign_ids: list[int]) -> int:
+    """A megadott kampányok ÖSSZES hozzárendelésének törlése (minden user).
+
+    Az offboard / campaign-end használja. Visszatérés: a törölt sorok száma.
+    """
+    if not campaign_ids:
+        return 0
+    sb = get_supabase()
+    deleted = 0
+    for chunk in _chunks(campaign_ids, 200):
+        existing = (
+            sb.table(_TABLE).select("id").in_("campaign_id", chunk).execute().data or []
+        )
+        if not existing:
+            continue
+        sb.table(_TABLE).delete().in_("campaign_id", chunk).execute()
+        deleted += len(existing)
+    return deleted
+
+
 def inherit_assignments_for_campaign(
     campaign_id: int,
     source_user_roles: list[dict[str, Any]],

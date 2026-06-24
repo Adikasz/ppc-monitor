@@ -82,6 +82,34 @@ def create_client(
     return res.data[0]
 
 
+def set_client_active(client_id: int, active: bool) -> dict[str, Any] | None:
+    """Az ügyfél `is_active` kapcsolójának állítása (offboard → false, reactivate → true).
+
+    Visszaadja a frissített sort, vagy None-t, ha nincs ilyen ügyfél.
+    """
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .update({"is_active": active})
+        .eq("id", client_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def search_clients(query: str, *, active: bool | None = None, limit: int = 25) -> list[dict[str, Any]]:
+    """Ügyfél autocomplete-hez: név ILIKE keresés, opcionális is_active szűréssel.
+
+    `active=None` → mind; `True` → csak aktív; `False` → csak inaktív (reactivate-hez).
+    Visszatérés elemei: {"id", "name", "is_active"} (név szerint rendezve).
+    """
+    q = (query or "").strip()
+    qb = get_supabase().table(_TABLE).select("id, name, is_active").ilike("name", f"%{q}%")
+    if active is not None:
+        qb = qb.eq("is_active", active)
+    return qb.order("name").limit(limit).execute().data or []
+
+
 def set_insights_enabled(client_id: int, enabled: bool) -> dict[str, Any] | None:
     """Az ügyfél `insights_enabled` kapcsolójának frissítése.
 

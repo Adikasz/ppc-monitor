@@ -282,6 +282,27 @@ def delete_account_assignment(ad_account_id: int, user_id: int) -> bool:
     return True
 
 
+def delete_account_assignments_for_accounts(account_ids: list[int]) -> int:
+    """A megadott fiókok ÖSSZES OM-hozzárendelésének törlése (offboard).
+
+    Védve: ha a tábla még nem létezik, 0. Visszatérés: a törölt sorok száma.
+    """
+    if not account_ids:
+        return 0
+    sb = get_supabase()
+    try:
+        existing = (
+            sb.table(_TABLE).select("id").in_("ad_account_id", account_ids).execute().data or []
+        )
+        if existing:
+            sb.table(_TABLE).delete().in_("ad_account_id", account_ids).execute()
+        return len(existing)
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_relation(exc):
+            return 0
+        raise
+
+
 def inherit_account_assignments_for_campaign(ad_account_id: int, campaign_id: int) -> int:
     """Egy ÚJ kampányra örökíti a fiók OM-hozzárendeléseit (discovery hívja).
 

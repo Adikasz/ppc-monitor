@@ -27,7 +27,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from datetime import datetime, timedelta, timezone
+
 from src.config import get_config
+from src.integrations import discord_router
 from src.monitoring.discovery import discover_campaigns_for_client
 from src.storage import account_assignments as account_assignments_storage
 from src.storage import ad_account_kpis as ad_account_kpis_storage
@@ -987,6 +990,302 @@ class ClientCog(commands.GroupCog, group_name="client"):
         embed.add_field(name="🚨 Utolsó alert", value=alert_value, inline=False)
 
         await interaction.followup.send(embed=embed)
+
+    # ==================================================================
+    # Lifecycle: offboard / pause / resume / reactivate (25. lépés)
+    # ==================================================================
+
+    async def _client_autocomplete(
+        self, current: str, *, active: bool | None
+    ) -> list[app_commands.Choice[str]]:
+        rows = await asyncio.to_thread(
+            clients_storage.search_clients, current, active=active
+        )
+        return [
+            app_commands.Choice(name=r["name"][:100], value=str(r["id"]))
+            for r in rows
+        ][:25]
+
+    # ------------------------------------------------------------------
+    # /client offboard client:<> [reason:<>] [confirm:yes]
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="offboard",
+        description="Ügyfél leállítása: kampányok 'ended', OM-ek törölve, monitoring off (admin)",
+    )
+    @app_commands.describe(
+        client="Az ügyfél neve vagy #id",
+        reason="Opcionális indok (auditba kerül)",
+        confirm="Írd be: yes — a művelet NEM visszavonható (a /client reactivate részben visszaállít)",
+    )
+    async def offboard(
+        self,
+        interaction: discord.Interaction,
+        client: str,
+        reason: str | None = None,
+        confirm: str | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+
+        c = await asyncio.to_thread(_resolve_client, client)
+        if c is None:
+            await interaction.followup.send(
+                f"❌ Nem található ügyfél: **{client}**\nNézd meg: `/client list`"
+            )
+            return
+
+        accounts = await asyncio.to_thread(
+            ad_accounts_storage.get_ad_accounts_for_client, c["id"], active_only=False
+        )
+        account_ids = [a["id"] for a in accounts]
+        campaigns = await asyncio.to_thread(campaigns_storage.list_campaigns, c["id"], active_only=False)
+        all_campaign_ids = [cm["id"] for cm in campaigns]
+        active_campaign_ids = [cm["id"] for cm in campaigns if cm.get("lifecycle_state") != "ended"]
+
+        om_total = 0
+        for aid in account_ids:
+            om_total += len(
+                await asyncio.to_thread(account_assignments_storage.get_account_assignments, aid)
+            )
+
+        # 1) Megerősítés kérése
+        if (confirm or "").strip().lower() != "yes":
+            await interaction.followup.send(
+                f"⚠️ Biztosan offboardolod: **{c['name']}**?\n"
+                f"Ez az alábbiak miatt csak részben visszavonható:\n"
+                f"• {len(active_campaign_ids)} kampány → lifecycle: `ended`\n"
+                f"• {om_total} OM hozzárendelés törlése\n"
+                f"• Monitoring leáll, a kliens + fiókok inaktívvá válnak\n\n"
+                f"A kampány-adatok (insights, alertek) MEGMARADNAK.\n"
+                f"Megerősítés: `/client offboard client:{c['name']} confirm:yes`"
+            )
+            return
+
+        # 2) Végrehajtás
+        ended = await asyncio.to_thread(
+            campaigns_storage.set_campaigns_lifecycle,
+            active_campaign_ids, "ended", is_monitored=False,
+        )
+        deleted_assigns = await asyncio.to_thread(
+            assignments_storage.delete_assignments_for_campaigns, all_campaign_ids
+        )
+        deleted_acct = await asyncio.to_thread(
+            account_assignments_storage.delete_account_assignments_for_accounts, account_ids
+        )
+        await asyncio.to_thread(clients_storage.set_client_active, c["id"], False)
+        for aid in account_ids:
+            await asyncio.to_thread(ad_accounts_storage.set_ad_account_active, aid, False)
+
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "client_offboard",
+            entity_type="client", entity_id=c["id"],
+            details={"client_name": c["name"], "reason": reason,
+                     "campaigns_ended": ended, "deleted_assignments": deleted_assigns,
+                     "deleted_account_assignments": deleted_acct, "accounts": len(account_ids)},
+        )
+        log.info("Offboard: %s — %d kampány ended, %d+%d hozzárendelés törölve",
+                 c["name"], ended, deleted_assigns, deleted_acct)
+
+        reason_line = f"\nReason: {reason}" if reason else ""
+        await _notify_admin(
+            f"📤 **{c['name']}** offboardolva\n"
+            f"{ended} kampány leállítva · {deleted_acct} OM fiók-hozzárendelés törölve"
+            f"{reason_line}"
+        )
+        await interaction.followup.send(
+            f"✅ **{c['name']}** offboardolva.\n"
+            f"• {ended} kampány → `ended` (monitoring off)\n"
+            f"• {deleted_assigns} kampány- + {deleted_acct} fiók-hozzárendelés törölve\n"
+            f"• kliens + {len(account_ids)} fiók inaktív\n"
+            f"Visszahozható: `/client reactivate client:{c['name']}`"
+        )
+
+    @offboard.autocomplete("client")
+    async def offboard_client_autocomplete(self, interaction: discord.Interaction, current: str):
+        return await self._client_autocomplete(current, active=True)
+
+    # ------------------------------------------------------------------
+    # /client pause client:<> [days:<30>]
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="pause",
+        description="Ügyfél kampányainak szüneteltetése X napra (auto-resume) (admin)",
+    )
+    @app_commands.describe(
+        client="Az ügyfél neve vagy #id",
+        days="Hány nap múlva álljon vissza automatikusan (alap: 30)",
+    )
+    async def pause(
+        self,
+        interaction: discord.Interaction,
+        client: str,
+        days: int = 30,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+        if days <= 0 or days > 365:
+            await interaction.followup.send("❌ A napok száma 1 és 365 között legyen.")
+            return
+
+        c = await asyncio.to_thread(_resolve_client, client)
+        if c is None:
+            await interaction.followup.send(
+                f"❌ Nem található ügyfél: **{client}**\nNézd meg: `/client list`"
+            )
+            return
+
+        campaigns = await asyncio.to_thread(campaigns_storage.list_campaigns, c["id"], active_only=False)
+        ids = [cm["id"] for cm in campaigns if cm.get("lifecycle_state") != "ended"]
+        until = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+        paused = await asyncio.to_thread(
+            campaigns_storage.set_campaigns_lifecycle, ids, "paused", lifecycle_until=until,
+        )
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "client_pause",
+            entity_type="client", entity_id=c["id"],
+            details={"client_name": c["name"], "days": days, "until": until, "campaigns": paused},
+        )
+        log.info("Pause: %s — %d kampány szüneteltetve %d napra", c["name"], paused, days)
+
+        until_label = until[:10]
+        await _notify_admin(
+            f"⏸ **{c['name']}** szüneteltetve — {paused} kampány, auto-resume: {until_label}"
+        )
+        await interaction.followup.send(
+            f"⏸ **{c['name']}** szüneteltetve: {paused} kampány `paused`.\n"
+            f"Automatikus visszaállás: **{until_label}** (vagy korábban: `/client resume client:{c['name']}`).\n"
+            f"Az OM-hozzárendelések megmaradnak."
+        )
+
+    @pause.autocomplete("client")
+    async def pause_client_autocomplete(self, interaction: discord.Interaction, current: str):
+        return await self._client_autocomplete(current, active=True)
+
+    # ------------------------------------------------------------------
+    # /client resume client:<>
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="resume",
+        description="Szüneteltetett ügyfél kampányainak azonnali visszaállítása (admin)",
+    )
+    @app_commands.describe(client="Az ügyfél neve vagy #id")
+    async def resume(self, interaction: discord.Interaction, client: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+
+        c = await asyncio.to_thread(_resolve_client, client)
+        if c is None:
+            await interaction.followup.send(
+                f"❌ Nem található ügyfél: **{client}**\nNézd meg: `/client list`"
+            )
+            return
+
+        campaigns = await asyncio.to_thread(campaigns_storage.list_campaigns, c["id"], active_only=False)
+        paused_ids = [cm["id"] for cm in campaigns if cm.get("lifecycle_state") == "paused"]
+        if not paused_ids:
+            await interaction.followup.send(f"**{c['name']}**-nek nincs szüneteltetett kampánya.")
+            return
+
+        resumed = await asyncio.to_thread(
+            campaigns_storage.set_campaigns_lifecycle,
+            paused_ids, "mature", is_monitored=True, lifecycle_until=None,
+        )
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "client_resume",
+            entity_type="client", entity_id=c["id"],
+            details={"client_name": c["name"], "campaigns": resumed},
+        )
+        log.info("Resume: %s — %d kampány visszaállítva (mature)", c["name"], resumed)
+
+        await _notify_admin(f"▶️ **{c['name']}** visszaállítva — {resumed} kampány `mature`")
+        await interaction.followup.send(
+            f"▶️ **{c['name']}** visszaállítva: {resumed} kampány → `mature`, monitoring újra él."
+        )
+
+    @resume.autocomplete("client")
+    async def resume_client_autocomplete(self, interaction: discord.Interaction, current: str):
+        return await self._client_autocomplete(current, active=True)
+
+    # ------------------------------------------------------------------
+    # /client reactivate client:<>
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="reactivate",
+        description="Offboardolt ügyfél visszahozása: kliens + fiókok aktív, ended kampányok 'new' (admin)",
+    )
+    @app_commands.describe(client="Az (inaktív) ügyfél neve vagy #id")
+    async def reactivate(self, interaction: discord.Interaction, client: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+
+        c = await asyncio.to_thread(_resolve_client, client)
+        if c is None:
+            await interaction.followup.send(
+                f"❌ Nem található ügyfél: **{client}**\nNézd meg: `/client list`"
+            )
+            return
+
+        await asyncio.to_thread(clients_storage.set_client_active, c["id"], True)
+        accounts = await asyncio.to_thread(
+            ad_accounts_storage.get_ad_accounts_for_client, c["id"], active_only=False
+        )
+        for a in accounts:
+            await asyncio.to_thread(ad_accounts_storage.set_ad_account_active, a["id"], True)
+
+        campaigns = await asyncio.to_thread(campaigns_storage.list_campaigns, c["id"], active_only=False)
+        ended_ids = [cm["id"] for cm in campaigns if cm.get("lifecycle_state") == "ended"]
+        revived = await asyncio.to_thread(
+            campaigns_storage.set_campaigns_lifecycle,
+            ended_ids, "new", is_monitored=True, lifecycle_until=None,
+        )
+
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "client_reactivate",
+            entity_type="client", entity_id=c["id"],
+            details={"client_name": c["name"], "accounts": len(accounts), "campaigns_revived": revived},
+        )
+        log.info("Reactivate: %s — %d fiók aktív, %d kampány → new", c["name"], len(accounts), revived)
+
+        await _notify_admin(
+            f"✅ **{c['name']}** reaktiválva — {len(accounts)} fiók aktív, {revived} kampány `new`"
+        )
+        await interaction.followup.send(
+            f"✅ **{c['name']}** reaktiválva — {len(accounts)} fiók aktív, {revived} kampány → `new`.\n"
+            f"Futtass `/discover client:{c['name']}`-t az új/aktuális kampányok felfedezéséhez."
+        )
+
+    @reactivate.autocomplete("client")
+    async def reactivate_client_autocomplete(self, interaction: discord.Interaction, current: str):
+        # Csak INAKTÍV kliensek (őket lehet reaktiválni).
+        return await self._client_autocomplete(current, active=False)
+
+
+async def _notify_admin(content: str) -> None:
+    """Best-effort, NEM-ephemeral értesítés az admin csatornára (lifecycle audit-nyom).
+
+    Élő bot kliens nélkül (pl. teszt) vagy hiányzó admin csatornánál csendben kimarad.
+    """
+    admin = get_config().discord_admin_channel_id
+    if not admin:
+        return
+    try:
+        await discord_router.send_text_message(admin, content)
+    except Exception:  # noqa: BLE001 — az értesítés sosem buktathatja meg a parancsot
+        log.exception("Admin lifecycle-értesítés kiküldése sikertelen")
 
 
 async def setup(bot: commands.Bot) -> None:

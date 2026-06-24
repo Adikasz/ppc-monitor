@@ -34,7 +34,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from src.config import get_config
+from src.integrations import discord_router
 from src.storage import ad_accounts as ad_accounts_storage
+from src.storage import assignments as assignments_storage
 from src.storage import campaigns as campaigns_storage
 from src.storage import clients as clients_storage
 from src.storage import insights as insights_storage
@@ -762,6 +764,84 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             f"✅ **{_display_name(supporter)}** eltávolítva helyettesként a "
             f"**#{campaign_id} — {c['name']}** kampányról."
         )
+
+    # ------------------------------------------------------------------
+    # /campaign end campaign_id:<id> [reason:<>]
+    # ------------------------------------------------------------------
+    @app_commands.command(name="end", description="Egyedi kampány lezárása: ended + monitoring off (admin)")
+    @app_commands.describe(
+        campaign_id="A kampány numerikus azonosítója (autocomplete: gépeld a nevét)",
+        reason="Opcionális indok (auditba kerül)",
+    )
+    async def end(
+        self,
+        interaction: discord.Interaction,
+        campaign_id: int,
+        reason: str | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+
+        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
+        if c is None:
+            await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
+            return
+        if c.get("lifecycle_state") == "ended":
+            await interaction.followup.send(f"ℹ️ **#{campaign_id} — {c['name']}** már lezárva.")
+            return
+
+        # Az értesítendő OM-ek (csatornáik) — a hozzárendelések törlése ELŐTT.
+        assigns = await asyncio.to_thread(
+            assignments_storage.get_assignments_for_campaign, campaign_id
+        )
+
+        await asyncio.to_thread(
+            campaigns_storage.set_campaigns_lifecycle, [campaign_id], "ended", is_monitored=False
+        )
+        deleted = await asyncio.to_thread(
+            assignments_storage.delete_assignments_for_campaigns, [campaign_id]
+        )
+
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "campaign_end",
+            entity_type="campaign", entity_id=campaign_id,
+            details={"campaign_name": c["name"], "reason": reason,
+                     "deleted_assignments": deleted},
+        )
+        log.info("Kampány lezárva: #%s %s (%d hozzárendelés törölve)", campaign_id, c["name"], deleted)
+
+        # OM-ek értesítése a saját csatornájukon (best-effort, duplikátum-mentes).
+        reason_line = f"\nReason: {reason}" if reason else ""
+        notified: set[str] = set()
+        for a in assigns:
+            ch = (a.get("users") or {}).get("alerts_channel_id")
+            if ch and ch not in notified:
+                notified.add(ch)
+                try:
+                    await discord_router.send_text_message(
+                        ch, f"📤 Kampány lezárva: **{c['name']}** (#{campaign_id}){reason_line}"
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("Campaign-end OM értesítés hiba (csatorna=%s)", ch)
+
+        await interaction.followup.send(
+            f"📤 **#{campaign_id} — {c['name']}** lezárva (`ended`, monitoring off).\n"
+            f"{deleted} hozzárendelés törölve · {len(notified)} OM értesítve."
+        )
+
+    @end.autocomplete("campaign_id")
+    async def end_campaign_autocomplete(self, interaction: discord.Interaction, current: str):
+        rows = await asyncio.to_thread(campaigns_storage.search_campaigns, current)
+        return [
+            app_commands.Choice(
+                name=f"#{r['id']} {r['name']} ({r['lifecycle_state']})"[:100],
+                value=int(r["id"]),
+            )
+            for r in rows
+        ][:25]
 
 
 async def setup(bot: commands.Bot) -> None:

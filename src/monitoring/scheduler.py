@@ -410,6 +410,25 @@ async def daily_insight_scan(*, limit: int | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Auto-resume (25. lépés) — lejárt szüneteltetésű kampányok visszaállítása
+# ---------------------------------------------------------------------------
+
+async def auto_resume_job() -> None:
+    """A `/client pause`-zal szüneteltetett, határidőt elért kampányok visszaállítása.
+
+    A `paused` + lejárt `lifecycle_until` kampányokat `mature`-re állítja. Naponta
+    fut; a határidő nélkül (kézzel) szüneteltetett kampányokat nem érinti.
+    """
+    log.info("Auto-resume job indítva…")
+    try:
+        n = await asyncio.to_thread(campaigns_storage.resume_due_paused_campaigns)
+    except Exception:  # noqa: BLE001 — sosem buktathatja meg a schedulert
+        log.exception("Auto-resume job hiba")
+        return
+    log.info("Auto-resume job kész: %d kampány visszaállítva", n)
+
+
+# ---------------------------------------------------------------------------
 # Scheduler életciklus
 # ---------------------------------------------------------------------------
 
@@ -492,6 +511,20 @@ def start_scheduler() -> AsyncIOScheduler:
         minute=0,
         day_of_week="mon-fri",
         id="daily_insight_scan",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    # Auto-resume: MINDEN NAP 06:00 — a lejárt szüneteltetésű kampányok (25. lépés
+    # /client pause) visszaállítása mature-re.
+    _scheduler.add_job(
+        auto_resume_job,
+        trigger="cron",
+        hour=6,
+        minute=0,
+        id="auto_resume_paused",
         replace_existing=True,
         misfire_grace_time=3600,
         coalesce=True,

@@ -27,7 +27,7 @@ Függvények — írás:
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from src.storage.supabase_client import get_supabase
@@ -402,3 +402,85 @@ def group_campaigns_by_account(
             continue
         grouped[account_id].append(c)
     return dict(grouped)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle tömeges műveletek (offboard / pause / resume / reactivate, 25. lépés)
+# ---------------------------------------------------------------------------
+
+def _chunks(seq: list[Any], size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def set_campaigns_lifecycle(
+    campaign_ids: list[int],
+    state: str,
+    *,
+    is_monitored: bool | None = None,
+    lifecycle_until: str | None = "__keep__",
+) -> int:
+    """Több kampány lifecycle_state-jét (és opcionálisan is_monitored / lifecycle_until)
+    állítja egy körben (200-as kötegekben). Visszatérés: az érintett sorok száma.
+
+    lifecycle_until: `"__keep__"` (alap) → nem nyúl hozzá; None → NULL-ra állítja;
+    string → arra az értékre.
+    """
+    if not campaign_ids:
+        return 0
+    payload: dict[str, Any] = {"lifecycle_state": state}
+    if is_monitored is not None:
+        payload["is_monitored"] = is_monitored
+    if lifecycle_until != "__keep__":
+        payload["lifecycle_until"] = lifecycle_until
+
+    sb = get_supabase()
+    affected = 0
+    for chunk in _chunks(campaign_ids, 200):
+        res = sb.table(_TABLE).update(payload).in_("id", chunk).execute()
+        affected += len(res.data or [])
+    return affected
+
+
+def resume_due_paused_campaigns() -> int:
+    """Auto-resume: a lejárt szüneteltetésű kampányok visszaállítása.
+
+    Azokat a `paused` kampányokat, amelyek `lifecycle_until`-ja a múltban van,
+    `mature`-re állítja (is_monitored=true, lifecycle_until=NULL). A kézzel,
+    határidő nélkül szüneteltetett kampányokat (lifecycle_until IS NULL) NEM
+    érinti. A scheduler napi jobja hívja. Visszatérés: a visszaállított db.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    sb = get_supabase()
+    rows = (
+        sb.table(_TABLE).select("id")
+        .eq("lifecycle_state", "paused")
+        .lte("lifecycle_until", now_iso)
+        .execute().data
+        or []
+    )
+    ids = [r["id"] for r in rows]
+    if not ids:
+        return 0
+    for chunk in _chunks(ids, 200):
+        sb.table(_TABLE).update(
+            {"lifecycle_state": "mature", "is_monitored": True, "lifecycle_until": None}
+        ).in_("id", chunk).execute()
+    log.info("Auto-resume: %d szüneteltetett kampány visszaállítva (mature)", len(ids))
+    return len(ids)
+
+
+def search_campaigns(query: str, *, limit: int = 25, include_ended: bool = False) -> list[dict[str, Any]]:
+    """Kampány autocomplete-hez: szám → pontos id, szöveg → név ILIKE.
+
+    Visszatérés elemei: {"id", "name", "lifecycle_state"} (név szerint rendezve).
+    """
+    q = (query or "").strip()
+    qb = get_supabase().table(_TABLE).select("id, name, lifecycle_state")
+    if not include_ended:
+        qb = qb.neq("lifecycle_state", "ended")
+    if q.isdigit():
+        qb = qb.eq("id", int(q))
+    elif q:
+        qb = qb.ilike("name", f"%{q}%")
+    return qb.order("name").limit(limit).execute().data or []
