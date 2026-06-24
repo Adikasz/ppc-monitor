@@ -322,11 +322,25 @@ def list_ad_account_ids(*, active_only: bool = True) -> list[int]:
 
     active_only=True esetén az 'ended' lifecycle-ű kampányokat kihagyja
     (ugyanaz a láthatóság, mint a `/campaign list`-nél).
+
+    Lapozás (ugyanaz, mint a get_active_campaigns-ben): ez a `campaigns` tábláról
+    olvas egy sort KAMPÁNYONKÉNT (~4000+), így a PostgREST 1000-es sorlimitje
+    már most levágná — `range()`-dzsel addig lapozunk, amíg egy oldal 1000-nél
+    kevesebbet ad vissza.
     """
-    query = get_supabase().table(_TABLE).select("ad_account_id")
-    if active_only:
-        query = query.neq("lifecycle_state", "ended")
-    return [r["ad_account_id"] for r in (query.execute().data or [])]
+    page = 1000
+    start = 0
+    out: list[int] = []
+    while True:
+        query = get_supabase().table(_TABLE).select("ad_account_id").order("id")
+        if active_only:
+            query = query.neq("lifecycle_state", "ended")
+        rows = query.range(start, start + page - 1).execute().data or []
+        out.extend(r["ad_account_id"] for r in rows)
+        if len(rows) < page:
+            break
+        start += page
+    return out
 
 
 # ---------------------------------------------------------------------------
