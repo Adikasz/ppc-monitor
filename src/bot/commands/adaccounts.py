@@ -415,6 +415,13 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
             return
 
+        if user.bot:
+            await interaction.followup.send(
+                f"❌ {user.mention} egy bot — nem rendelhető OM-ként fiókhoz. "
+                f"Válassz valódi felhasználót a `user:` mezőben."
+            )
+            return
+
         if not account and not accounts:
             await interaction.followup.send(
                 "❌ Adj meg egy fiókot (`account:`) vagy többet (`accounts:Stopvill,MyMins`)."

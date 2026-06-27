@@ -597,6 +597,13 @@ class ClientCog(commands.GroupCog, group_name="client"):
             await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
             return
 
+        if user.bot:
+            await interaction.followup.send(
+                f"❌ {user.mention} egy bot — nem rendelhető OM-ként ügyfélhez. "
+                f"Válassz valódi felhasználót a `user:` mezőben."
+            )
+            return
+
         role_value = role.value if role else "primary"
 
         c = await asyncio.to_thread(_resolve_client, client)

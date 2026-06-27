@@ -112,6 +112,13 @@ class AssignmentsCog(commands.Cog):
             )
             return
 
+        if user.bot:
+            await interaction.followup.send(
+                f"❌ {user.mention} egy bot — nem rendelhető OM-ként kampányhoz. "
+                f"Válassz valódi felhasználót a `user:` mezőben."
+            )
+            return
+
         role_value = role.value if role else "primary"
 
         # 1) Kampány megkeresése — campaign_id alapján a campaigns táblában
