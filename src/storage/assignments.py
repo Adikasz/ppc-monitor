@@ -277,17 +277,40 @@ def bulk_assign_campaigns(
 
     sb = get_supabase()
 
+    # A flag-oszlopokat is lekérjük, hogy meglévő (öröklött) sornál additívan
+    # be tudjuk állítani az `inherited_field`-et. Ha a 0009/0010 migráció még
+    # nem futott le, a select elhasal — ekkor flag nélkül, role-only módban
+    # degradálunk (a sorok jelöletlenek maradnak, de a kaszkád lefut).
+    _select = "id, campaign_id, role, inherited_from_account, inherited_from_client"
+    _have_flags = True
+
     existing_by_cid: dict[int, dict[str, Any]] = {}
     for chunk in _chunks(campaign_ids, 200):
-        rows = (
-            sb.table(_TABLE)
-            .select("id, campaign_id, role")
-            .eq("user_id", user_id)
-            .in_("campaign_id", chunk)
-            .execute()
-            .data
-            or []
-        )
+        try:
+            rows = (
+                sb.table(_TABLE)
+                .select(_select if _have_flags else "id, campaign_id, role")
+                .eq("user_id", user_id)
+                .in_("campaign_id", chunk)
+                .execute()
+                .data
+                or []
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if _have_flags and ("inherited_from_client" in msg or "inherited_from_account" in msg):
+                _have_flags = False
+                rows = (
+                    sb.table(_TABLE)
+                    .select("id, campaign_id, role")
+                    .eq("user_id", user_id)
+                    .in_("campaign_id", chunk)
+                    .execute()
+                    .data
+                    or []
+                )
+            else:
+                raise
         for r in rows:
             existing_by_cid[r["campaign_id"]] = r
 
@@ -304,8 +327,24 @@ def bulk_assign_campaigns(
             if created_by_discord_user_id is not None:
                 payload["created_by_discord_user_id"] = created_by_discord_user_id
             to_insert.append(payload)
-        elif row.get("role") != role:
-            sb.table(_TABLE).update({"role": role}).eq("id", row["id"]).execute()
+            continue
+
+        # Meglévő sor: role igazítása + öröklés-forrás additív jelölése.
+        # A KPI-kaszkáddal egyezően a KÉZI sort (mindkét flag false) nem
+        # jelöljük örököltnek, de a role-t ott is frissítjük. Az öröklött
+        # sorra (pl. inherited_from_client) ráhúzzuk az inherited_field-et is,
+        # hogy a hozzárendelés mindkét forrását tükrözze.
+        updates: dict[str, Any] = {}
+        if row.get("role") != role:
+            updates["role"] = role
+        if _have_flags:
+            already_inherited = (
+                row.get("inherited_from_account") or row.get("inherited_from_client")
+            )
+            if already_inherited and not row.get(inherited_field):
+                updates[inherited_field] = True
+        if updates:
+            sb.table(_TABLE).update(updates).eq("id", row["id"]).execute()
             result["updated"] += 1
 
     for chunk in _chunks(to_insert, 500):
