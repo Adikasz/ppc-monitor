@@ -550,6 +550,41 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             return None
         return res["accounts"][0]
 
+    async def _owned_account_choices(
+        self, owner: dict, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete-jelöltek CSAK az adott OM saját (aktív) fiókjaiból.
+
+        Az OM saját fiókjaiból építkezünk (nem a globális keresésből), így a lista
+        akkor is teljes, ha a kliens ABC-rendben hátul van. Szűr kliensnévre, külső
+        azonosítóra és #id-re; üres input az összes saját fiókot mutatja.
+        """
+        accounts = await asyncio.to_thread(
+            account_assignments_storage.get_accounts_for_user, owner["id"]
+        )
+        if not accounts:
+            return []
+        clients = await asyncio.to_thread(clients_storage.list_clients)
+        names = {c["id"]: c["name"] for c in clients}
+        q = (current or "").strip().lower()
+        choices: list[app_commands.Choice[str]] = []
+        for a in sorted(accounts, key=lambda x: x["id"]):
+            if not a.get("is_active", True):
+                continue
+            cname = names.get(a["client_id"], f"#{a['client_id']}")
+            if q and q not in f"{cname} {a['external_account_id']} {a['id']}".lower():
+                continue
+            choices.append(app_commands.Choice(
+                name=self._ac_label({
+                    "client_name": cname, "platform": a["platform"],
+                    "external_account_id": a["external_account_id"],
+                }),
+                value=str(a["id"]),
+            ))
+            if len(choices) >= 25:
+                break
+        return choices
+
     @assign.autocomplete("account")
     async def assign_account_autocomplete(
         self,
@@ -643,7 +678,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     ) -> list[app_commands.Choice[str]]:
         return await self._account_choices(current)
 
-    @app_commands.command(name="kpi", description="Fiók-szintű KPI + lecsorgatás a kampányokra (admin)")
+    @app_commands.command(name="kpi", description="Fiók-szintű KPI + lecsorgatás a kampányokra (admin vagy saját #alerts)")
     @app_commands.describe(
         account="Fiók: #id, külső azonosító VAGY kliensnév (pl. 2 / act_165… / Stopvill)",
         target_roas="Cél ROAS szorzó (pl. 3.0 = 3×)",
@@ -674,13 +709,30 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
-        if not _is_admin_channel(interaction):
-            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+        # Csatorna-kontextus: az OM SAJÁT #alerts csatornájából is futtatható
+        # (csak a saját fiókjaira), egyébként az admin csatornából (bármelyik fiók).
+        channel_owner = await asyncio.to_thread(
+            users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
+        )
+        if channel_owner is None and not _is_admin_channel(interaction):
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában vagy a saját #alerts csatornádból "
+                "használható."
+            )
             return
 
         acct = await self._resolve_single_account(interaction, account)
         if acct is None:
             return
+
+        # Alerts csatornából csak a saját (hozzárendelt) fiók módosítható.
+        if channel_owner is not None:
+            owned = await asyncio.to_thread(
+                account_assignments_storage.get_account_ids_for_user, channel_owner["id"]
+            )
+            if acct["id"] not in owned:
+                await interaction.followup.send("❌ Ez a fiók nincs hozzád rendelve.")
+                return
 
         inputs = {k: v for k, v in {
             "target_roas": target_roas, "max_cpa": max_cpa, "monthly_budget": monthly_budget,
@@ -759,7 +811,13 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     async def kpi_account_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        return await self._account_choices(current)
+        """Admin csatorna → összes fiók; alerts csatorna → csak az OM saját fiókjai."""
+        owner = await asyncio.to_thread(
+            users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
+        )
+        if owner is None:
+            return await self._account_choices(current)
+        return await self._owned_account_choices(owner, current)
 
 
 async def setup(bot: commands.Bot) -> None:
