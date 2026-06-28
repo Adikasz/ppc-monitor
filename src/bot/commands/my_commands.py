@@ -32,7 +32,6 @@ from src.integrations import discord_router
 from src.monitoring import summary as summary_gen
 from src.storage import account_assignments as account_assignments_storage
 from src.storage import ad_account_kpis as ad_account_kpis_storage
-from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import audit
 from src.storage import campaigns as campaigns_storage
 from src.storage import clients as clients_storage
@@ -103,22 +102,76 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         return owner
 
     async def _owned_account_or_reject(
-        self, interaction: discord.Interaction, owner: dict, account_id: int
+        self, interaction: discord.Interaction, owner: dict, account: str
     ) -> dict | None:
-        """A fiók sora, ha az OM-hez van rendelve; különben None + elutasítás."""
-        acct = await asyncio.to_thread(ad_accounts_storage.get_ad_account, account_id)
-        if acct is None:
+        """Feloldja az `account` paramétert (#id / külső azonosító / kliensnév) EGY
+        fiókra, amely az OM-hez van rendelve.
+
+        not_found / nem-saját / többértelmű esetén üzen és None-t ad vissza (a hívó
+        ekkor return-öljön).
+        """
+        res = await asyncio.to_thread(account_assignments_storage.resolve_accounts, account)
+        if res["status"] == "not_found":
             await interaction.followup.send(
-                f"❌ Nincs ilyen hirdetési fiók: **#{account_id}** — nézd meg: `/my accounts`"
+                f"❌ Nem található fiók vagy kliens: **{account}** — nézd meg: `/my accounts`"
             )
             return None
         owned = await asyncio.to_thread(
             account_assignments_storage.get_account_ids_for_user, owner["id"]
         )
-        if account_id not in owned:
-            await interaction.followup.send("❌ Ez a fiók nincs hozzád rendelve.")
+        mine = [a for a in res["accounts"] if a["id"] in owned]
+        if not mine:
+            await interaction.followup.send(
+                "❌ Ez a fiók nincs hozzád rendelve — nézd meg: `/my accounts`"
+            )
             return None
-        return acct
+        if len(mine) > 1:
+            lines = [
+                f"**#{a['id']}** `{a['platform']}` `{_short_account(a['external_account_id'])}`"
+                for a in mine
+            ]
+            await interaction.followup.send(
+                "Több hozzád rendelt fiók illeszkedik:\n" + "\n".join(lines)
+                + "\nAdd meg a konkrét **#id**-t (vagy válassz az autocomplete-ből)."
+            )
+            return None
+        return mine[0]
+
+    async def _owned_account_choices(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete a `/my` parancsok `account` mezőjéhez: CSAK az aktuális
+        csatorna OM-jéhez rendelt (aktív) fiókok, a beírt szövegre szűrve.
+
+        Az OM SAJÁT fiókjaiból építkezünk (nem a globális `search_account_choices`-
+        ból), így a lista akkor is teljes, ha a kliens ABC-rendben hátul van. A
+        szűrés kliensnévre, külső azonosítóra és #id-re is illeszt; üres input az
+        összes saját fiókot mutatja.
+        """
+        owner = await asyncio.to_thread(_channel_owner, interaction.channel_id)
+        if owner is None:
+            return []
+        accounts = await asyncio.to_thread(
+            account_assignments_storage.get_accounts_for_user, owner["id"]
+        )
+        if not accounts:
+            return []
+        clients = await asyncio.to_thread(clients_storage.list_clients)
+        names = {c["id"]: c["name"] for c in clients}
+
+        q = (current or "").strip().lower()
+        choices: list[app_commands.Choice[str]] = []
+        for a in sorted(accounts, key=lambda x: x["id"]):
+            if not a.get("is_active", True):
+                continue
+            cname = names.get(a["client_id"], f"#{a['client_id']}")
+            if q and q not in f"{cname} {a['external_account_id']} {a['id']}".lower():
+                continue
+            label = f"{cname} ({a['platform']} · {_short_account(a['external_account_id'])})"
+            choices.append(app_commands.Choice(name=label[:100], value=str(a["id"])))
+            if len(choices) >= 25:
+                break
+        return choices
 
     # ------------------------------------------------------------------
     # /my accounts
@@ -175,7 +228,7 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
     # ------------------------------------------------------------------
     @app_commands.command(name="kpi", description="A saját fiókod KPI-jának beállítása")
     @app_commands.describe(
-        account="A fiók #azonosítója (a `/my accounts` mutatja)",
+        account="Saját fiók: #id, külső azonosító VAGY kliensnév (a `/my accounts` mutatja)",
         target_roas="Cél ROAS szorzó (pl. 3.0 = 3×)",
         max_cpa="Max CPA (Ft)",
         monthly_budget="Havi büdzsé (Ft)",
@@ -190,7 +243,7 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
     async def kpi(
         self,
         interaction: discord.Interaction,
-        account: int,
+        account: str,
         target_roas: float | None = None,
         max_cpa: float | None = None,
         monthly_budget: float | None = None,
@@ -281,19 +334,25 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
             f"{' | '.join(bits)} | {thr}"
         )
 
+    @kpi.autocomplete("account")
+    async def kpi_account_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._owned_account_choices(interaction, current)
+
     # ------------------------------------------------------------------
     # /my mute account:<#id> [campaign_id:<>] hours:<>
     # ------------------------------------------------------------------
     @app_commands.command(name="mute", description="Fiók vagy kampány némítása X órára")
     @app_commands.describe(
-        account="A fiók #azonosítója",
+        account="Saját fiók: #id, külső azonosító VAGY kliensnév (a `/my accounts` mutatja)",
         hours="Hány órára némítsd",
         campaign_id="Opcionális: csak ez a kampány (egyébként a fiók összes kampánya)",
     )
     async def mute(
         self,
         interaction: discord.Interaction,
-        account: int,
+        account: str,
         hours: int,
         campaign_id: int | None = None,
     ) -> None:
@@ -330,18 +389,24 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
             f"🔇 Némítva {hours} órára ({scope}) — eddig: {until.strftime('%Y-%m-%d %H:%M')} UTC"
         )
 
+    @mute.autocomplete("account")
+    async def mute_account_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._owned_account_choices(interaction, current)
+
     # ------------------------------------------------------------------
     # /my unmute account:<#id> [campaign_id:<>]
     # ------------------------------------------------------------------
     @app_commands.command(name="unmute", description="Némítás korai feloldása")
     @app_commands.describe(
-        account="A fiók #azonosítója",
+        account="Saját fiók: #id, külső azonosító VAGY kliensnév (a `/my accounts` mutatja)",
         campaign_id="Opcionális: csak ez a kampány (egyébként a fiók összes kampánya)",
     )
     async def unmute(
         self,
         interaction: discord.Interaction,
-        account: int,
+        account: str,
         campaign_id: int | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -368,12 +433,18 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         )
         await interaction.followup.send(f"🔔 Feloldva {unmuted} kampány némítása.")
 
+    @unmute.autocomplete("account")
+    async def unmute_account_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._owned_account_choices(interaction, current)
+
     # ------------------------------------------------------------------
     # /my lifecycle account:<#id> campaign_id:<> state:<>
     # ------------------------------------------------------------------
     @app_commands.command(name="lifecycle", description="Kampány lifecycle állapotának állítása")
     @app_commands.describe(
-        account="A fiók #azonosítója",
+        account="Saját fiók: #id, külső azonosító VAGY kliensnév (a `/my accounts` mutatja)",
         campaign_id="A kampány azonosítója",
         state="Új lifecycle állapot",
     )
@@ -381,7 +452,7 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
     async def lifecycle(
         self,
         interaction: discord.Interaction,
-        account: int,
+        account: str,
         campaign_id: int,
         state: app_commands.Choice[str],
     ) -> None:
@@ -418,18 +489,24 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
             f"✅ **#{campaign_id} — {camp['name']}** lifecycle: `{old_state}` → `{state.value}`"
         )
 
+    @lifecycle.autocomplete("account")
+    async def lifecycle_account_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._owned_account_choices(interaction, current)
+
     # ------------------------------------------------------------------
     # /my insights account:<#id> enabled:<bool>
     # ------------------------------------------------------------------
     @app_commands.command(name="insights", description="Insight (AI-elemzés) kapcsoló")
     @app_commands.describe(
-        account="A fiók #azonosítója",
+        account="Saját fiók: #id, külső azonosító VAGY kliensnév (a `/my accounts` mutatja)",
         enabled="true = bekapcsolva, false = kikapcsolva",
     )
     async def insights(
         self,
         interaction: discord.Interaction,
-        account: int,
+        account: str,
         enabled: bool,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -464,6 +541,12 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
             f"✅ Insights {state}: **{client['name']}** "
             f"*(kliens-szintű kapcsoló — a kliens minden fiókjára érvényes)*"
         )
+
+    @insights.autocomplete("account")
+    async def insights_account_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._owned_account_choices(interaction, current)
 
     # ------------------------------------------------------------------
     # /my summary [type:daily|weekly]
