@@ -293,60 +293,46 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     # /account remove account_id:<>
     # ------------------------------------------------------------------
     @app_commands.command(name="remove", description="Hirdetési fiók eltávolítása — soft delete (admin)")
-    @app_commands.describe(account_id="A fiók külső azonosítója (act_123 / 123 / 123-456-7890)")
-    async def remove(self, interaction: discord.Interaction, account_id: str) -> None:
+    @app_commands.describe(
+        account="Fiók: #id, külső azonosító VAGY kliensnév (pl. 2 / act_165… / Stopvill)"
+    )
+    async def remove(self, interaction: discord.Interaction, account: str) -> None:
         await interaction.response.defer(ephemeral=True)
 
         if not _is_admin_channel(interaction):
             await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
             return
 
-        account_id = (account_id or "").strip()
-        if not account_id:
-            await interaction.followup.send("❌ A fiók azonosító nem lehet üres.")
+        acct = await self._resolve_single_account(interaction, account)
+        if acct is None:
             return
 
-        candidates = [
-            account_id,
-            ad_accounts_storage.normalize_external_account_id("meta", account_id),
-            ad_accounts_storage.normalize_external_account_id("google", account_id),
-        ]
-        matches = await asyncio.to_thread(
-            ad_accounts_storage.find_ad_accounts_by_external_id, candidates
-        )
-        if not matches:
+        if not acct.get("is_active", True):
             await interaction.followup.send(
-                f"❌ Nem található hirdetési fiók ezzel az azonosítóval: `{account_id}`\n"
-                f"Tipp: `/account list` mutatja a fiókokat és a #id-ket."
+                f"ℹ️ A fiók már eltávolítva (inaktív): "
+                f"`{acct['platform']}` / `{acct['external_account_id']}` *(#{acct['id']})*"
             )
             return
 
-        active_matches = [m for m in matches if m.get("is_active", True)]
-        if not active_matches:
-            await interaction.followup.send(
-                f"ℹ️ A fiók már eltávolítva (inaktív): `{account_id}` *(#{matches[0]['id']})*"
-            )
-            return
-
-        removed = []
-        for m in active_matches:
-            await asyncio.to_thread(ad_accounts_storage.set_ad_account_active, m["id"], False)
-            removed.append(m)
-            await asyncio.to_thread(
-                audit.log_action, str(interaction.user.id), "account_remove",
-                entity_type="ad_account", entity_id=m["id"],
-                details={"platform": m["platform"], "external_account_id": m["external_account_id"],
-                         "client_id": m.get("client_id")},
-            )
-            log.info("Hirdetési fiók soft-deleted: %s / %s (#%s)",
-                     m["platform"], m["external_account_id"], m["id"])
-
-        lines = "\n".join(
-            f"🖥 `{m['platform']}` / `{m['external_account_id']}` *(#{m['id']})*" for m in removed
+        await asyncio.to_thread(ad_accounts_storage.set_ad_account_active, acct["id"], False)
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "account_remove",
+            entity_type="ad_account", entity_id=acct["id"],
+            details={"platform": acct["platform"], "external_account_id": acct["external_account_id"],
+                     "client_id": acct.get("client_id")},
         )
+        log.info("Hirdetési fiók soft-deleted: %s / %s (#%s)",
+                 acct["platform"], acct["external_account_id"], acct["id"])
         await interaction.followup.send(
-            f"✅ Fiók eltávolítva (soft delete — az adat megmarad):\n{lines}"
+            f"✅ Fiók eltávolítva (soft delete — az adat megmarad):\n"
+            f"🖥 `{acct['platform']}` / `{acct['external_account_id']}` *(#{acct['id']})*"
         )
+
+    @remove.autocomplete("account")
+    async def remove_account_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._account_choices(current)
 
     # ------------------------------------------------------------------
     # /account assign — #id VAGY név VAGY több fiók (accounts:...) (admin)
@@ -526,13 +512,8 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     def _ac_label(row: dict) -> str:
         return f"{row['client_name']} ({row['platform']} · {_short_account(row['external_account_id'])})"[:100]
 
-    @assign.autocomplete("account")
-    async def assign_account_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
-    ) -> list[app_commands.Choice[str]]:
-        """Az `account` mezőhöz: a beírt szövegre illeszkedő fiókok (#id az érték)."""
+    async def _account_choices(self, current: str) -> list[app_commands.Choice[str]]:
+        """Közös autocomplete: a beírt szövegre illeszkedő (aktív) fiókok, #id az érték."""
         rows = await asyncio.to_thread(
             account_assignments_storage.search_account_choices, current
         )
@@ -540,6 +521,43 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             app_commands.Choice(name=self._ac_label(r), value=str(r["id"]))
             for r in rows
         ]
+
+    async def _resolve_single_account(
+        self, interaction: discord.Interaction, account: str
+    ) -> dict | None:
+        """Az `account` paramétert EGY fiókra oldja fel (#id / external / kliensnév).
+
+        not_found / ambiguous esetén üzen a usernek és None-t ad vissza — ekkor a
+        hívó parancs egyszerűen return-öljön.
+        """
+        res = await asyncio.to_thread(account_assignments_storage.resolve_accounts, account)
+        if res["status"] == "not_found":
+            await interaction.followup.send(
+                f"❌ Nem található fiók vagy kliens: **{account}**\nNézd meg: `/account list`"
+            )
+            return None
+        if res["status"] == "ambiguous":
+            who = res.get("client_name") or account
+            lines = [
+                f"**#{a['id']}** `{a['platform']}` `{_short_account(a['external_account_id'])}`"
+                for a in res["accounts"]
+            ]
+            await interaction.followup.send(
+                f"**{who}** több fiókkal rendelkezik ({len(res['accounts'])}):\n"
+                + "\n".join(lines)
+                + "\nAdd meg a konkrét **#id**-t (vagy az autocomplete-ből válassz)."
+            )
+            return None
+        return res["accounts"][0]
+
+    @assign.autocomplete("account")
+    async def assign_account_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        """Az `account` mezőhöz: a beírt szövegre illeszkedő fiókok (#id az érték)."""
+        return await self._account_choices(current)
 
     @assign.autocomplete("accounts")
     async def assign_accounts_autocomplete(
@@ -569,13 +587,13 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     # ------------------------------------------------------------------
     @app_commands.command(name="unassign", description="OM eltávolítása a fiókról (admin)")
     @app_commands.describe(
-        account="A fiók #azonosítója",
+        account="Fiók: #id, külső azonosító VAGY kliensnév (pl. 2 / act_165… / Stopvill)",
         user="Az eltávolítandó Discord felhasználó",
     )
     async def unassign(
         self,
         interaction: discord.Interaction,
-        account: int,
+        account: str,
         user: discord.Member,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -584,11 +602,8 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
             return
 
-        acct = await asyncio.to_thread(ad_accounts_storage.get_ad_account, account)
+        acct = await self._resolve_single_account(interaction, account)
         if acct is None:
-            await interaction.followup.send(
-                f"❌ Nincs ilyen hirdetési fiók: **#{account}**\nNézd meg: `/account list`"
-            )
             return
 
         cname = (await asyncio.to_thread(clients_storage.get_client, acct["client_id"]) or {}).get("name", "?")
@@ -622,9 +637,15 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     # ------------------------------------------------------------------
     # /account kpi account:<#id> [KPI mezők...]
     # ------------------------------------------------------------------
+    @unassign.autocomplete("account")
+    async def unassign_account_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._account_choices(current)
+
     @app_commands.command(name="kpi", description="Fiók-szintű KPI + lecsorgatás a kampányokra (admin)")
     @app_commands.describe(
-        account="A fiók #azonosítója",
+        account="Fiók: #id, külső azonosító VAGY kliensnév (pl. 2 / act_165… / Stopvill)",
         target_roas="Cél ROAS szorzó (pl. 3.0 = 3×)",
         max_cpa="Max CPA (Ft)",
         monthly_budget="Havi büdzsé (Ft)",
@@ -639,7 +660,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     async def kpi(
         self,
         interaction: discord.Interaction,
-        account: int,
+        account: str,
         target_roas: float | None = None,
         max_cpa: float | None = None,
         monthly_budget: float | None = None,
@@ -657,11 +678,8 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
             return
 
-        acct = await asyncio.to_thread(ad_accounts_storage.get_ad_account, account)
+        acct = await self._resolve_single_account(interaction, account)
         if acct is None:
-            await interaction.followup.send(
-                f"❌ Nincs ilyen hirdetési fiók: **#{account}**\nNézd meg: `/account list`"
-            )
             return
 
         inputs = {k: v for k, v in {
@@ -736,6 +754,12 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         if casc["skipped_override"]:
             msg += f"\nℹ️ {casc['skipped_override']} kampány kihagyva (kézi `/campaign kpi` override)"
         await interaction.followup.send(msg)
+
+    @kpi.autocomplete("account")
+    async def kpi_account_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._account_choices(current)
 
 
 async def setup(bot: commands.Bot) -> None:
