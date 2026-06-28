@@ -224,3 +224,35 @@ async def test_quiet_hours_suppresses_warning():
 
     send.assert_awaited_once()
     assert result["routed"] is True
+
+
+async def test_route_alert_skips_paused_campaign():
+    """paused/ended kampányra a router nem küld — CRITICAL-ra sem (detektorral egyező)."""
+    for state in ("paused", "ended"):
+        with contextlib.ExitStack() as stack:
+            send = _patch_router(stack, recipients=[_recipient("david", "111")])
+            stack.enter_context(mock.patch.object(
+                router.campaigns_storage, "get_campaign",
+                return_value={"id": 1, "name": "Leállított", "ad_account_id": 5,
+                              "lifecycle_state": state},
+            ))
+            result = await router.route_alert(_alert("critical"))
+
+        send.assert_not_awaited()
+        assert result["routed"] is False
+        assert result["reason"] == f"lifecycle_{state}"
+
+
+async def test_route_alert_bypass_lifecycle_sends_paused():
+    """bypass_lifecycle=True (admin override, /alert test force) → paused-ra is kimegy."""
+    with contextlib.ExitStack() as stack:
+        send = _patch_router(stack, recipients=[_recipient("david", "111")])
+        stack.enter_context(mock.patch.object(
+            router.campaigns_storage, "get_campaign",
+            return_value={"id": 1, "name": "Leállított", "ad_account_id": 5,
+                          "lifecycle_state": "paused"},
+        ))
+        result = await router.route_alert(_alert("critical"), bypass_lifecycle=True)
+
+    send.assert_awaited_once()
+    assert result["routed"] is True

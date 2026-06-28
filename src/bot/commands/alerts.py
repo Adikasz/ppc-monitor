@@ -170,6 +170,7 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
     @app_commands.describe(
         campaign_id="A kampány numerikus azonosítója",
         severity="A teszt-riasztás súlyossága",
+        force="paused/ended kampányra is küldjön (admin override) — alap: nem",
     )
     @app_commands.choices(
         severity=[
@@ -183,6 +184,7 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
         interaction: discord.Interaction,
         campaign_id: int,
         severity: app_commands.Choice[str],
+        force: bool = False,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
@@ -197,6 +199,18 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
             await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
             return
 
+        # Lifecycle: a leállított kampányra az éles monitoring sem küld — a teszt is
+        # ezt tükrözze, hacsak az admin nem kéri kifejezetten (force:true).
+        lifecycle = (c.get("lifecycle_state") or "new").lower()
+        if lifecycle in ("paused", "ended") and not force:
+            await interaction.followup.send(
+                f"⚠️ **#{campaign_id} — {c['name']}** `{lifecycle}` állapotban van — "
+                f"nem küldünk alertet (ahogy az éles monitoring sem).\n"
+                f"Ha mégis tesztelni akarod a routingot: `/alert test campaign_id:{campaign_id} "
+                f"severity:{severity.value} force:true`."
+            )
+            return
+
         fake_anomaly = {
             "campaign_id": campaign_id,
             "severity": severity.value,
@@ -207,7 +221,10 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
         }
 
         # bypass_quiet_hours: a teszt bármikor (csendes időben is) lefuthasson.
-        result = await alert_router.route_alert(fake_anomaly, bypass_quiet_hours=True)
+        # bypass_lifecycle=force: csak kifejezett admin-override küldjön paused/ended-re.
+        result = await alert_router.route_alert(
+            fake_anomaly, bypass_quiet_hours=True, bypass_lifecycle=force,
+        )
 
         log.info(
             "Test alert kiküldve: kampány #%s severity=%s → channels=%s",

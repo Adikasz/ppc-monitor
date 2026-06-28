@@ -6,6 +6,8 @@ megfelelő csatornákra, a severity és a hozzárendelések (assignments) alapj�
 
 route_alert(alert) lépései:
     a) Kampány + ügyfél + címzettek (assignments: primary + supporter) lekérése
+    a2) Lifecycle-ellenőrzés (paused/ended kampány → skip, a detektorral egyezően;
+        csak az /alert test force-override lépi át)
     b) Némítás-ellenőrzés (muted kampány → skip)
     c) Dedup (a már elküldött — status='sent' — alertet nem küldjük újra)
     d) Per-OM kiküldés (CRITICAL + WARNING + INSIGHT egyaránt):
@@ -41,17 +43,27 @@ from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
+# A leállított kampányokra nem küldünk riasztást (a detektorral egyezően —
+# detector._SKIP_LIFECYCLE). Védelem mélységben: a normál folyamatban a detektor
+# már kiszűri ezeket, de a routert közvetlenül hívó utak (pl. /alert test) így is
+# védve vannak.
+_SKIP_LIFECYCLE = {"paused", "ended"}
+
 
 async def route_alert(
     alert: dict[str, Any],
     *,
     bypass_quiet_hours: bool = False,
+    bypass_lifecycle: bool = False,
 ) -> dict[str, Any]:
     """Egy riasztás kiküldése a megfelelő csatornákra (lásd modul-docstring).
 
     `bypass_quiet_hours=True` esetén a csendes idő nem nyomja el a nem-kritikus
     riasztást — a manuális `/alert test` parancs használja, hogy a routing
     bármikor tesztelhető legyen.
+
+    `bypass_lifecycle=True` esetén a paused/ended kampány sem nyomja el a
+    riasztást — kizárólag az `/alert test … force:true` admin-override használja.
     """
     alert_id = alert.get("id")
     campaign_id = alert.get("campaign_id")
@@ -76,6 +88,16 @@ async def route_alert(
     if campaign is None:
         log.warning("Routing: nincs ilyen kampány #%s (alert #%s)", campaign_id, alert_id)
         result["reason"] = "no_campaign"
+        return result
+
+    # a2) Lifecycle — a leállított kampányokra nem küldünk (a detektorral egyezően).
+    lifecycle = (campaign.get("lifecycle_state") or "new").lower()
+    if lifecycle in _SKIP_LIFECYCLE and not bypass_lifecycle:
+        log.info(
+            "Routing skip — kampány %s állapotban (#%s, alert #%s)",
+            lifecycle, campaign_id, alert_id,
+        )
+        result["reason"] = f"lifecycle_{lifecycle}"
         return result
 
     # b) Némítás-ellenőrzés
