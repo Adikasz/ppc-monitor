@@ -26,6 +26,7 @@ from discord.ext import commands
 
 from src.config import get_config
 from src.monitoring.discovery import discover_campaigns_for_client
+from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import clients as clients_storage
 from src.utils.logging import get_logger
 
@@ -188,6 +189,83 @@ class DiscoveryCog(commands.GroupCog, group_name="discover"):
 
         embed = discord.Embed(
             title="🔍 Discovery — összes aktív ügyfél",
+            description=description,
+            color=discord.Color.orange() if totals["errors"] else discord.Color.green(),
+        )
+        await interaction.followup.send(embed=embed)
+
+    # ------------------------------------------------------------------
+    # /discover google  — csak a Google-fiókos ügyfelek (Railway-en fut a SDK)
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="google",
+        description="Csak a Google-fiókos ügyfelek discoveryje (csak admin csatorna)",
+    )
+    async def google(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send(
+                "Ez a parancs csak az admin csatornában használható (sok ügyfélen futhat)."
+            )
+            return
+
+        # Aktív Google fiókok → érintett ügyfelek (client_id szerint dedup, mert a
+        # discovery ügyfél-szintű: egy kliens minden fiókját nézi).
+        accounts = await asyncio.to_thread(ad_accounts_storage.list_ad_accounts, active_only=True)
+        google_accounts = [a for a in accounts if a.get("platform") == "google"]
+        if not google_accounts:
+            await interaction.followup.send("Nincs aktív Google (platform=`google`) fiók.")
+            return
+
+        client_ids: list[int] = []
+        seen: set[int] = set()
+        for a in google_accounts:
+            cid = a.get("client_id")
+            if cid is not None and cid not in seen:
+                seen.add(cid)
+                client_ids.append(cid)
+
+        log.info(
+            "/discover google indítva: %d Google fiók, %d ügyfél",
+            len(google_accounts), len(client_ids),
+        )
+
+        totals = {"inserted": 0, "updated": 0, "deactivated": 0, "errors": 0}
+        per_client_lines: list[str] = []
+
+        for cid in client_ids:
+            c = await asyncio.to_thread(clients_storage.get_client, cid)
+            cname = (c or {}).get("name", f"#{cid}")
+            try:
+                result = await asyncio.to_thread(discover_campaigns_for_client, cid)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Google discovery fatális hiba (client_id=%s)", cid)
+                per_client_lines.append(f"❌ **{cname}** — `{exc}`")
+                totals["errors"] += 1
+                continue
+
+            totals["inserted"] += result["inserted"]
+            totals["updated"] += result["updated"]
+            totals["deactivated"] += result["deactivated"]
+            totals["errors"] += len(result["errors"])
+            note = f" ⚠️ {len(result['errors'])} hiba" if result["errors"] else ""
+            per_client_lines.append(f"✅ **{cname}**: {result['inserted']} kampány{note}")
+
+        header = (
+            f"**Összesen: {totals['inserted']} új kampány** "
+            f"({len(client_ids)} Google-ügyfél · {totals['updated']} frissítve · "
+            f"{totals['deactivated']} deaktiválva · ⚠️ {totals['errors']} hiba)\n\n"
+        )
+        description = header
+        for line in per_client_lines:
+            if len(description) + len(line) + 1 > 3900:
+                description += "… (a többi ügyfél nem fért ki)"
+                break
+            description += line + "\n"
+
+        embed = discord.Embed(
+            title="🔍 Discovery — Google fiókok",
             description=description,
             color=discord.Color.orange() if totals["errors"] else discord.Color.green(),
         )
