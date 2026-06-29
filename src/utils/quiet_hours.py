@@ -4,10 +4,13 @@ Csendes idő (quiet hours) — mikor NE menjen ki nem-kritikus riasztás.
 A konfigurált időzónában (config.timezone) egy napi ablakot definiál
 (QUIET_HOURS_START..QUIET_HOURS_END óra). Az ablakon belül a WARNING és INSIGHT
 riasztásokat elnyomjuk (status='suppressed'), hogy ne zavarjuk a kollégákat
-éjszaka; a CRITICAL riasztás MINDIG kimegy (a csendes idő nem blokkolja).
+munkaidőn kívül; a CRITICAL riasztás MINDIG kimegy (a csendes idő nem blokkolja).
 
-Az ablak átfordulhat éjfélen: pl. start=18, end=9 → 18:00-tól másnap 09:00-ig
+Az ablak átfordulhat éjfélen: pl. start=17, end=8 → 17:00-tól másnap 08:00-ig
 csendes. Ha start == end, nincs csendes idő (mindig kimegy minden).
+
+A TELJES hétvége (szombat=5, vasárnap=6) csendes — a nem-kritikus riasztás
+szombaton és vasárnap egész nap el van nyomva, az óra-ablaktól függetlenül.
 """
 from __future__ import annotations
 
@@ -32,6 +35,10 @@ def is_quiet_now(now: datetime | None = None) -> bool:
         now = datetime.now(tz)
     elif now.tzinfo is not None:
         now = now.astimezone(tz)
+
+    # Teljes hétvége csendes (szombat=5, vasárnap=6) — óra-ablaktól függetlenül.
+    if now.weekday() >= 5:
+        return True
 
     hour = now.hour
     start = cfg.quiet_hours_start

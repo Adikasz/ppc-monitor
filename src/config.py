@@ -146,8 +146,8 @@ class Config:
             smtp_from=_optional("SMTP_FROM"),
 
             timezone=_optional("TIMEZONE", "Europe/Budapest"),
-            quiet_hours_start=_int("QUIET_HOURS_START", 18),
-            quiet_hours_end=_int("QUIET_HOURS_END", 9),
+            quiet_hours_start=_int("QUIET_HOURS_START", 17),
+            quiet_hours_end=_int("QUIET_HOURS_END", 8),
             log_level=_optional("LOG_LEVEL", "INFO"),
         )
 
