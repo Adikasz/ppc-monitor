@@ -79,6 +79,7 @@ def _build_summary_sync(user_id: int, from_dt: datetime, to_dt: datetime) -> dic
     top_issues = [
         {
             "campaign": (a.get("campaigns") or {}).get("name") or f"#{a.get('campaign_id')}",
+            "platform": ((a.get("campaigns") or {}).get("ad_accounts") or {}).get("platform"),
             "severity": (a.get("severity") or "").lower(),
             "message": a.get("message") or a.get("metric") or "",
         }

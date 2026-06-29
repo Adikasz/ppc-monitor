@@ -117,11 +117,22 @@ async def route_alert(
         result["reason"] = "quiet_hours"
         return result
 
-    # Ügyfél (címkéhez) + címzettek
-    client = await asyncio.to_thread(_resolve_client, campaign)
+    # Fiók (platform-jelöléshez + ügyfélhez). Egyszer kérjük le, és a CRITICAL
+    # ClickUp-ág is ezt használja újra.
+    account = await asyncio.to_thread(
+        ad_accounts_storage.get_ad_account, campaign.get("ad_account_id")
+    )
+    platform = account.get("platform") if account else None
+    client = await asyncio.to_thread(
+        clients_storage.get_client, account.get("client_id")
+    ) if account else None
     client_name = client.get("name") if client else "?"
     client_id = client.get("id") if client else None
-    campaign_label = f"{client_name} / {campaign.get('campaign_type') or campaign.get('name') or '?'}"
+
+    # Platform-jelölés a fejlécben: "Ügyfél [META] / Kampány".
+    platform_tag = f" [{platform.upper()}]" if platform else ""
+    campaign_name = campaign.get("campaign_type") or campaign.get("name") or "?"
+    campaign_label = f"{client_name}{platform_tag} / {campaign_name}"
 
     recipients = await asyncio.to_thread(_resolve_recipients, campaign_id, client_id)
     result["recipients"] = [r["discord_user_id"] for r in recipients]
@@ -174,13 +185,8 @@ async def route_alert(
 
     clickup_res = None
     if severity == "critical":
-        # Platform a ClickUp leíráshoz: a campaigns táblában nincs platform, a
-        # fiókon keresztül oldjuk fel. Csak CRITICAL esetén fut (ritka) → 1 olcsó
-        # extra query elfogadható.
-        account = await asyncio.to_thread(
-            ad_accounts_storage.get_ad_account, campaign.get("ad_account_id")
-        )
-        platform = account.get("platform") if account else None
+        # A platformot fent már feloldottuk a fiókból (a campaigns táblában nincs
+        # platform) — itt újrahasználjuk a ClickUp leíráshoz.
         clickup_res = await clickup_router.create_clickup_task(
             alert, campaign, client, platform=platform,
         )
@@ -234,14 +240,6 @@ async def route_alert(
 # ---------------------------------------------------------------------------
 # Belső segédfüggvények (szinkron — to_thread-ből hívva)
 # ---------------------------------------------------------------------------
-
-def _resolve_client(campaign: dict[str, Any]) -> dict[str, Any] | None:
-    """Kampány → ad_account → ügyfél."""
-    account = ad_accounts_storage.get_ad_account(campaign.get("ad_account_id"))
-    if not account:
-        return None
-    return clients_storage.get_client(account.get("client_id"))
-
 
 def _other_recipient_labels(
     recipients: list[dict[str, Any]],

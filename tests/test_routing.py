@@ -43,13 +43,15 @@ def _patch_router(
         return_value={"id": 1, "name": "TestKampány", "campaign_type": "meta", "ad_account_id": 5},
     ))
     stack.enter_context(mock.patch.object(router.mutes_storage, "is_muted", return_value=False))
-    stack.enter_context(mock.patch.object(
-        router, "_resolve_client", return_value={"id": 10, "name": "TestÜgyfél"},
-    ))
-    # CRITICAL ág a ClickUp leíráshoz a fiókból oldja fel a platformot.
+    # A router a fiókból oldja fel a platformot (fejléc-jelölés + ClickUp) és az
+    # ügyfelet (client_id alapján).
     stack.enter_context(mock.patch.object(
         router.ad_accounts_storage, "get_ad_account",
         return_value={"id": 5, "platform": "meta", "client_id": 10},
+    ))
+    stack.enter_context(mock.patch.object(
+        router.clients_storage, "get_client",
+        return_value={"id": 10, "name": "TestÜgyfél"},
     ))
     stack.enter_context(mock.patch.object(router, "_resolve_recipients", return_value=recipients))
     stack.enter_context(mock.patch.object(
@@ -163,7 +165,13 @@ async def test_route_alert_multi_assignee_formats_notified_line():
             return_value={"id": 1, "name": "K", "campaign_type": "meta", "ad_account_id": 5},
         ))
         stack.enter_context(mock.patch.object(router.mutes_storage, "is_muted", return_value=False))
-        stack.enter_context(mock.patch.object(router, "_resolve_client", return_value={"id": 10, "name": "Ü"}))
+        stack.enter_context(mock.patch.object(
+            router.ad_accounts_storage, "get_ad_account",
+            return_value={"id": 5, "platform": "meta", "client_id": 10},
+        ))
+        stack.enter_context(mock.patch.object(
+            router.clients_storage, "get_client", return_value={"id": 10, "name": "Ü"},
+        ))
         stack.enter_context(mock.patch.object(router, "_resolve_recipients", return_value=recipients))
         stack.enter_context(mock.patch.object(
             router, "get_config", return_value=SimpleNamespace(discord_admin_channel_id="admin999"),
@@ -177,6 +185,8 @@ async def test_route_alert_multi_assignee_formats_notified_line():
 
     sent_contents = [call.args[0] for call in fake_channel.send.await_args_list]
     assert any("Értesítve még:" in c for c in sent_contents)
+    # Platform-jelölés a fejlécben: "Ü [META] / …"
+    assert any("[META]" in c for c in sent_contents)
 
 
 async def test_parse_channel_id_accepts_url_and_raw():

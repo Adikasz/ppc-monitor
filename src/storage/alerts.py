@@ -187,7 +187,7 @@ def get_alerts_for_user_in_range(
     res = (
         get_supabase()
         .table(_TABLE)
-        .select("*, campaigns(name)")
+        .select("*, campaigns(name, ad_accounts(platform))")
         .in_("campaign_id", campaign_ids)
         .gte("detected_at", from_dt.isoformat())
         .lt("detected_at", to_dt.isoformat())
