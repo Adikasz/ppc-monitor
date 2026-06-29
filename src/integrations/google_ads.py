@@ -86,9 +86,7 @@ _CAMPAIGNS_GAQL = """
     SELECT
         campaign.id,
         campaign.name,
-        campaign.status,
-        campaign.start_date,
-        campaign.end_date
+        campaign.status
     FROM campaign
     WHERE campaign.status != 'REMOVED'
 """
@@ -204,7 +202,7 @@ class GoogleAdsClient:
                 "external_campaign_id": "111222333",
                 "name":                 "Kampány neve",
                 "status":               "ENABLED",     # ENABLED | PAUSED | ...
-                "created_at":           "2026-01-01",  # campaign.start_date
+                "created_at":           None,          # a GAQL nem kéri le a dátumot
             }
 
         Raises:
@@ -224,7 +222,10 @@ class GoogleAdsClient:
                         "external_campaign_id": str(campaign.id),
                         "name": campaign.name,
                         "status": campaign.status.name,  # proto enum → str
-                        "created_at": campaign.start_date or None,
+                        # A discovery nem használ dátumot; a campaign.start_date a
+                        # GAQL-ből kikerült (a kezdő/záró dátumokat insightnál a
+                        # segments.date adja). A kulcsot kompat. miatt tartjuk.
+                        "created_at": None,
                     }
                 )
             log.info(
