@@ -84,6 +84,8 @@ _KPI_FIELDS = (
     "monthly_budget", "primary_conversion_event",
     "warning_pct", "critical_pct",
     "no_conversion_critical_days",
+    # Küszöb-alapú metrikák (0011 migration): CTR / CPM / Frequency / Impressions
+    "min_ctr", "max_cpm", "max_frequency", "min_impressions",
 )
 
 
@@ -260,7 +262,86 @@ def _evaluate_rules(
                 f"Büdzsé 90%-on ({_fmt(spend)} / {_fmt(monthly_budget)} Ft)",
             ))
 
+    # 6) Küszöb-alapú metrikák (CTR / CPM / Frequency / Impressions) — 0011 migration.
+    #    Csak ha a KPI be van állítva (nem None). A pct-eltérésnek el kell érnie a
+    #    warning/critical küszöböt (különben a határérték körüli zaj is riasztana).
+    ctr = _num(insights, "ctr")            # arány (0.035), %-ra ×100
+    ctr_pct = ctr * 100 if ctr is not None else None
+    # CPM a meglévő mezőkből is számítható (a normalizáló is adja, de itt biztos).
+    cpm = (spend / impressions * 1000) if (impressions and spend is not None) else None
+    frequency = _num(insights, "frequency")
+
+    min_ctr = _num(eff, "min_ctr")
+    if ctr_pct is not None and min_ctr is not None and min_ctr > 0 and ctr_pct < min_ctr:
+        pct_diff = (ctr_pct - min_ctr) / min_ctr * 100
+        sev = _sev_for(pct_diff, warning_pct, critical_pct, drop=True, only_critical=only_critical)
+        if sev:
+            out.append(_mk(
+                campaign_id, sev, "ctr_drop", ctr_pct, min_ctr,
+                f"CTR {ctr_pct:.2f}% a cél {_fmtn(min_ctr, 2)}% alatt",
+            ))
+
+    max_cpm = _num(eff, "max_cpm")
+    if cpm is not None and max_cpm is not None and max_cpm > 0 and cpm > max_cpm:
+        pct_diff = (cpm - max_cpm) / max_cpm * 100
+        sev = _sev_for(pct_diff, warning_pct, critical_pct, drop=False, only_critical=only_critical)
+        if sev:
+            out.append(_mk(
+                campaign_id, sev, "cpm_spike", cpm, max_cpm,
+                f"CPM {cpm:.0f} Ft a max {_fmt(max_cpm)} Ft felett",
+            ))
+
+    max_frequency = _num(eff, "max_frequency")
+    if frequency is not None and max_frequency is not None and max_frequency > 0 and frequency > max_frequency:
+        pct_diff = (frequency - max_frequency) / max_frequency * 100
+        sev = _sev_for(pct_diff, warning_pct, critical_pct, drop=False, only_critical=only_critical)
+        if sev:
+            out.append(_mk(
+                campaign_id, sev, "frequency_spike", frequency, max_frequency,
+                f"Frequency {frequency:.1f} a max {_fmtn(max_frequency, 1)} felett — hirdetési telítettség",
+            ))
+
+    min_impressions = _num(eff, "min_impressions")
+    if (
+        impressions is not None and min_impressions is not None
+        and min_impressions > 0 and impressions < min_impressions
+    ):
+        pct_diff = (impressions - min_impressions) / min_impressions * 100
+        sev = _sev_for(pct_diff, warning_pct, critical_pct, drop=True, only_critical=only_critical)
+        if sev:
+            out.append(_mk(
+                campaign_id, sev, "impressions_drop", impressions, min_impressions,
+                f"Impressions {int(impressions):,} a minimum {int(min_impressions):,} alatt",
+            ))
+
     return out
+
+
+def _sev_for(
+    pct_diff: float,
+    warning_pct: float,
+    critical_pct: float,
+    *,
+    drop: bool,
+    only_critical: bool,
+) -> str | None:
+    """Severity a százalékos eltérésből.
+
+    drop=True  → a cél ALATT vagyunk (negatív irány): a nagy negatív pct rossz.
+    drop=False → a cél FÖLÖTT vagyunk (pozitív irány): a nagy pozitív pct rossz.
+    `only_critical` esetén a WARNING-ot elnyomjuk (tanulási fázis).
+    """
+    if drop:
+        if pct_diff <= -critical_pct:
+            return "critical"
+        if not only_critical and pct_diff <= -warning_pct:
+            return "warning"
+    else:
+        if pct_diff >= critical_pct:
+            return "critical"
+        if not only_critical and pct_diff >= warning_pct:
+            return "warning"
+    return None
 
 
 def _higher_is_better(

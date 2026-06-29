@@ -117,6 +117,11 @@ async def get_campaign_metrics(
     cpc = (spend / clicks) if clicks else 0.0
     cpa = (spend / conversions) if conversions else 0.0
     roas = (conversion_value / spend) if spend else 0.0
+    cpm = (spend / impressions * 1000) if impressions else 0.0
+
+    # frequency csak a Meta API-ból jön (Google-nál nincs ilyen fogalom → None).
+    freq_raw = raw.get("frequency")
+    frequency = float(freq_raw) if freq_raw not in (None, "") else None
 
     return {
         "impressions": impressions,
@@ -128,6 +133,8 @@ async def get_campaign_metrics(
         "cpc": round(cpc, 2),
         "cpa": round(cpa, 2),
         "roas": round(roas, 4),
+        "cpm": round(cpm, 2),
+        "frequency": round(frequency, 2) if frequency is not None else None,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 

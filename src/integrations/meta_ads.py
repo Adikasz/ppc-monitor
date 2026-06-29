@@ -55,13 +55,14 @@ def _normalize_insight(
     spend: Any,
     conversions: Any,
     conversion_value: Any,
+    frequency: Any = None,
 ) -> dict[str, Any]:
     """Nyers metrikák → közös, normalizált insight-dict (származtatottakkal).
 
-    A számított mezők (ctr, cpc, cpa, roas) PONTOSAN úgy állnak elő, mint a
+    A számított mezők (ctr, cpc, cpa, roas, cpm) PONTOSAN úgy állnak elő, mint a
     `src.monitoring.metrics`-ben (arány-alapú ctr, nem százalék), hogy a
     detektor és a campaign_insights tábla a batch- és a per-kampány úton
-    azonosan viselkedjen.
+    azonosan viselkedjen. A `frequency` a Meta API-ból jön (Google-nál nincs).
     """
     impressions = int(impressions or 0)
     clicks = int(clicks or 0)
@@ -73,6 +74,7 @@ def _normalize_insight(
     cpc = round(spend / clicks, 2) if clicks else 0.0
     cpa = round(spend / conversions, 2) if conversions else 0.0
     roas = round(conversion_value / spend, 4) if spend else 0.0
+    cpm = round(spend / impressions * 1000, 2) if impressions else 0.0
 
     return {
         "external_campaign_id": str(external_campaign_id),
@@ -85,6 +87,8 @@ def _normalize_insight(
         "cpc": cpc,
         "cpa": cpa,
         "roas": roas,
+        "cpm": cpm,
+        "frequency": round(float(frequency), 2) if frequency not in (None, "") else None,
     }
 
 
@@ -281,6 +285,7 @@ class MetaAdsClient:
                     "impressions",
                     "clicks",
                     "spend",
+                    "frequency",
                     "actions",
                     "action_values",
                 ],
@@ -322,12 +327,14 @@ class MetaAdsClient:
                 if v.get("action_type") in _conversion_types
             )
 
+            _freq = data.get("frequency")
             result: dict[str, Any] = {
                 "impressions": int(data.get("impressions", 0)),
                 "clicks": int(data.get("clicks", 0)),
                 "spend": float(data.get("spend", 0.0)),
                 "conversions": conversions,
                 "conversion_value": conversion_value,
+                "frequency": float(_freq) if _freq not in (None, "") else None,
             }
             log.debug(
                 "Meta Insights — kampány=%s, %s–%s: %s",
@@ -388,6 +395,7 @@ class MetaAdsClient:
                         "impressions",
                         "clicks",
                         "spend",
+                        "frequency",
                         "actions",
                         "action_values",
                     ],
@@ -407,6 +415,7 @@ class MetaAdsClient:
                         row.get("spend", 0.0),
                         conversions,
                         conversion_value,
+                        row.get("frequency"),
                     ))
 
                 log.info(

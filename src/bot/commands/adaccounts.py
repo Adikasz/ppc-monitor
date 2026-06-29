@@ -691,6 +691,10 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         target_ctr="Cél CTR (%)",
         max_cpc="Max CPC (Ft)",
         primary_conversion_event="Elsődleges konverzió esemény (pl. Purchase)",
+        min_ctr="Minimum CTR % (alatta riasztás, pl. 1.5)",
+        max_cpm="Maximum CPM Ft (felette riasztás, pl. 500)",
+        max_frequency="Maximum frequency (felette riasztás, pl. 3.5)",
+        min_impressions="Minimum impressions (alatta riasztás, pl. 1000)",
     )
     async def kpi(
         self,
@@ -706,6 +710,10 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         target_ctr: float | None = None,
         max_cpc: float | None = None,
         primary_conversion_event: str | None = None,
+        min_ctr: float | None = None,
+        max_cpm: float | None = None,
+        max_frequency: float | None = None,
+        min_impressions: int | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
@@ -739,6 +747,8 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             "warning_pct": warning_pct, "critical_pct": critical_pct, "target_roi": target_roi,
             "max_cpl": max_cpl, "target_ctr": target_ctr, "max_cpc": max_cpc,
             "primary_conversion_event": primary_conversion_event,
+            "min_ctr": min_ctr, "max_cpm": max_cpm, "max_frequency": max_frequency,
+            "min_impressions": min_impressions,
         }.items() if v is not None}
         if not inputs:
             await interaction.followup.send("❌ Adj meg legalább egy KPI mezőt.")
@@ -799,10 +809,23 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             bits.append(f"Max CPL {_money(row['max_cpl'])} Ft")
         thr = f"W-{_pct_int(row.get('warning_pct'))}% / C-{_pct_int(row.get('critical_pct'))}%"
 
+        # Küszöb-alapú metrikák (0011) — külön sor, csak a beállítottak.
+        bits2: list[str] = []
+        if row.get("min_ctr") is not None:
+            bits2.append(f"Min CTR {_pct_int(row['min_ctr'])}%")
+        if row.get("max_cpm") is not None:
+            bits2.append(f"Max CPM {_money(row['max_cpm'])} Ft")
+        if row.get("max_frequency") is not None:
+            bits2.append(f"Max Frequency {_pct_int(row['max_frequency'])}")
+        if row.get("min_impressions") is not None:
+            bits2.append(f"Min Impressions {_money(row['min_impressions'])}")
+
         msg = (
             f"✅ KPI beállítva: **{cname} · {acct['platform']}** ({written} kampány)\n"
             f"{' | '.join(bits)} | {thr}"
         )
+        if bits2:
+            msg += f"\n{' | '.join(bits2)}"
         if casc["skipped_override"]:
             msg += f"\nℹ️ {casc['skipped_override']} kampány kihagyva (kézi `/campaign kpi` override)"
         await interaction.followup.send(msg)

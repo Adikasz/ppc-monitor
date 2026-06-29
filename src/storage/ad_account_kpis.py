@@ -34,6 +34,11 @@ CASCADE_FIELDS = (
     "primary_conversion_event",
     "warning_pct",
     "critical_pct",
+    # Küszöb-alapú metrikák (0011 migration)
+    "min_ctr",
+    "max_cpm",
+    "max_frequency",
+    "min_impressions",
 )
 
 
