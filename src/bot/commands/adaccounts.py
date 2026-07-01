@@ -678,7 +678,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     ) -> list[app_commands.Choice[str]]:
         return await self._account_choices(current)
 
-    @app_commands.command(name="kpi", description="Fiók-szintű KPI + lecsorgatás a kampányokra (admin vagy saját #alerts)")
+    @app_commands.command(name="kpi", description="Fiók-szintű KPI + lecsorgatás a kampányokra (csak saját #alerts csatorna)")
     @app_commands.describe(
         account="Fiók: #id, külső azonosító VAGY kliensnév (pl. 2 / act_165… / Stopvill)",
         target_roas="Cél ROAS szorzó (pl. 3.0 = 3×)",
@@ -717,15 +717,14 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
-        # Csatorna-kontextus: az OM SAJÁT #alerts csatornájából is futtatható
-        # (csak a saját fiókjaira), egyébként az admin csatornából (bármelyik fiók).
+        # CSAK a saját #alerts csatornából futtatható (az admin csatornából NEM).
         channel_owner = await asyncio.to_thread(
             users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
         )
-        if channel_owner is None and not _is_admin_channel(interaction):
+        if channel_owner is None:
             await interaction.followup.send(
-                "Ez a parancs csak az admin csatornában vagy a saját #alerts csatornádból "
-                "használható."
+                "❌ Ez a parancs csak a saját #alerts csatornádból futtatható. "
+                "Nyisd meg a saját csatornádat és futtasd ott."
             )
             return
 
@@ -733,14 +732,13 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         if acct is None:
             return
 
-        # Alerts csatornából csak a saját (hozzárendelt) fiók módosítható.
-        if channel_owner is not None:
-            owned = await asyncio.to_thread(
-                account_assignments_storage.get_account_ids_for_user, channel_owner["id"]
-            )
-            if acct["id"] not in owned:
-                await interaction.followup.send("❌ Ez a fiók nincs hozzád rendelve.")
-                return
+        # Csak a saját (hozzárendelt) fiók módosítható.
+        owned = await asyncio.to_thread(
+            account_assignments_storage.get_account_ids_for_user, channel_owner["id"]
+        )
+        if acct["id"] not in owned:
+            await interaction.followup.send("❌ Ez a fiók nincs hozzád rendelve.")
+            return
 
         inputs = {k: v for k, v in {
             "target_roas": target_roas, "max_cpa": max_cpa, "monthly_budget": monthly_budget,
@@ -834,12 +832,12 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     async def kpi_account_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        """Admin csatorna → összes fiók; alerts csatorna → csak az OM saját fiókjai."""
+        """CSAK alerts csatornából ajánl fiókokat (az OM sajátjait); máshol üres."""
         owner = await asyncio.to_thread(
             users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
         )
         if owner is None:
-            return await self._account_choices(current)
+            return []
         return await self._owned_account_choices(owner, current)
 
 
