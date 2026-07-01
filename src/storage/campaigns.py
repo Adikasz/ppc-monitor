@@ -484,3 +484,78 @@ def search_campaigns(query: str, *, limit: int = 25, include_ended: bool = False
     elif q:
         qb = qb.ilike("name", f"%{q}%")
     return qb.order("name").limit(limit).execute().data or []
+
+
+def search_campaign_choices(account_id: int, query: str, *, limit: int = 25) -> list[dict[str, Any]]:
+    """Kampány autocomplete EGY fiókon belül: szám → pontos id, szöveg → név ILIKE.
+
+    A `/my lifecycle` használja: az OM már kiválasztott egy fiókot, itt csak az
+    abban lévő (nem-'ended') kampányokat kínáljuk fel. Visszatérés elemei:
+    {"id", "name"} (név szerint rendezve).
+    """
+    q = (query or "").strip()
+    qb = (
+        get_supabase().table(_TABLE)
+        .select("id, name")
+        .eq("ad_account_id", account_id)
+        .neq("lifecycle_state", "ended")
+    )
+    if q.isdigit():
+        qb = qb.eq("id", int(q))
+    elif q:
+        qb = qb.ilike("name", f"%{q}%")
+    return qb.order("name").limit(limit).execute().data or []
+
+
+def search_campaign_choices_global(query: str, *, limit: int = 25) -> list[dict[str, Any]]:
+    """Kampány autocomplete MINDEN fiókban, kliensnévvel (admin `/alert …`).
+
+    A visszaadott sorok tartalmazzák a beágyazott `ad_accounts(clients(name))`
+    objektumot, hogy a felkínált címke `Kliens / Kampány` formájú lehessen.
+    Szám → pontos id, szöveg → név ILIKE; az 'ended' kampányokat kihagyja.
+    """
+    q = (query or "").strip()
+    qb = (
+        get_supabase().table(_TABLE)
+        .select("id, name, ad_accounts(clients(name))")
+        .neq("lifecycle_state", "ended")
+    )
+    if q.isdigit():
+        qb = qb.eq("id", int(q))
+    elif q:
+        qb = qb.ilike("name", f"%{q}%")
+    return qb.order("name").limit(limit).execute().data or []
+
+
+def resolve_campaign(value: str, account_id: int | None = None) -> dict[str, Any] | None:
+    """Kampány feloldása str értékből (autocomplete VAGY kézi bevitel).
+
+    - szám (`"920"`)  → pontos belső ID egyezés (backward compat)
+    - szöveg          → név ILIKE keresés (ha `account_id` adott, arra szűrve)
+
+    Visszatérés:
+        - kampány sor {"id", "name", "lifecycle_state", "ad_account_id"} — egy egyértelmű találat
+        - {"ambiguous": True, "matches": [...]} — több névtalálat (max 5)
+        - None — nincs találat
+    """
+    v = (value or "").strip()
+    if not v:
+        return None
+
+    sb = get_supabase()
+    cols = "id, name, lifecycle_state, ad_account_id"
+
+    if v.isdigit():
+        res = sb.table(_TABLE).select(cols).eq("id", int(v)).limit(1).execute()
+        return res.data[0] if res.data else None
+
+    qb = sb.table(_TABLE).select(cols).ilike("name", f"%{v}%")
+    if account_id is not None:
+        qb = qb.eq("ad_account_id", account_id)
+    results = qb.order("name").limit(5).execute().data or []
+
+    if len(results) == 1:
+        return results[0]
+    if len(results) > 1:
+        return {"ambiguous": True, "matches": results}
+    return None

@@ -10,7 +10,7 @@ Parancsok:
     /my kpi       account:<#id> [KPI mezők...]      — fiók-KPI (csak saját fiók)
     /my mute      account:<#id> [campaign_id:] hours:<>  — némítás
     /my unmute    account:<#id> [campaign_id:]      — némítás feloldása
-    /my lifecycle account:<#id> campaign_id:<> state:<>  — lifecycle állítás
+    /my lifecycle account:<#id> campaign:<név|#id> state:<>  — lifecycle állítás
     /my insights  account:<#id> enabled:<bool>      — insight kapcsoló
     /my summary   [type:daily|weekly]               — saját összefoglaló
 
@@ -445,7 +445,7 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
     @app_commands.command(name="lifecycle", description="Kampány lifecycle állapotának állítása")
     @app_commands.describe(
         account="Saját fiók: #id, külső azonosító VAGY kliensnév (a `/my accounts` mutatja)",
-        campaign_id="A kampány azonosítója",
+        campaign="A kampány neve (autocomplete) VAGY #id",
         state="Új lifecycle állapot",
     )
     @app_commands.choices(state=_LIFECYCLE_CHOICES)
@@ -453,7 +453,7 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         self,
         interaction: discord.Interaction,
         account: str,
-        campaign_id: int,
+        campaign: str,
         state: app_commands.Choice[str],
     ) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -465,10 +465,28 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         if acct is None:
             return
 
-        camp = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
-        if camp is None or camp.get("ad_account_id") != acct["id"]:
+        resolved = await asyncio.to_thread(
+            campaigns_storage.resolve_campaign, campaign, acct["id"]
+        )
+        if resolved is None:
             await interaction.followup.send(
-                f"❌ A(z) #{campaign_id} kampány nem ehhez a fiókhoz (#{acct['id']}) tartozik."
+                f"❌ Nem található kampány: **{campaign}** — válassz az autocomplete-ből."
+            )
+            return
+        if resolved.get("ambiguous"):
+            lines = [f"**#{m['id']}** {m['name']}" for m in resolved["matches"]]
+            await interaction.followup.send(
+                "Több kampány illeszkedik — pontosíts vagy válassz az autocomplete-ből:\n"
+                + "\n".join(lines)
+            )
+            return
+
+        camp = resolved
+        campaign_id = camp["id"]
+        if camp.get("ad_account_id") != acct["id"]:
+            await interaction.followup.send(
+                f"❌ A(z) #{campaign_id} — {camp['name']} kampány nem ehhez a fiókhoz "
+                f"(#{acct['id']}) tartozik."
             )
             return
 
@@ -494,6 +512,43 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         return await self._owned_account_choices(interaction, current)
+
+    @lifecycle.autocomplete("campaign")
+    async def lifecycle_campaign_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Kampány-autocomplete: a már kiválasztott (saját) fiók nem-'ended' kampányai.
+
+        A fiókot a `account` mezőből olvassuk (namespace); ha még nincs megadva,
+        vagy nem az OM-hez tartozik, üres listát adunk (előbb fiókot kell választani).
+        """
+        owner = await asyncio.to_thread(_channel_owner, interaction.channel_id)
+        if owner is None:
+            return []
+        account_val = interaction.namespace.account
+        if not account_val:
+            return []
+
+        res = await asyncio.to_thread(
+            account_assignments_storage.resolve_accounts, str(account_val)
+        )
+        if res["status"] != "ok" or not res.get("accounts"):
+            return []
+        owned = await asyncio.to_thread(
+            account_assignments_storage.get_account_ids_for_user, owner["id"]
+        )
+        mine = [a for a in res["accounts"] if a["id"] in owned]
+        if len(mine) != 1:
+            return []
+        account_id = mine[0]["id"]
+
+        rows = await asyncio.to_thread(
+            campaigns_storage.search_campaign_choices, account_id, current or ""
+        )
+        return [
+            app_commands.Choice(name=c["name"][:100], value=str(c["id"]))
+            for c in rows
+        ][:25]
 
     # ------------------------------------------------------------------
     # /my insights account:<#id> enabled:<bool>

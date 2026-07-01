@@ -2,9 +2,12 @@
 /alert slash parancscsoport — kampány-némítás + routing-teszt.
 
 Parancsok:
-    /alert mute    campaign_id:<id> [hours:<2>]              — kampány némítása X órára
-    /alert unmute  campaign_id:<id>                          — némítás korai feloldása
-    /alert test    campaign_id:<id> severity:<…>            — fake riasztás → routing teszt
+    /alert mute    campaign:<név|#id> [hours:<2>]           — kampány némítása X órára
+    /alert unmute  campaign:<név|#id>                        — némítás korai feloldása
+    /alert test    campaign:<név|#id> severity:<…>          — fake riasztás → routing teszt
+
+A `campaign` mező névvel (autocomplete, `Kliens / Kampány`) és #id-vel is működik
+(backward compat): a `campaigns_storage.resolve_campaign` oldja fel.
 
 A némítás a `mutes` táblán keresztül történik (src.storage.mutes). Muted
 kampányra a detektor nem generál, az alert-router nem küld riasztást.
@@ -61,17 +64,61 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
         self.bot = bot
 
     # ------------------------------------------------------------------
-    # /alert mute campaign_id:<id> hours:<2>
+    # Kampány-feloldás + autocomplete (admin: bármelyik fiók)
+    # ------------------------------------------------------------------
+    async def _resolve_campaign_or_reject(
+        self, interaction: discord.Interaction, campaign: str
+    ) -> dict | None:
+        """A `campaign` mező feloldása kampány-sorra (#id VAGY név).
+
+        Egyértelmű találatnál a kampány sort adja vissza; nem-talált / többértelmű
+        esetben üzen és None-t ad vissza (a hívó ekkor return-öljön).
+        """
+        resolved = await asyncio.to_thread(campaigns_storage.resolve_campaign, campaign)
+        if resolved is None:
+            await interaction.followup.send(
+                f"Nincs ilyen kampány: **{campaign}** — válassz az autocomplete-ből."
+            )
+            return None
+        if resolved.get("ambiguous"):
+            lines = [f"**#{m['id']}** — {m['name']}" for m in resolved["matches"]]
+            await interaction.followup.send(
+                "Több kampány illeszkedik — pontosíts vagy válassz az autocomplete-ből:\n"
+                + "\n".join(lines)
+            )
+            return None
+        return resolved
+
+    async def _campaign_choices_global(self, current: str) -> list[app_commands.Choice[str]]:
+        """Autocomplete az `/alert …` kampány-mezőihez: minden fiók, `Kliens / Kampány`
+        címkével. Legalább 2 karakter (vagy id) kell, hogy ne listázzunk mindent."""
+        q = (current or "").strip()
+        if len(q) < 2 and not q.isdigit():
+            return []
+        rows = await asyncio.to_thread(campaigns_storage.search_campaign_choices_global, q)
+        out: list[app_commands.Choice[str]] = []
+        for r in rows:
+            client = ((r.get("ad_accounts") or {}).get("clients")) or {}
+            cname = client.get("name") or "?"
+            out.append(
+                app_commands.Choice(
+                    name=f"{cname} / {r['name']}"[:100], value=str(r["id"])
+                )
+            )
+        return out[:25]
+
+    # ------------------------------------------------------------------
+    # /alert mute campaign:<név|#id> hours:<2>
     # ------------------------------------------------------------------
     @app_commands.command(name="mute", description="Kampány némítása X órára (nem jelez riasztást)")
     @app_commands.describe(
-        campaign_id="A kampány numerikus azonosítója",
+        campaign="A kampány neve (autocomplete) VAGY #id",
         hours="Hány órára némítsd (alapértelmezés: 2)",
     )
     async def mute(
         self,
         interaction: discord.Interaction,
-        campaign_id: int,
+        campaign: str,
         hours: int = _DEFAULT_MUTE_HOURS,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -82,10 +129,10 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
             )
             return
 
-        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
+        c = await self._resolve_campaign_or_reject(interaction, campaign)
         if c is None:
-            await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
             return
+        campaign_id = c["id"]
 
         until = datetime.now(timezone.utc) + timedelta(hours=hours)
         try:
@@ -119,25 +166,31 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
         await interaction.followup.send(
             f"🔇 **#{campaign_id} — {c['name']}** némítva **{hours} órára**.\n"
             f"Eddig: `{until.strftime('%Y-%m-%d %H:%M')} UTC` — addig nem megy riasztás.\n"
-            f"Korai feloldás: `/alert unmute campaign_id:{campaign_id}`"
+            f"Korai feloldás: `/alert unmute campaign:{campaign_id}`"
         )
 
+    @mute.autocomplete("campaign")
+    async def mute_campaign_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._campaign_choices_global(current)
+
     # ------------------------------------------------------------------
-    # /alert unmute campaign_id:<id>
+    # /alert unmute campaign:<név|#id>
     # ------------------------------------------------------------------
     @app_commands.command(name="unmute", description="Kampány némításának feloldása")
-    @app_commands.describe(campaign_id="A kampány numerikus azonosítója")
+    @app_commands.describe(campaign="A kampány neve (autocomplete) VAGY #id")
     async def unmute(
         self,
         interaction: discord.Interaction,
-        campaign_id: int,
+        campaign: str,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
-        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
+        c = await self._resolve_campaign_or_reject(interaction, campaign)
         if c is None:
-            await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
             return
+        campaign_id = c["id"]
 
         unmuted = await asyncio.to_thread(mutes_storage.unmute_campaign, campaign_id)
         if not unmuted:
@@ -160,15 +213,21 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
             f"🔔 **#{campaign_id} — {c['name']}** némítása feloldva — újra figyeljük."
         )
 
+    @unmute.autocomplete("campaign")
+    async def unmute_campaign_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._campaign_choices_global(current)
+
     # ------------------------------------------------------------------
-    # /alert test campaign_id:<id> severity:<critical|warning|insight>
+    # /alert test campaign:<név|#id> severity:<critical|warning|insight>
     # ------------------------------------------------------------------
     @app_commands.command(
         name="test",
         description="Fake riasztás kiküldése a routing ellenőrzéséhez (admin csatorna)",
     )
     @app_commands.describe(
-        campaign_id="A kampány numerikus azonosítója",
+        campaign="A kampány neve (autocomplete) VAGY #id",
         severity="A teszt-riasztás súlyossága",
         force="paused/ended kampányra is küldjön (admin override) — alap: nem",
     )
@@ -182,7 +241,7 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
     async def test(
         self,
         interaction: discord.Interaction,
-        campaign_id: int,
+        campaign: str,
         severity: app_commands.Choice[str],
         force: bool = False,
     ) -> None:
@@ -194,10 +253,10 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
             )
             return
 
-        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
+        c = await self._resolve_campaign_or_reject(interaction, campaign)
         if c is None:
-            await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
             return
+        campaign_id = c["id"]
 
         # Lifecycle: a leállított kampányra az éles monitoring sem küld — a teszt is
         # ezt tükrözze, hacsak az admin nem kéri kifejezetten (force:true).
@@ -206,7 +265,7 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
             await interaction.followup.send(
                 f"⚠️ **#{campaign_id} — {c['name']}** `{lifecycle}` állapotban van — "
                 f"nem küldünk alertet (ahogy az éles monitoring sem).\n"
-                f"Ha mégis tesztelni akarod a routingot: `/alert test campaign_id:{campaign_id} "
+                f"Ha mégis tesztelni akarod a routingot: `/alert test campaign:{campaign_id} "
                 f"severity:{severity.value} force:true`."
             )
             return
@@ -245,6 +304,12 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
                 f"Ellenőrizd: van-e beállítva admin/alert csatorna, "
                 f"vagy némítva van-e a kampány."
             )
+
+    @test.autocomplete("campaign")
+    async def test_campaign_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._campaign_choices_global(current)
 
 
 class SummaryCog(commands.Cog):
