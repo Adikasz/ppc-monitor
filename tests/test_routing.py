@@ -227,9 +227,10 @@ async def test_quiet_hours_suppresses_warning():
     mark_suppressed.assert_called_once_with(1)
 
 
-async def test_quiet_hours_suppresses_non_urgent_critical():
-    """Csendes időben a nem-sürgős CRITICAL (pl. roas_drop) IS elnyomódik."""
-    for metric in ("roas_drop", "cpa_spike", "ctr_drop", "cpm_spike"):
+async def test_quiet_hours_suppresses_everything_including_critical():
+    """Csendes időben SEMMI nem megy ki — a CRITICAL (budget_depleted is) elnyomódik."""
+    for metric in ("roas_drop", "cpa_spike", "ctr_drop", "cpm_spike",
+                   "budget_depleted", "account_suspended", "payment_failed"):
         with contextlib.ExitStack() as stack:
             send = _patch_router(stack, recipients=[_recipient("david", "111")], is_quiet=True)
             result = await router.route_alert(_alert("critical", metric=metric))
@@ -237,17 +238,6 @@ async def test_quiet_hours_suppresses_non_urgent_critical():
         send.assert_not_awaited()
         assert result["reason"] == "quiet_hours", f"metric={metric}"
         assert result["routed"] is False
-
-
-async def test_quiet_hours_lets_budget_depleted_through():
-    """Csendes időben a valódi vészhelyzet (budget_depleted) kimegy — a keret elfogyott."""
-    for metric in ("budget_depleted", "account_suspended", "payment_failed"):
-        with contextlib.ExitStack() as stack:
-            send = _patch_router(stack, recipients=[_recipient("david", "111")], is_quiet=True)
-            result = await router.route_alert(_alert("critical", metric=metric))
-
-        send.assert_awaited_once()
-        assert result["routed"] is True, f"metric={metric}"
 
 
 async def test_bypass_quiet_hours_overrides_suppression():
