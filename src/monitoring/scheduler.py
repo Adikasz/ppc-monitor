@@ -301,7 +301,7 @@ def _resolve_client_for_account(ad_account_id: int | None) -> dict[str, Any] | N
 
 
 async def daily_insight_scan(*, limit: int | None = None) -> None:
-    """Napi INSIGHT scan (02:00, hétköznap) — szabály-alapú + AI javaslatok.
+    """Napi INSIGHT scan (08:00, hétköznap) — szabály-alapú + AI javaslatok.
 
     Csak 'mature' lifecycle-ú kampányokat néz (a tanulási fázis nem kap insightot).
     Kampányonként:
@@ -311,8 +311,8 @@ async def daily_insight_scan(*, limit: int | None = None) -> None:
       4. AI javaslat, ha a kliensnél insights_enabled=True,
       5. alert beszúrás (dedup) + routing.
 
-    A routing `bypass_quiet_hours=True`: a 02:00 a csendes időbe esik, az insight
-    viszont csak csatorna-poszt (nem pingel), így a csendes idő nem nyomhatja el.
+    A routing tiszteli a csendes időt (nincs bypass): a scan 08:00-kor (a quiet
+    hours VÉGÉN, hétköznap) fut, így az insight munkaidőben megy ki, nem éjjel.
 
     `limit`: legfeljebb ennyi mature kampányt dolgoz fel (teszt/manuális futtatás).
     """
@@ -394,7 +394,10 @@ async def daily_insight_scan(*, limit: int | None = None) -> None:
                 if alert_row:
                     insight_count += 1
                     try:
-                        await route_alert(alert_row, bypass_quiet_hours=True)
+                        # NEM bypassoljuk a csendes időt: az insight is csak
+                        # munkaidőben (08:00–17:00, hétköznap) menjen ki. A scan
+                        # 08:00-kor fut, így nem nyomódik el.
+                        await route_alert(alert_row)
                     except Exception as exc:  # noqa: BLE001
                         log.error(
                             "Insight routing hiba (alert #%s): %s",
@@ -501,13 +504,14 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
     )
 
-    # Napi INSIGHT scan: HÉTKÖZNAP 02:00 (18. lépés). Éjjel fut, hogy reggelre a
-    # friss optimalizálási javaslatok ott legyenek az OM csatornáiban. Hétvégén
-    # nem fut (akkor nincs aktív kampánykezelés).
+    # Napi INSIGHT scan: HÉTKÖZNAP 08:00 (18. lépés). Reggel, a csendes idő VÉGÉN
+    # fut, hogy a friss javaslatok ott legyenek az OM csatornáiban, de NE éjjel
+    # (02:00) pingeljenek — az insight is tiszteli a quiet hours-t (a scan nem
+    # bypassolja). Hétvégén nem fut (akkor nincs aktív kampánykezelés).
     _scheduler.add_job(
         daily_insight_scan,
         trigger="cron",
-        hour=2,
+        hour=8,
         minute=0,
         day_of_week="mon-fri",
         id="daily_insight_scan",
@@ -534,7 +538,7 @@ def start_scheduler() -> AsyncIOScheduler:
     _scheduler.start()
     log.info(
         "Monitoring scheduler indítva (óránkénti ciklus + napi/heti összefoglaló "
-        "+ napi insight scan 02:00, tz=%s)",
+        "+ napi insight scan 08:00, tz=%s)",
         timezone,
     )
     return _scheduler

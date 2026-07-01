@@ -49,6 +49,26 @@ def test_weekday_early_morning_quiet():
     assert _is_quiet(_at(2024, 1, 1, 7, 30)) is True
 
 
+def test_weekday_0200_quiet():
+    # 02:00 hétfő → éjjel, csendes (a hajnali riasztás-bug regressziója)
+    assert _is_quiet(_at(2024, 1, 1, 2, 0)) is True
+
+
+def test_weekday_1659_not_quiet():
+    # 16:59 hétfő → még munkaidő, NEM csendes
+    assert _is_quiet(_at(2024, 1, 1, 16, 59)) is False
+
+
+def test_weekday_1700_quiet():
+    # 17:00 hétfő → csendes kezdete
+    assert _is_quiet(_at(2024, 1, 1, 17, 0)) is True
+
+
+def test_weekday_2300_quiet():
+    # 23:00 hétfő → csendes
+    assert _is_quiet(_at(2024, 1, 1, 23, 0)) is True
+
+
 # --- Hétvége: egész nap csendes ---------------------------------------------
 
 def test_saturday_midday_quiet():
