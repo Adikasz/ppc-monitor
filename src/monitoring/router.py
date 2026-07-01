@@ -49,6 +49,13 @@ log = get_logger(__name__)
 # védve vannak.
 _SKIP_LIFECYCLE = {"paused", "ended"}
 
+# Csendes időben CSAK ezek a valódi vészhelyzetek mennek ki — a severity-től
+# függetlenül. Minden más (akár egy CRITICAL roas_drop is) reggel 08:00-ig vár:
+# a ROAS hajnalban ugyanaz lesz, mint reggel, nem éri meg felébreszteni érte az
+# OM-et (az összefoglalót 08:00-kor úgyis megkapja). A budget_depleted viszont
+# valódi pénzügyi vészhelyzet (elfogy a keret) → azonnal kell tudni róla.
+_TRULY_URGENT = {"budget_depleted", "account_suspended", "payment_failed"}
+
 
 async def route_alert(
     alert: dict[str, Any],
@@ -58,9 +65,10 @@ async def route_alert(
 ) -> dict[str, Any]:
     """Egy riasztás kiküldése a megfelelő csatornákra (lásd modul-docstring).
 
-    `bypass_quiet_hours=True` esetén a csendes idő nem nyomja el a nem-kritikus
+    `bypass_quiet_hours=True` esetén a csendes idő egyáltalán nem nyomja el a
     riasztást — a manuális `/alert test` parancs használja, hogy a routing
-    bármikor tesztelhető legyen.
+    bármikor tesztelhető legyen. Enélkül csendes időben csak a `_TRULY_URGENT`
+    metrikák (pl. budget_depleted) mennek ki, minden más (akár CRITICAL is) vár.
 
     `bypass_lifecycle=True` esetén a paused/ended kampány sem nyomja el a
     riasztást — kizárólag az `/alert test … force:true` admin-override használja.
@@ -106,11 +114,16 @@ async def route_alert(
         result["reason"] = "muted"
         return result
 
-    # b2) Csendes idő — a nem-kritikus riasztást elnyomjuk (CRITICAL átmegy).
-    if severity != "critical" and not bypass_quiet_hours and quiet_hours.is_quiet_now():
+    # b2) Csendes idő — csak a valódi vészhelyzet (_TRULY_URGENT metric) megy ki;
+    # minden más elnyomódik, még a CRITICAL is (pl. roas_drop éjjel nem ébreszti
+    # az OM-et). A `bypass_quiet_hours=True` (pl. /alert test) továbbra is teljesen
+    # felülírja a csendes időt.
+    metric = (alert.get("metric") or "").lower()
+    if metric not in _TRULY_URGENT and not bypass_quiet_hours and quiet_hours.is_quiet_now():
         log.info(
-            "Routing skip — csendes idő, nem-kritikus alert elnyomva (#%s, severity=%s)",
-            alert_id, severity,
+            "Routing skip — csendes idő, nem-sürgős alert elnyomva "
+            "(#%s, severity=%s, metric=%s)",
+            alert_id, severity, metric,
         )
         if alert_id is not None:
             await asyncio.to_thread(alerts_storage.mark_alert_suppressed, alert_id)
