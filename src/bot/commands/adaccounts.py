@@ -790,6 +790,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
 
         moved: list[str] = []
         failed: list[str] = []
+        meta_recorded = True
         for acct in accounts:
             role_value = acct.get("_role") or "primary"
             try:
@@ -805,6 +806,17 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
                     await asyncio.to_thread(
                         assignments_storage.bulk_unassign_campaigns, from_row["id"], campaign_ids
                     )
+                else:
+                    # Ideiglenes: jegyezzük fel, ki adta át és meddig — ebből tud a
+                    # /account handover-return pontosan visszavenni. Graceful, ha a
+                    # 0012 migráció még nem futott le (ekkor a return fallback-re esik).
+                    ok = await asyncio.to_thread(
+                        account_assignments_storage.mark_handover,
+                        acct["id"], to_row["id"],
+                        from_user_id=from_row["id"], until=handover_until,
+                    )
+                    if not ok:
+                        meta_recorded = False
             except Exception as exc:  # noqa: BLE001
                 log.exception("Handover hiba (#%s)", acct["id"])
                 failed.append(f"#{acct['id']} (`{exc}`)")
@@ -841,8 +853,135 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         if not permanent:
             msg += (
                 f"\nℹ️ Ideiglenes: {_display_name(from_user)} megmaradt a fiókokon "
-                f"(lejárat: {handover_until[:10]}). Visszaálláskor távolítsd el "
-                f"{_display_name(to_user)}-t: `/account unassign account:<#id> user:@{_display_name(to_user)}`."
+                f"(lejárat: {handover_until[:10]}). Visszaálláskor EGY paranccsal add vissza:\n"
+                f"`/account handover-return from_user:@{_display_name(to_user)} "
+                f"to_user:@{_display_name(from_user)}`"
+            )
+            if not meta_recorded:
+                msg += (
+                    "\n⚠️ A handover-metaadat nem íródott el (a `0012_handover.sql` migráció "
+                    "még nem futott le) — a return a „mindkét OM rajta van” heurisztikára esik vissza."
+                )
+        if failed:
+            msg += f"\n⚠️ Hiba: {', '.join(failed)}"
+        await interaction.followup.send(msg)
+
+    # ------------------------------------------------------------------
+    # /account handover-return from_user:<@OM> to_user:<@OM>
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="handover-return",
+        description="Ideiglenes handover visszaadása EGY paranccsal (szabadságról visszatéréskor) (admin)",
+    )
+    @app_commands.describe(
+        from_user="Aki MOST bírja a fiókokat (handover-rel kapta, pl. a helyettes)",
+        to_user="Az eredeti OM, akinek visszaadjuk (aki átadta)",
+    )
+    async def handover_return(
+        self,
+        interaction: discord.Interaction,
+        from_user: discord.Member,
+        to_user: discord.Member,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+
+        if from_user.bot or to_user.bot:
+            await interaction.followup.send("❌ Bot nem lehet OM — válassz valódi felhasználókat.")
+            return
+        if from_user.id == to_user.id:
+            await interaction.followup.send("❌ A `from_user` és `to_user` nem lehet ugyanaz.")
+            return
+
+        from_row = await asyncio.to_thread(users_storage.get_user_by_discord_id, str(from_user.id))
+        to_row = await asyncio.to_thread(users_storage.get_user_by_discord_id, str(to_user.id))
+        if from_row is None or to_row is None:
+            missing = _display_name(from_user if from_row is None else to_user)
+            await interaction.followup.send(
+                f"❌ **{missing}** nincs a rendszerben — nincs mit visszaadni."
+            )
+            return
+
+        # Pontos: a from_user azon sorai, amiket kifejezetten to_user-től kapott
+        # handover-rel. None → a 0012 oszlop hiányzik → fallback heurisztika.
+        rows = await asyncio.to_thread(
+            account_assignments_storage.get_handover_assignments, from_row["id"], to_row["id"]
+        )
+        used_fallback = False
+        if rows is None:
+            used_fallback = True
+            rows = await asyncio.to_thread(
+                account_assignments_storage.get_shared_account_assignments,
+                from_row["id"], to_row["id"],
+            )
+
+        if not rows:
+            hint = (
+                "" if not used_fallback
+                else "\n(A `0012_handover.sql` még nem futott le — a heurisztika sem talált "
+                     "közös fiókot.)"
+            )
+            await interaction.followup.send(
+                f"❌ Nincs aktív handover {from_user.mention} és {to_user.mention} között.{hint}"
+            )
+            return
+
+        returned: list[str] = []
+        failed: list[str] = []
+        for r in rows:
+            acct = r.get("ad_accounts") or {}
+            acct_id = acct.get("id") or r.get("ad_account_id")
+            if acct_id is None:
+                continue
+            cname = ((acct.get("clients") or {}).get("name")) or f"#{acct_id}"
+            try:
+                await asyncio.to_thread(
+                    account_assignments_storage.delete_account_assignment, acct_id, from_row["id"]
+                )
+                campaign_ids = await asyncio.to_thread(
+                    _account_campaign_ids, acct_id, active_only=False
+                )
+                await asyncio.to_thread(
+                    assignments_storage.bulk_unassign_campaigns, from_row["id"], campaign_ids
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Handover-return hiba (#%s)", acct_id)
+                failed.append(f"#{acct_id} (`{exc}`)")
+                continue
+            returned.append(cname)
+
+        if not returned:
+            msg = "❌ Egyetlen fiókot sem sikerült visszaadni."
+            if failed:
+                msg += f"\nHiba: {', '.join(failed)}"
+            await interaction.followup.send(msg)
+            return
+
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "account_handover_return",
+            entity_type="user", entity_id=from_row["id"],
+            details={
+                "from_discord_id": str(from_user.id), "from_name": _display_name(from_user),
+                "to_discord_id": str(to_user.id), "to_name": _display_name(to_user),
+                "fallback": used_fallback, "count": len(returned), "accounts": returned,
+            },
+        )
+        log.info(
+            "Handover-return: %s → %s (%d fiók%s)",
+            from_user, to_user, len(returned), ", fallback" if used_fallback else "",
+        )
+
+        msg = (
+            f"✅ **{len(returned)} fiók visszaadva** {from_user.mention} → "
+            f"{to_user.mention}:\n" + ", ".join(returned)
+        )
+        if used_fallback:
+            msg += (
+                "\nℹ️ Heurisztikus mód (a `0012_handover.sql` még nem futott le): minden közös "
+                f"fiókról levettem {_display_name(from_user)}-t. Ellenőrizd: `/account list`."
             )
         if failed:
             msg += f"\n⚠️ Hiba: {', '.join(failed)}"

@@ -277,6 +277,99 @@ def upsert_account_assignment(
     return res.data[0], True
 
 
+def _is_missing_handover_column(exc: Exception) -> bool:
+    """True, ha a hiba a handover oszlopok hiányára utal (0012 még nem futott le)."""
+    msg = str(exc).lower()
+    return "handover_" in msg and any(
+        s in msg for s in ("does not exist", "could not find", "schema cache", "column", "pgrst204")
+    )
+
+
+def mark_handover(
+    ad_account_id: int,
+    user_id: int,
+    *,
+    from_user_id: int,
+    until: str | None,
+) -> bool:
+    """Ideiglenes handover metaadat rögzítése a fogadó (user_id) során.
+
+    A `/account handover-return` ebből tudja pontosan, mely sorokat kell visszavenni.
+    Graceful: ha a 0012 migráció (handover_* oszlopok) még nem futott le, False-t ad
+    vissza és NEM dob — a handover metaadat nélkül is működik.
+    """
+    try:
+        (
+            get_supabase()
+            .table(_TABLE)
+            .update({"handover_from_user_id": from_user_id, "handover_until": until})
+            .eq("ad_account_id", ad_account_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_handover_column(exc):
+            log.warning("handover_* oszlop hiányzik (0012 migration?) — metaadat kihagyva")
+            return False
+        raise
+
+
+def get_handover_assignments(user_id: int, from_user_id: int) -> list[dict[str, Any]] | None:
+    """A fogadó (user_id) azon sorai, amiket kifejezetten `from_user_id`-tól kapott handover-rel.
+
+    Visszatérés:
+        - list[dict]  — a handover-sorok (beágyazott ad_accounts + clients névvel)
+        - None        — a handover_* oszlop még nem létezik (0012 előtt) → a hívó
+                        essen vissza a `get_shared_account_assignments` heurisztikára
+    """
+    try:
+        res = (
+            get_supabase()
+            .table(_TABLE)
+            .select("*, ad_accounts(id, platform, external_account_id, client_id, clients(name))")
+            .eq("user_id", user_id)
+            .eq("handover_from_user_id", from_user_id)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_handover_column(exc) or _is_missing_relation(exc):
+            return None
+        raise
+    return res.data or []
+
+
+def get_shared_account_assignments(
+    returning_user_id: int, original_user_id: int
+) -> list[dict[str, Any]]:
+    """Fallback (0012 előtt): azon fiókok, ahol MINDKÉT user rajta van.
+
+    A `returning_user_id` sorait adja vissza azokra a fiókokra, amelyeken az
+    `original_user_id` is jelen van (beágyazott ad_accounts + clients névvel). A
+    handover-return ezekről veszi le a `returning_user_id`-t. Kevésbé pontos, mint
+    a metaadat-alapú keresés (nem különbözteti meg az eleve közös fiókokat).
+    """
+    sb = get_supabase()
+    try:
+        ret = sb.table(_TABLE).select("ad_account_id").eq("user_id", returning_user_id).execute().data or []
+        orig = sb.table(_TABLE).select("ad_account_id").eq("user_id", original_user_id).execute().data or []
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing_relation(exc):
+            return []
+        raise
+    shared = {r["ad_account_id"] for r in ret} & {r["ad_account_id"] for r in orig}
+    if not shared:
+        return []
+    res = (
+        sb.table(_TABLE)
+        .select("*, ad_accounts(id, platform, external_account_id, client_id, clients(name))")
+        .eq("user_id", returning_user_id)
+        .in_("ad_account_id", list(shared))
+        .execute()
+    )
+    return res.data or []
+
+
 def delete_account_assignment(ad_account_id: int, user_id: int) -> bool:
     """Fiók-hozzárendelés törlése. True ha volt mit törölni."""
     existing = get_account_assignment(ad_account_id, user_id)
