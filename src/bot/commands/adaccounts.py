@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -707,6 +709,144 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         return await self._account_choices(current)
+
+    # ------------------------------------------------------------------
+    # /account handover from_user:<@OM> to_user:<@OM> [days:<N>] [confirm:yes]
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="handover",
+        description="Egy OM ÖSSZES fiókjának átadása másik OM-nek — szabadság kezelés (admin)",
+    )
+    @app_commands.describe(
+        from_user="Az OM, akitől átvesszük a fiókokat (pl. szabadságra megy)",
+        to_user="Az OM, aki átveszi a fiókokat",
+        days="Opcionális: ideiglenes átadás ennyi napra (from_user is megmarad). Üres = TARTÓS átvitel.",
+        confirm="Tartós átvitelnél kötelező: yes — from_user lekerül minden fiókról",
+    )
+    async def handover(
+        self,
+        interaction: discord.Interaction,
+        from_user: discord.Member,
+        to_user: discord.Member,
+        days: Optional[int] = None,
+        confirm: Optional[str] = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if not _is_admin_channel(interaction):
+            await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
+            return
+
+        if from_user.bot or to_user.bot:
+            await interaction.followup.send("❌ Bot nem lehet OM — válassz valódi felhasználókat.")
+            return
+        if from_user.id == to_user.id:
+            await interaction.followup.send("❌ A `from_user` és `to_user` nem lehet ugyanaz.")
+            return
+        if days is not None and days <= 0:
+            await interaction.followup.send(
+                "❌ A `days` pozitív egész legyen (vagy hagyd üresen a tartós átvitelhez)."
+            )
+            return
+
+        from_row = await asyncio.to_thread(users_storage.get_user_by_discord_id, str(from_user.id))
+        if from_row is None:
+            await interaction.followup.send(
+                f"**{_display_name(from_user)}** nincs a rendszerben — nincs mit átadni."
+            )
+            return
+
+        accounts = await asyncio.to_thread(
+            account_assignments_storage.get_accounts_for_user, from_row["id"]
+        )
+        if not accounts:
+            await interaction.followup.send(
+                f"**{_display_name(from_user)}** egyetlen fiókhoz sincs rendelve — nincs mit átadni."
+            )
+            return
+
+        permanent = days is None
+
+        # Tartós átvitel → megerősítés kötelező (from_user véglegesen lekerül).
+        if permanent and (confirm or "").strip().lower() != "yes":
+            await interaction.followup.send(
+                f"⚠️ **Tartós átvitel**: {_display_name(from_user)} **{len(accounts)}** fiókja "
+                f"átkerül {_display_name(to_user)}-hoz, és {_display_name(from_user)} lekerül róluk.\n"
+                f"Ha biztos vagy, futtasd újra `confirm:yes`-szel.\n"
+                f"ℹ️ Ideiglenes (szabadság) átadáshoz add meg a `days:` paramétert — akkor "
+                f"{_display_name(from_user)} megmarad, és a lejáratkor manuálisan visszaállítható."
+            )
+            return
+
+        to_row, created = await asyncio.to_thread(
+            users_storage.get_or_create_user, str(to_user.id), _display_name(to_user)
+        )
+        if created:
+            log.info("Új felhasználó regisztrálva: %s (%s)", to_user, to_user.id)
+
+        handover_until = None
+        if not permanent:
+            handover_until = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+        moved: list[str] = []
+        failed: list[str] = []
+        for acct in accounts:
+            role_value = acct.get("_role") or "primary"
+            try:
+                _n, cname = await self._assign_one(interaction, acct, to_row, role_value, to_user)
+                if permanent:
+                    await asyncio.to_thread(
+                        account_assignments_storage.delete_account_assignment,
+                        acct["id"], from_row["id"],
+                    )
+                    campaign_ids = await asyncio.to_thread(
+                        _account_campaign_ids, acct["id"], active_only=False
+                    )
+                    await asyncio.to_thread(
+                        assignments_storage.bulk_unassign_campaigns, from_row["id"], campaign_ids
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Handover hiba (#%s)", acct["id"])
+                failed.append(f"#{acct['id']} (`{exc}`)")
+                continue
+            moved.append(cname)
+
+        if not moved:
+            msg = "❌ Egyetlen fiókot sem sikerült átadni."
+            if failed:
+                msg += f"\nHiba: {', '.join(failed)} — lehet, hogy a `0010` migráció hiányzik."
+            await interaction.followup.send(msg)
+            return
+
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "account_handover",
+            entity_type="user", entity_id=from_row["id"],
+            details={
+                "from_discord_id": str(from_user.id), "from_name": _display_name(from_user),
+                "to_discord_id": str(to_user.id), "to_name": _display_name(to_user),
+                "permanent": permanent, "days": days, "handover_until": handover_until,
+                "count": len(moved), "accounts": moved,
+            },
+        )
+        log.info(
+            "Handover: %s → %s (%s, %d fiók)",
+            from_user, to_user, "tartós" if permanent else f"{days} nap", len(moved),
+        )
+
+        when = "tartósan" if permanent else f"{days} napra"
+        msg = (
+            f"✅ **{len(moved)} fiók átvíve** {_display_name(from_user)} → "
+            f"{_display_name(to_user)} ({when}):\n" + ", ".join(moved)
+        )
+        if not permanent:
+            msg += (
+                f"\nℹ️ Ideiglenes: {_display_name(from_user)} megmaradt a fiókokon "
+                f"(lejárat: {handover_until[:10]}). Visszaálláskor távolítsd el "
+                f"{_display_name(to_user)}-t: `/account unassign account:<#id> user:@{_display_name(to_user)}`."
+            )
+        if failed:
+            msg += f"\n⚠️ Hiba: {', '.join(failed)}"
+        await interaction.followup.send(msg)
 
     async def _apply_account_kpi(
         self, interaction: discord.Interaction, acct: dict, inputs: dict
