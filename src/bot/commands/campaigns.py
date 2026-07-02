@@ -423,9 +423,28 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
     # ------------------------------------------------------------------
     # /campaign kpi campaign_id:<id> [KPI mezők...]
     # ------------------------------------------------------------------
-    @app_commands.command(name="kpi", description="KPI-ok beállítása kampányhoz (verziózott)")
+    async def _apply_campaign_kpi(
+        self, interaction: discord.Interaction, camp: dict, kpi_fields: dict
+    ) -> dict:
+        """Egy kampányra beállítja a KPI-t (verziózott set_kpis) + audit. Hibát DOB."""
+        new_kpi = await asyncio.to_thread(
+            kpis_storage.set_kpis, camp["id"], **kpi_fields
+        )
+        await asyncio.to_thread(
+            audit.log_action,
+            str(interaction.user.id),
+            "set_kpi",
+            entity_type="campaign",
+            entity_id=camp["id"],
+            details={"campaign_name": camp.get("name"), "kpi_id": new_kpi["id"], **kpi_fields},
+        )
+        log.info("KPI beállítva: #%s %s → kpi #%s", camp["id"], camp.get("name"), new_kpi["id"])
+        return new_kpi
+
+    @app_commands.command(name="kpi", description="KPI-ok beállítása kampány(ok)hoz (verziózott)")
     @app_commands.describe(
-        campaign_id="A kampány numerikus azonosítója",
+        campaign_id="Egy kampány numerikus azonosítója",
+        campaigns="Több kampány vesszővel (név vagy #id) — ugyanaz a KPI mindre: pl. A,B,C",
         target_roas="Célzott ROAS (%)",
         max_cpa="Max megengedett CPA (Ft)",
         max_cpl="Max megengedett CPL lead kampányhoz (Ft)",
@@ -440,7 +459,8 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
     async def kpi(
         self,
         interaction: discord.Interaction,
-        campaign_id: int,
+        campaign_id: int | None = None,
+        campaigns: str | None = None,
         target_roas: float | None = None,
         max_cpa: float | None = None,
         max_cpl: float | None = None,
@@ -460,69 +480,26 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             )
             return
 
+        if campaign_id is None and not campaigns:
+            await interaction.followup.send(
+                "❌ Adj meg egy kampányt (`campaign_id:`) vagy többet (`campaigns:A,B,C`)."
+            )
+            return
+
         # Legalább egy KPI mezőt meg kell adni
-        all_values = [
-            target_roas, max_cpa, max_cpl, monthly_budget, target_ctr, max_cpc,
-            primary_conversion_event, no_conversion_critical_days,
-            cpa_spike_critical_pct, trend_warning_days,
-        ]
-        if all(v is None for v in all_values):
+        kpi_fields = {
+            "target_roas": target_roas, "max_cpa": max_cpa, "max_cpl": max_cpl,
+            "monthly_budget": monthly_budget, "target_ctr": target_ctr, "max_cpc": max_cpc,
+            "primary_conversion_event": primary_conversion_event,
+            "no_conversion_critical_days": no_conversion_critical_days,
+            "cpa_spike_critical_pct": cpa_spike_critical_pct,
+            "trend_warning_days": trend_warning_days,
+        }
+        if all(v is None for v in kpi_fields.values()):
             await interaction.followup.send("Legalább egy KPI mezőt meg kell adni!")
             return
 
-        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
-        if c is None:
-            await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
-            return
-
-        try:
-            new_kpi = await asyncio.to_thread(
-                kpis_storage.set_kpis,
-                campaign_id,
-                target_roas=target_roas,
-                max_cpa=max_cpa,
-                max_cpl=max_cpl,
-                monthly_budget=monthly_budget,
-                target_ctr=target_ctr,
-                max_cpc=max_cpc,
-                primary_conversion_event=primary_conversion_event,
-                no_conversion_critical_days=no_conversion_critical_days,
-                cpa_spike_critical_pct=cpa_spike_critical_pct,
-                trend_warning_days=trend_warning_days,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Hiba a KPI beállításakor (#%s)", campaign_id)
-            await interaction.followup.send(f"Hiba a KPI mentésekor: `{exc}`")
-            return
-
-        await asyncio.to_thread(
-            audit.log_action,
-            str(interaction.user.id),
-            "set_kpi",
-            entity_type="campaign",
-            entity_id=campaign_id,
-            details={
-                "campaign_name": c["name"],
-                "kpi_id": new_kpi["id"],
-                "target_roas": target_roas,
-                "max_cpa": max_cpa,
-                "max_cpl": max_cpl,
-                "monthly_budget": monthly_budget,
-                "target_ctr": target_ctr,
-                "max_cpc": max_cpc,
-                "primary_conversion_event": primary_conversion_event,
-                "no_conversion_critical_days": no_conversion_critical_days,
-                "cpa_spike_critical_pct": cpa_spike_critical_pct,
-                "trend_warning_days": trend_warning_days,
-            },
-        )
-
-        log.info(
-            "KPI beállítva: #%s %s → kpi #%s",
-            campaign_id, c["name"], new_kpi["id"],
-        )
-
-        set_fields = [k for k, v in {
+        set_fields_label = ", ".join(k for k, v in {
             "ROAS cél": target_roas,
             "Max CPA": max_cpa,
             "Max CPL": max_cpl,
@@ -533,12 +510,92 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             "Nincs konv. → CRITICAL": no_conversion_critical_days,
             "CPA ugrás → CRITICAL": cpa_spike_critical_pct,
             "Trend warning": trend_warning_days,
-        }.items() if v is not None]
+        }.items() if v is not None)
+
+        # ---- MULTI mód: campaigns:A,B,C → ugyanaz a KPI mindre ----
+        if campaigns:
+            tokens = [t.strip() for t in campaigns.split(",") if t.strip()]
+            applied: list[str] = []
+            not_found: list[str] = []
+            ambiguous: list[str] = []
+            failed: list[str] = []
+            seen: set[int] = set()
+
+            for tok in tokens:
+                camp = await asyncio.to_thread(campaigns_storage.resolve_campaign, tok)
+                if camp is None:
+                    not_found.append(tok)
+                    continue
+                if camp.get("ambiguous"):
+                    ambiguous.append(tok)
+                    continue
+                if camp["id"] in seen:
+                    continue
+                seen.add(camp["id"])
+                try:
+                    new_kpi = await self._apply_campaign_kpi(interaction, camp, kpi_fields)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("Kampány-KPI hiba (#%s)", camp["id"])
+                    failed.append(f"#{camp['id']} (`{exc}`)")
+                    continue
+                applied.append(f"• #{camp['id']} — {camp['name']} *(kpi #{new_kpi['id']})*")
+
+            if not applied:
+                msg = "❌ Egyetlen kampányra sem sikerült a KPI beállítása."
+                if not_found:
+                    msg += f"\nNem található: {', '.join(not_found)}"
+                if ambiguous:
+                    msg += f"\nTöbbértelmű (adj meg #id-t): {', '.join(ambiguous)}"
+                if failed:
+                    msg += f"\nHiba: {', '.join(failed)}"
+                await interaction.followup.send(msg)
+                return
+
+            msg = f"✅ KPI beállítva {len(applied)} kampányra:\n" + "\n".join(applied)
+            msg += f"\n**Frissített mezők: {set_fields_label}**"
+            if not_found:
+                msg += f"\n⚠️ Nem található: {', '.join(not_found)}"
+            if ambiguous:
+                msg += f"\n⚠️ Többértelmű (adj meg #id-t): {', '.join(ambiguous)}"
+            if failed:
+                msg += f"\n⚠️ Hiba: {', '.join(failed)}"
+            await interaction.followup.send(msg)
+            return
+
+        # ---- EGYES mód: campaign_id ----
+        c = await asyncio.to_thread(campaigns_storage.get_campaign, campaign_id)
+        if c is None:
+            await interaction.followup.send(f"Nincs ilyen kampány: #{campaign_id}")
+            return
+
+        try:
+            new_kpi = await self._apply_campaign_kpi(interaction, c, kpi_fields)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Hiba a KPI beállításakor (#%s)", campaign_id)
+            await interaction.followup.send(f"Hiba a KPI mentésekor: `{exc}`")
+            return
 
         await interaction.followup.send(
             f"✅ KPI-ok beállítva: **#{campaign_id} — {c['name']}** *(kpi #{new_kpi['id']})*\n"
-            f"Frissített mezők: {', '.join(set_fields)}"
+            f"Frissített mezők: {set_fields_label}"
         )
+
+    @kpi.autocomplete("campaigns")
+    async def kpi_campaigns_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """A `campaigns` (vesszős lista) mezőhöz: az UTOLSÓ token alapján keres a
+        kampányok közt, a választott #id-t a már beírt tokenek MÖGÉ fűzi."""
+        parts = (current or "").split(",")
+        active = parts[-1].strip()
+        prefix = ",".join(p.strip() for p in parts[:-1])
+        if prefix:
+            prefix += ","
+        rows = await asyncio.to_thread(campaigns_storage.search_campaigns, active)
+        return [
+            app_commands.Choice(name=f"{r['name']}"[:100], value=f"{prefix}{r['id']}"[:100])
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # /campaign set-state campaign_id:<id> state:<állapot> [until:<dátum>]

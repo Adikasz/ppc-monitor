@@ -114,6 +114,32 @@ def _account_campaign_ids(ad_account_id: int, *, active_only: bool = True) -> li
     return [r["id"] for r in rows]
 
 
+def _kpi_summary_bits(inputs: dict) -> list[str]:
+    """Rövid, ember-olvasható összefoglaló a beállított KPI mezőkből (multi-mód)."""
+    bits: list[str] = []
+    if inputs.get("target_roas") is not None:
+        bits.append(f"ROAS {_pct_int(inputs['target_roas'])}")
+    if inputs.get("max_cpa") is not None:
+        bits.append(f"Max CPA {_money(inputs['max_cpa'])} Ft")
+    if inputs.get("monthly_budget") is not None:
+        bits.append(f"Büdzsé {_money(inputs['monthly_budget'])} Ft")
+    if inputs.get("target_ctr") is not None:
+        bits.append(f"CTR {_pct_int(inputs['target_ctr'])}%")
+    if inputs.get("max_cpc") is not None:
+        bits.append(f"Max CPC {_money(inputs['max_cpc'])} Ft")
+    if inputs.get("max_cpl") is not None:
+        bits.append(f"Max CPL {_money(inputs['max_cpl'])} Ft")
+    if inputs.get("min_ctr") is not None:
+        bits.append(f"Min CTR {_pct_int(inputs['min_ctr'])}%")
+    if inputs.get("max_cpm") is not None:
+        bits.append(f"Max CPM {_money(inputs['max_cpm'])} Ft")
+    if inputs.get("max_frequency") is not None:
+        bits.append(f"Max Freq {_pct_int(inputs['max_frequency'])}")
+    if inputs.get("min_impressions") is not None:
+        bits.append(f"Min Impr {_money(inputs['min_impressions'])}")
+    return bits
+
+
 # ---------------------------------------------------------------------------
 # Cog
 # ---------------------------------------------------------------------------
@@ -682,9 +708,39 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     ) -> list[app_commands.Choice[str]]:
         return await self._account_choices(current)
 
+    async def _apply_account_kpi(
+        self, interaction: discord.Interaction, acct: dict, inputs: dict
+    ) -> dict:
+        """Egy fiókra alkalmazza a KPI-t: upsert + kaszkád + audit. Hibát DOB (hívó kezeli).
+
+        Visszatérés: {"cname", "row", "casc", "written"}.
+        """
+        cname = (await asyncio.to_thread(clients_storage.get_client, acct["client_id"]) or {}).get("name", "?")
+        row = await asyncio.to_thread(
+            ad_account_kpis_storage.upsert_ad_account_kpis, acct["id"], fields=inputs
+        )
+        cascade_values = {
+            f: row[f] for f in ad_account_kpis_storage.CASCADE_FIELDS if row.get(f) is not None
+        }
+        campaign_ids = await asyncio.to_thread(_account_campaign_ids, acct["id"], active_only=True)
+        casc = await asyncio.to_thread(
+            kpis_storage.cascade_account_kpis_to_campaigns,
+            campaign_ids, values=cascade_values,
+            set_by_discord_user_id=str(interaction.user.id),
+        )
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "account_kpi",
+            entity_type="ad_account", entity_id=acct["id"],
+            details={"client_name": cname, "platform": acct["platform"],
+                     "fields": inputs, "cascade": casc},
+        )
+        return {"cname": cname, "row": row, "casc": casc,
+                "written": casc["updated"] + casc["inserted"]}
+
     @app_commands.command(name="kpi", description="Fiók-szintű KPI + lecsorgatás a kampányokra (csak saját #alerts csatorna)")
     @app_commands.describe(
-        account="Fiók: #id, külső azonosító VAGY kliensnév (pl. 2 / act_165… / Stopvill)",
+        account="Egy fiók: #id, külső azonosító VAGY kliensnév (pl. 2 / act_165… / Stopvill)",
+        accounts="Több fiók vesszővel — ugyanaz a KPI mindre: pl. Stopvill,MyMins",
         target_roas="Cél ROAS szorzó (pl. 3.0 = 3×)",
         max_cpa="Max CPA (Ft)",
         monthly_budget="Havi büdzsé (Ft)",
@@ -703,7 +759,8 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     async def kpi(
         self,
         interaction: discord.Interaction,
-        account: str,
+        account: str | None = None,
+        accounts: str | None = None,
         target_roas: float | None = None,
         max_cpa: float | None = None,
         monthly_budget: float | None = None,
@@ -732,16 +789,10 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             )
             return
 
-        acct = await self._resolve_single_account(interaction, account)
-        if acct is None:
-            return
-
-        # Csak a saját (hozzárendelt) fiók módosítható.
-        owned = await asyncio.to_thread(
-            account_assignments_storage.get_account_ids_for_user, channel_owner["id"]
-        )
-        if acct["id"] not in owned:
-            await interaction.followup.send("❌ Ez a fiók nincs hozzád rendelve.")
+        if not account and not accounts:
+            await interaction.followup.send(
+                "❌ Adj meg egy fiókot (`account:`) vagy többet (`accounts:Stopvill,MyMins`)."
+            )
             return
 
         inputs = {k: v for k, v in {
@@ -756,46 +807,88 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             await interaction.followup.send("❌ Adj meg legalább egy KPI mezőt.")
             return
 
-        cname = (await asyncio.to_thread(clients_storage.get_client, acct["client_id"]) or {}).get("name", "?")
-
-        try:
-            row = await asyncio.to_thread(
-                ad_account_kpis_storage.upsert_ad_account_kpis, acct["id"], fields=inputs
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Fiók-KPI mentés hiba (#%s)", acct["id"])
-            await interaction.followup.send(
-                f"❌ Nem sikerült a fiók-KPI mentése: `{exc}`\n"
-                f"Lehet, hogy a `0010_account_level.sql` migráció (ad_account_kpis) még nem futott le."
-            )
-            return
-
-        cascade_values = {
-            f: row[f] for f in ad_account_kpis_storage.CASCADE_FIELDS if row.get(f) is not None
-        }
-        campaign_ids = await asyncio.to_thread(_account_campaign_ids, acct["id"], active_only=True)
-        try:
-            casc = await asyncio.to_thread(
-                kpis_storage.cascade_account_kpis_to_campaigns,
-                campaign_ids, values=cascade_values,
-                set_by_discord_user_id=str(interaction.user.id),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Fiók-KPI kaszkád hiba (#%s)", acct["id"])
-            await interaction.followup.send(
-                f"⚠️ A fiók-KPI elmentve, de a kaszkád hibázott: `{exc}`\n"
-                f"(Lehet, hogy a campaign_kpis `inherited_from_account` oszlop hiányzik — `0010`.)"
-            )
-            return
-
-        await asyncio.to_thread(
-            audit.log_action, str(interaction.user.id), "account_kpi",
-            entity_type="ad_account", entity_id=acct["id"],
-            details={"client_name": cname, "platform": acct["platform"],
-                     "fields": inputs, "cascade": casc},
+        # Csak a saját (hozzárendelt) fiókok módosíthatók.
+        owned = await asyncio.to_thread(
+            account_assignments_storage.get_account_ids_for_user, channel_owner["id"]
         )
 
-        written = casc["updated"] + casc["inserted"]
+        # ---- MULTI mód: accounts:Stopvill,MyMins,... → ugyanaz a KPI mindre ----
+        if accounts:
+            tokens = [t.strip() for t in accounts.split(",") if t.strip()]
+            applied: list[str] = []
+            not_found: list[str] = []
+            not_owned: list[str] = []
+            failed: list[str] = []
+            seen: set[int] = set()
+
+            for tok in tokens:
+                res = await asyncio.to_thread(account_assignments_storage.resolve_accounts, tok)
+                if res["status"] == "not_found":
+                    not_found.append(tok)
+                    continue
+                for acct in res["accounts"]:
+                    if acct["id"] in seen:
+                        continue
+                    seen.add(acct["id"])
+                    if acct["id"] not in owned:
+                        cn = (await asyncio.to_thread(clients_storage.get_client, acct["client_id"]) or {}).get("name", f"#{acct['id']}")
+                        not_owned.append(f"{cn} · {acct['platform']}")
+                        continue
+                    try:
+                        summ = await self._apply_account_kpi(interaction, acct, inputs)
+                    except Exception as exc:  # noqa: BLE001
+                        log.exception("Fiók-KPI hiba (#%s)", acct["id"])
+                        failed.append(f"#{acct['id']} (`{exc}`)")
+                        continue
+                    applied.append(f"• {summ['cname']} · `{acct['platform']}` ({summ['written']} kampány)")
+
+            if not applied:
+                msg = "❌ Egyetlen fiókra sem sikerült a KPI beállítása."
+                if not_found:
+                    msg += f"\nNem található: {', '.join(not_found)}"
+                if not_owned:
+                    msg += f"\nNincs hozzád rendelve: {', '.join(not_owned)}"
+                if failed:
+                    msg += f"\nHiba: {', '.join(failed)}"
+                await interaction.followup.send(msg)
+                return
+
+            set_bits = _kpi_summary_bits(inputs)
+            msg = f"✅ KPI beállítva {len(applied)} fiókra:\n" + "\n".join(applied)
+            if set_bits:
+                msg += f"\n**{' | '.join(set_bits)}**"
+            if not_found:
+                msg += f"\n⚠️ Nem található: {', '.join(not_found)}"
+            if not_owned:
+                msg += f"\n⚠️ Nincs hozzád rendelve: {', '.join(not_owned)}"
+            if failed:
+                msg += f"\n⚠️ Hiba: {', '.join(failed)}"
+            await interaction.followup.send(msg)
+            return
+
+        # ---- EGYES mód: account:<#id | external | kliensnév> ----
+        acct = await self._resolve_single_account(interaction, account)
+        if acct is None:
+            return
+
+        if acct["id"] not in owned:
+            await interaction.followup.send("❌ Ez a fiók nincs hozzád rendelve.")
+            return
+
+        try:
+            summ = await self._apply_account_kpi(interaction, acct, inputs)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Fiók-KPI hiba (#%s)", acct["id"])
+            await interaction.followup.send(
+                f"❌ Nem sikerült a fiók-KPI beállítása: `{exc}`\n"
+                f"Lehet, hogy a `0010_account_level.sql` / `0011` migráció még nem futott le."
+            )
+            return
+
+        cname = summ["cname"]
+        row = summ["row"]
+        casc = summ["casc"]
+        written = summ["written"]
         bits: list[str] = []
         if row.get("target_roas") is not None:
             bits.append(f"ROAS {_pct_int(row['target_roas'])}")
@@ -843,6 +936,28 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         if owner is None:
             return []
         return await self._owned_account_choices(owner, current)
+
+    @kpi.autocomplete("accounts")
+    async def kpi_accounts_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Az `accounts` (vesszős lista) mezőhöz: az UTOLSÓ token alapján, a saját
+        fiókok közül; a választott #id-t a már beírt tokenek MÖGÉ fűzi."""
+        owner = await asyncio.to_thread(
+            users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
+        )
+        if owner is None:
+            return []
+        parts = (current or "").split(",")
+        active = parts[-1].strip()
+        prefix = ",".join(p.strip() for p in parts[:-1])
+        if prefix:
+            prefix += ","
+        base = await self._owned_account_choices(owner, active)
+        return [
+            app_commands.Choice(name=c.name, value=f"{prefix}{c.value}"[:100])
+            for c in base
+        ]
 
 
 async def setup(bot: commands.Bot) -> None:
