@@ -113,10 +113,14 @@ def search_account_choices(query: str, *, limit: int = 25) -> list[dict[str, Any
     """
     q = (query or "").strip()
     sb = get_supabase()
+    # A klienseket is `limit`-ig (25) hozzuk, ne 15-ig — különben tág keresésnél
+    # (vagy üres inputnál) csak az ABC-sorrend elején lévő 15 kliens fiókjai
+    # jelennének meg, pedig 25 találat is kiférne. A szűrés (ILIKE) DB-szinten
+    # fut a limit ELŐTT, így minden illeszkedő kliens bekerül a 25-ös keretig.
     clients = (
         sb.table("clients").select("id, name")
         .ilike("name", f"%{q}%").eq("is_active", True)
-        .order("name").limit(15).execute().data
+        .order("name").limit(limit).execute().data
         or []
     )
     if not clients:

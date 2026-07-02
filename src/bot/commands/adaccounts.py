@@ -568,7 +568,11 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         names = {c["id"]: c["name"] for c in clients}
         q = (current or "").strip().lower()
         choices: list[app_commands.Choice[str]] = []
-        for a in sorted(accounts, key=lambda x: x["id"]):
+        # Alfabetikus (kliensnév) rendezés — üres inputnál is stabil, ABC-sorrend.
+        for a in sorted(
+            accounts,
+            key=lambda x: (names.get(x["client_id"], f"#{x['client_id']}").lower(), x["id"]),
+        ):
             if not a.get("is_active", True):
                 continue
             cname = names.get(a["client_id"], f"#{a['client_id']}")
