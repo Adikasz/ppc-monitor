@@ -238,6 +238,13 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         embed.set_footer(text=footer)
         await interaction.followup.send(embed=embed)
 
+    @list_.autocomplete("client")
+    async def list_client_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        rows = await asyncio.to_thread(clients_storage.search_clients, current, active=None)
+        return [app_commands.Choice(name=r["name"][:100], value=str(r["id"])) for r in rows][:25]
+
     # ------------------------------------------------------------------
     # /account add client:<> platform:<> account_id:<>
     # ------------------------------------------------------------------
@@ -316,6 +323,13 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             f"Ügyfél: **{c['name']}** *(#{row['id']})*\n"
             f"Következő: `/discover client:{c['name']}`, majd `/account assign account:{row['id']} user:@OM`"
         )
+
+    @add.autocomplete("client")
+    async def add_client_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        rows = await asyncio.to_thread(clients_storage.search_clients, current, active=True)
+        return [app_commands.Choice(name=r["name"][:100], value=str(r["id"])) for r in rows][:25]
 
     # ------------------------------------------------------------------
     # /account remove account_id:<>

@@ -331,6 +331,12 @@ class ClientCog(commands.GroupCog, group_name="client"):
         embed.add_field(name="Létrehozva", value=str(c.get("created_at", "—")), inline=False)
         await interaction.followup.send(embed=embed)
 
+    @info.autocomplete("client")
+    async def info_client_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._client_autocomplete(current, active=None)
+
     # ------------------------------------------------------------------
     # /client add name:<> [contact_email:<>]
     # ------------------------------------------------------------------
@@ -446,6 +452,12 @@ class ClientCog(commands.GroupCog, group_name="client"):
         await interaction.followup.send(
             f"✅ **{c['name']}** (id: {c['id']}) insights: {state}"
         )
+
+    @insights.autocomplete("client")
+    async def insights_client_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._client_autocomplete(current, active=None)
 
     # ------------------------------------------------------------------
     # /client onboard name:<> platform:<> account_id:<> [contact_email:<>]
@@ -652,6 +664,12 @@ class ClientCog(commands.GroupCog, group_name="client"):
             f"{deleted} kampány-hozzárendelés törölve"
         )
 
+    @unassign.autocomplete("client")
+    async def unassign_client_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._client_autocomplete(current, active=None)
+
     # ------------------------------------------------------------------
     # /client kpi client:<> [KPI mezők...]
     # ------------------------------------------------------------------
@@ -803,6 +821,12 @@ class ClientCog(commands.GroupCog, group_name="client"):
             + "\n".join(f"　• {line}" for line in per_account)
         )
 
+    @kpi.autocomplete("client")
+    async def kpi_client_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._client_autocomplete(current, active=True)
+
     # ------------------------------------------------------------------
     # /client status client:<név vagy id>
     # ------------------------------------------------------------------
@@ -882,6 +906,12 @@ class ClientCog(commands.GroupCog, group_name="client"):
         embed.add_field(name="🚨 Utolsó alert", value=alert_value, inline=False)
 
         await interaction.followup.send(embed=embed)
+
+    @status.autocomplete("client")
+    async def status_client_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await self._client_autocomplete(current, active=None)
 
     # ==================================================================
     # Lifecycle: offboard / pause / resume / reactivate (25. lépés)

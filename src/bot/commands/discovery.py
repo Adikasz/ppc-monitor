@@ -136,6 +136,13 @@ class DiscoveryCog(commands.GroupCog, group_name="discover"):
             embed.add_field(name="Hibák", value=_format_errors(result["errors"]), inline=False)
         await interaction.followup.send(embed=embed)
 
+    @client.autocomplete("client")
+    async def client_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        rows = await asyncio.to_thread(clients_storage.search_clients, current, active=True)
+        return [app_commands.Choice(name=r["name"][:100], value=str(r["id"])) for r in rows][:25]
+
     # ------------------------------------------------------------------
     # /discover all
     # ------------------------------------------------------------------
