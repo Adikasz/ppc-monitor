@@ -16,13 +16,16 @@ from src.monitoring import summary as s
 TZ = ZoneInfo("Europe/Budapest")
 
 
-def _alert(campaign_id, severity, name, message, detected_at):
+def _alert(campaign_id, severity, name, message, detected_at, ad_account=None):
+    campaigns: dict = {"name": name}
+    if ad_account is not None:
+        campaigns["ad_accounts"] = ad_account
     return {
         "campaign_id": campaign_id,
         "severity": severity,
         "message": message,
         "detected_at": detected_at,
-        "campaigns": {"name": name},
+        "campaigns": campaigns,
     }
 
 
@@ -100,6 +103,63 @@ def test_top_issues_critical_first():
 
     assert res["top_issues"][0]["severity"] == "critical"
     assert res["top_issues"][0]["campaign"] == "A"
+
+
+def test_top_issues_include_client_and_no_account_label_for_single_account():
+    import contextlib
+    frm = datetime(2026, 6, 15, 0, 0, tzinfo=TZ)
+    to = datetime(2026, 6, 16, 0, 0, tzinfo=TZ)
+    ad_account = {
+        "id": 1, "platform": "meta", "external_account_id": "act_111",
+        "account_name": None, "client_id": 5, "clients": {"name": "Stopvill"},
+    }
+    alerts = [_alert(10, "critical", "A", "ROAS 0.00", "2026-06-15T10:00:00+02:00", ad_account)]
+    with contextlib.ExitStack() as stack:
+        _patch(stack, campaign_ids=[10], alerts=alerts)
+        stack.enter_context(mock.patch.object(
+            s.ad_accounts_storage, "get_ad_accounts_for_client", return_value=[ad_account],
+        ))
+        res = s._build_summary_sync(1, frm, to)
+
+    issue = res["top_issues"][0]
+    assert issue["client"] == "Stopvill"
+    assert issue["platform"] == "meta"
+    assert issue["account_label"] is None
+
+
+def test_top_issues_show_account_label_when_client_has_multiple_accounts_same_platform():
+    import contextlib
+    frm = datetime(2026, 6, 15, 0, 0, tzinfo=TZ)
+    to = datetime(2026, 6, 16, 0, 0, tzinfo=TZ)
+    ad_account = {
+        "id": 1, "platform": "meta", "external_account_id": "act_111",
+        "account_name": None, "client_id": 5, "clients": {"name": "Stopvill"},
+    }
+    sibling = {**ad_account, "id": 2, "external_account_id": "act_222"}
+    alerts = [_alert(10, "critical", "A", "ROAS 0.00", "2026-06-15T10:00:00+02:00", ad_account)]
+    with contextlib.ExitStack() as stack:
+        _patch(stack, campaign_ids=[10], alerts=alerts)
+        stack.enter_context(mock.patch.object(
+            s.ad_accounts_storage, "get_ad_accounts_for_client", return_value=[ad_account, sibling],
+        ))
+        res = s._build_summary_sync(1, frm, to)
+
+    assert res["top_issues"][0]["account_label"] == "act_111"
+
+
+def test_format_top_issue_line_with_client_and_account_label():
+    out = _format_summary(
+        {"total_campaigns": 1, "critical_count": 1, "warning_count": 0,
+         "alert_count": 1, "healthy_campaigns": 0,
+         "top_issues": [{
+             "client": "Stopvill", "campaign": "Sales-LEGRAND", "platform": "meta",
+             "account_label": "act_1657", "severity": "critical",
+             "message": "ROAS 0.00 a cél 3.00 alatt",
+         }],
+         "from": "2026-06-15T00:00:00+02:00", "to": "2026-06-16T00:00:00+02:00"},
+        is_weekly=False,
+    )
+    assert "Stopvill [META · act_1657] — Sales-LEGRAND — ROAS 0.00 a cél 3.00 alatt" in out
 
 
 def test_build_summary_no_alerts():

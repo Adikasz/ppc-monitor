@@ -292,9 +292,18 @@ def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
         lines.append("")
         lines.append(issues_title)
         for issue in top_issues:
+            client = issue.get("client") or "?"
             plat = issue.get("platform")
-            tag = f" [{plat.upper()}]" if plat else ""
-            lines.append(f"• {issue.get('campaign', '?')}{tag} — {issue.get('message', '')}")
+            account_label = issue.get("account_label")
+            if plat and account_label:
+                tag = f" [{plat.upper()} · {account_label}]"
+            elif plat:
+                tag = f" [{plat.upper()}]"
+            else:
+                tag = ""
+            lines.append(
+                f"• {client}{tag} — {issue.get('campaign', '?')} — {issue.get('message', '')}"
+            )
 
     lines.append("")
     lines.append(f"**Kampányok figyelve:** {total}  |  **{alerts_label}:** {alert_count}")

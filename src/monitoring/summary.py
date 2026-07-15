@@ -19,6 +19,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.config import get_config
+from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import alerts as alerts_storage
 from src.storage import assignments as assignments_storage
 from src.utils.logging import get_logger
@@ -59,6 +60,34 @@ def weekend_range(now: datetime | None = None) -> tuple[datetime, datetime]:
     return friday, monday
 
 
+def _multi_account_label(
+    ad_account: dict[str, Any],
+    cache: dict[tuple[int, str], int],
+) -> str | None:
+    """Fiók-megkülönböztető címke, ha az ügyfélnek 2+ fiókja van ugyanazon a platformon.
+
+    None-t ad vissza, ha a kliensnek csak 1 fiókja van az adott platformon
+    (redundáns lenne kiírni). A `cache` elkerüli az ismételt lekérdezést
+    ugyanarra a (client_id, platform) párra egy összefoglaló-generáláson belül.
+    """
+    client_id = ad_account.get("client_id")
+    platform = ad_account.get("platform")
+    if client_id is None or not platform:
+        return None
+
+    key = (client_id, platform)
+    if key not in cache:
+        siblings = ad_accounts_storage.get_ad_accounts_for_client(
+            client_id, platform=platform, active_only=False
+        )
+        cache[key] = len(siblings)
+
+    if cache[key] < 2:
+        return None
+
+    return ad_account.get("account_name") or ad_account.get("external_account_id") or "?"
+
+
 def _build_summary_sync(user_id: int, from_dt: datetime, to_dt: datetime) -> dict[str, Any]:
     """Szinkron összesítés (to_thread-ből hívva)."""
     campaign_ids = assignments_storage.get_campaign_ids_for_user(user_id)
@@ -76,15 +105,20 @@ def _build_summary_sync(user_id: int, from_dt: datetime, to_dt: datetime) -> dic
         alerts,
         key=lambda a: _SEVERITY_RANK.get((a.get("severity") or "").lower(), 99),
     )
-    top_issues = [
-        {
-            "campaign": (a.get("campaigns") or {}).get("name") or f"#{a.get('campaign_id')}",
-            "platform": ((a.get("campaigns") or {}).get("ad_accounts") or {}).get("platform"),
+    account_cache: dict[tuple[int, str], int] = {}
+    top_issues = []
+    for a in ordered[:_TOP_ISSUES_LIMIT]:
+        campaign = a.get("campaigns") or {}
+        ad_account = campaign.get("ad_accounts") or {}
+        client = ad_account.get("clients") or {}
+        top_issues.append({
+            "client": client.get("name"),
+            "campaign": campaign.get("name") or f"#{a.get('campaign_id')}",
+            "platform": ad_account.get("platform"),
+            "account_label": _multi_account_label(ad_account, account_cache),
             "severity": (a.get("severity") or "").lower(),
             "message": a.get("message") or a.get("metric") or "",
-        }
-        for a in ordered[:_TOP_ISSUES_LIMIT]
-    ]
+        })
 
     campaigns_with_alerts = {a.get("campaign_id") for a in alerts if a.get("campaign_id") is not None}
     healthy_campaigns = max(0, total_campaigns - len(campaigns_with_alerts & set(campaign_ids)))
