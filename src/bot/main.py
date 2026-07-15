@@ -13,6 +13,7 @@ Indítás:
 """
 from __future__ import annotations
 
+import os
 import traceback
 
 import discord
@@ -132,7 +133,8 @@ def build_bot() -> commands.Bot:
 def main() -> None:
     config = get_config()
     bot = build_bot()
-    log.info("Discord bot indítása…")
+    commit = os.getenv("RAILWAY_GIT_COMMIT_SHA", "")[:7] or "?"
+    log.info("Discord bot indítása… (commit=%s)", commit)
     bot.run(config.discord_bot_token, log_handler=None)
 
 
