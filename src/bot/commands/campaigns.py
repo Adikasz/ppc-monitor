@@ -194,7 +194,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
     # /campaign info campaign_id:<id>
     # ------------------------------------------------------------------
     @app_commands.command(name="info", description="Egy kampány részletei és aktuális KPI-ok")
-    @app_commands.describe(campaign_id="A kampány numerikus azonosítója")
+    @app_commands.describe(campaign_id="A kampány numerikus azonosítója (autocomplete: gépeld a nevét)")
     async def info(
         self,
         interaction: discord.Interaction,
@@ -265,6 +265,19 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
 
         embed.add_field(name="Létrehozva", value=str(c.get("created_at", "—")), inline=False)
         await interaction.followup.send(embed=embed)
+
+    @info.autocomplete("campaign_id")
+    async def info_campaign_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[int]]:
+        rows = await asyncio.to_thread(campaigns_storage.search_campaigns, current)
+        return [
+            app_commands.Choice(
+                name=f"#{r['id']} {r['name']} ({r['lifecycle_state']})"[:100],
+                value=int(r["id"]),
+            )
+            for r in rows
+        ][:25]
 
     # ------------------------------------------------------------------
     # /campaign add client_name:<név> platform:<meta|google> account_id:<...>
@@ -465,7 +478,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
 
     @app_commands.command(name="kpi", description="KPI-ok beállítása kampány(ok)hoz (verziózott)")
     @app_commands.describe(
-        campaign_id="Egy kampány numerikus azonosítója",
+        campaign_id="Egy kampány numerikus azonosítója (autocomplete: gépeld a nevét)",
         campaigns="Több kampány vesszővel (név vagy #id) — ugyanaz a KPI mindre: pl. A,B,C",
         target_roas="Célzott ROAS (%)",
         max_cpa="Max megengedett CPA (Ft)",
@@ -602,6 +615,19 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             f"Frissített mezők: {set_fields_label}"
         )
 
+    @kpi.autocomplete("campaign_id")
+    async def kpi_campaign_id_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[int]]:
+        rows = await asyncio.to_thread(campaigns_storage.search_campaigns, current)
+        return [
+            app_commands.Choice(
+                name=f"#{r['id']} {r['name']} ({r['lifecycle_state']})"[:100],
+                value=int(r["id"]),
+            )
+            for r in rows
+        ][:25]
+
     @kpi.autocomplete("campaigns")
     async def kpi_campaigns_autocomplete(
         self, interaction: discord.Interaction, current: str
@@ -624,7 +650,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
     # ------------------------------------------------------------------
     @app_commands.command(name="set-state", description="Kampány lifecycle állapot beállítása")
     @app_commands.describe(
-        campaign_id="A kampány numerikus azonosítója",
+        campaign_id="A kampány numerikus azonosítója (autocomplete: gépeld a nevét)",
         state="Új lifecycle állapot",
         until="Opcionális lejárati dátum (YYYY-MM-DD), pl. learning → ennyi ideig tart",
     )
@@ -697,6 +723,19 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             f"{_lifecycle_emoji(state)} **#{campaign_id} — {c['name']}** lifecycle beállítva: "
             f"`{old_state}` → `{state}`{until_str}"
         )
+
+    @set_state.autocomplete("campaign_id")
+    async def set_state_campaign_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[int]]:
+        rows = await asyncio.to_thread(campaigns_storage.search_campaigns, current)
+        return [
+            app_commands.Choice(
+                name=f"#{r['id']} {r['name']} ({r['lifecycle_state']})"[:100],
+                value=int(r["id"]),
+            )
+            for r in rows
+        ][:25]
 
     # ------------------------------------------------------------------
     # /campaign add-supporter campaign_id:<id> supporter:<@user>

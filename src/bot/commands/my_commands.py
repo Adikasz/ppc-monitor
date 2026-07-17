@@ -173,6 +173,41 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
                 break
         return choices
 
+    async def _owned_campaign_choices(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[int]]:
+        """Kampány-autocomplete (int érték) `campaign_id` mezőkhöz: a namespace
+        `account` mezőjéből feloldott, SAJÁT (egyértelmű) fiók nem-'ended'
+        kampányai. Ha még nincs egyértelműen saját fiók kiválasztva, üres lista
+        — ugyanaz a logika, mint a `/my lifecycle` `campaign` autocomplete-jénél."""
+        owner = await asyncio.to_thread(_channel_owner, interaction.channel_id)
+        if owner is None:
+            return []
+        account_val = interaction.namespace.account
+        if not account_val:
+            return []
+
+        res = await asyncio.to_thread(
+            account_assignments_storage.resolve_accounts, str(account_val)
+        )
+        if res["status"] != "ok" or not res.get("accounts"):
+            return []
+        owned = await asyncio.to_thread(
+            account_assignments_storage.get_account_ids_for_user, owner["id"]
+        )
+        mine = [a for a in res["accounts"] if a["id"] in owned]
+        if len(mine) != 1:
+            return []
+        account_id = mine[0]["id"]
+
+        rows = await asyncio.to_thread(
+            campaigns_storage.search_campaign_choices, account_id, current or ""
+        )
+        return [
+            app_commands.Choice(name=c["name"][:100], value=int(c["id"]))
+            for c in rows
+        ][:25]
+
     # ------------------------------------------------------------------
     # /my accounts
     # ------------------------------------------------------------------
@@ -347,7 +382,8 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
     @app_commands.describe(
         account="Saját fiók: #id, külső azonosító VAGY kliensnév (a `/my accounts` mutatja)",
         hours="Hány órára némítsd",
-        campaign_id="Opcionális: csak ez a kampány (egyébként a fiók összes kampánya)",
+        campaign_id="Opcionális: csak ez a kampány (autocomplete: gépeld a nevét — a fiók "
+                    "kiválasztása után), egyébként a fiók összes kampánya",
     )
     async def mute(
         self,
@@ -395,13 +431,20 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
     ) -> list[app_commands.Choice[str]]:
         return await self._owned_account_choices(interaction, current)
 
+    @mute.autocomplete("campaign_id")
+    async def mute_campaign_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[int]]:
+        return await self._owned_campaign_choices(interaction, current)
+
     # ------------------------------------------------------------------
     # /my unmute account:<#id> [campaign_id:<>]
     # ------------------------------------------------------------------
     @app_commands.command(name="unmute", description="Némítás korai feloldása")
     @app_commands.describe(
         account="Saját fiók: #id, külső azonosító VAGY kliensnév (a `/my accounts` mutatja)",
-        campaign_id="Opcionális: csak ez a kampány (egyébként a fiók összes kampánya)",
+        campaign_id="Opcionális: csak ez a kampány (autocomplete: gépeld a nevét — a fiók "
+                    "kiválasztása után), egyébként a fiók összes kampánya",
     )
     async def unmute(
         self,
@@ -438,6 +481,12 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         return await self._owned_account_choices(interaction, current)
+
+    @unmute.autocomplete("campaign_id")
+    async def unmute_campaign_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[int]]:
+        return await self._owned_campaign_choices(interaction, current)
 
     # ------------------------------------------------------------------
     # /my lifecycle account:<#id> campaign_id:<> state:<>
