@@ -322,6 +322,22 @@ async def send_summary_to_user(
     Visszatérés: {"channel_id", "message_id"} siker esetén, különben None.
     """
     channel_id = user.get("alerts_channel_id") or get_config().discord_admin_channel_id
+
+    # Üzleti szándék: az admin csatorna NE kapjon napi/heti összefoglalót (sem
+    # a saját alerts_channel_id-ja miatt, sem a fallback miatt) — csak a hozzá
+    # nem rendelt kampányok CRITICAL alert-fallbackja mehet oda (az a
+    # `router.route_alert`-en megy, ezt a függvényt nem érinti). A
+    # `_parse_channel_id`-vel normalizálva hasonlítunk, mert a
+    # DISCORD_ADMIN_CHANNEL_ID-t korábban már belapátolták teljes URL-ként is
+    # (lásd `_parse_channel_id` docstring) — nyers string-egyezés ezt kihagyná.
+    admin_channel_id = _parse_channel_id(get_config().discord_admin_channel_id)
+    if admin_channel_id is not None and _parse_channel_id(channel_id) == admin_channel_id:
+        log.info(
+            "Összefoglaló kihagyva (user #%s) — a célcsatorna az admin csatorna",
+            user.get("id"),
+        )
+        return None
+
     channel = await _resolve_channel(channel_id)
     if channel is None:
         log.warning(

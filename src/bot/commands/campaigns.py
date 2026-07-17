@@ -101,6 +101,18 @@ def _fmt_kpi(label: str, value: object, unit: str = "") -> str:
     return f"{label}: {value}{unit}"
 
 
+def _resolve_client(value: str) -> dict | None:
+    """Ügyfél feloldása név VAGY numerikus ID alapján (autocomplete a #id-t adja át)."""
+    val = (value or "").strip()
+    if not val:
+        return None
+    if val.isdigit():
+        row = clients_storage.get_client(int(val))
+        if row is not None:
+            return row
+    return clients_storage.get_client_by_name(val)
+
+
 # ---------------------------------------------------------------------------
 # Cog
 # ---------------------------------------------------------------------------
@@ -123,9 +135,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
-        client = await asyncio.to_thread(
-            clients_storage.get_client_by_name, client_name.strip()
-        )
+        client = await asyncio.to_thread(_resolve_client, client_name)
         if client is None:
             await interaction.followup.send(
                 f"Nem található ügyfél: **{client_name}**\n"
@@ -172,6 +182,13 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
         else:
             embed.set_footer(text=f"Összesen: {len(rows)} kampány")
         await interaction.followup.send(embed=embed)
+
+    @list_.autocomplete("client_name")
+    async def list_client_name_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        rows = await asyncio.to_thread(clients_storage.search_clients, current, active=None)
+        return [app_commands.Choice(name=r["name"][:100], value=str(r["id"])) for r in rows][:25]
 
     # ------------------------------------------------------------------
     # /campaign info campaign_id:<id>
@@ -295,9 +312,7 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             return
 
         # Ügyfél ellenőrzése — to_thread: nem blokkolja az event loop-ot
-        client = await asyncio.to_thread(
-            clients_storage.get_client_by_name, client_name.strip()
-        )
+        client = await asyncio.to_thread(_resolve_client, client_name)
         log.info("Ügyfél keresés eredménye: %r", client)
         if client is None:
             await interaction.followup.send(
@@ -359,6 +374,13 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             f"Következő lépés: futtasd a discovery-t:\n"
             f"`python -m scripts.run_discovery --client-name {client['name']}`"
         )
+
+    @add.autocomplete("client_name")
+    async def add_client_name_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        rows = await asyncio.to_thread(clients_storage.search_clients, current, active=True)
+        return [app_commands.Choice(name=r["name"][:100], value=str(r["id"])) for r in rows][:25]
 
     # ------------------------------------------------------------------
     # /campaign tag campaign_id:<id> type:<típus>
