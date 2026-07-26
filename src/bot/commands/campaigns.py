@@ -45,6 +45,7 @@ from src.storage import users as users_storage
 from src.storage import audit
 from src.storage.supabase_client import get_supabase
 from src.utils.logging import get_logger
+from src.utils.paginator import Paginator
 
 log = get_logger(__name__)
 
@@ -152,8 +153,10 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
             return
 
         # Description-alapú lista (NEM mezőnként): a Discord embed max. 25 mezőt
-        # enged, így sok kampánynál (pl. Stopvill 36 db) a mezős változat hibára
-        # futna. A description 4096 karakterig bír — ha túlcsordul, csonkítunk.
+        # enged, így sok kampánynál a mezős változat hibára futna.
+        # A description 4096 karakterig bír — ezért a lista GOMBOKKAL LAPOZHATÓ
+        # (Paginator). Korábban itt egyszerű csonkítás volt, ami nagy fiókoknál
+        # (pl. Brands_Marquard Media: 895 kampány) 895-ből csak ~35 sort mutatott.
         lines: list[str] = []
         for c in rows:
             state = c.get("lifecycle_state", "?")
@@ -164,24 +167,17 @@ class CampaignsCog(commands.GroupCog, group_name="campaign"):
                 f"　`{state}` · 🖥 `{platform}` · típus: `{campaign_type}`"
             )
 
-        description = ""
-        shown = 0
-        for line in lines:
-            if len(description) + len(line) + 1 > 3900:  # biztonsági margó a 4096 limit alá
-                break
-            description += line + "\n"
-            shown += 1
-
-        embed = discord.Embed(
+        view = Paginator(
+            lines,
             title=f"📊 {client['name']} — kampányok",
-            description=description or "—",
+            owner_id=interaction.user.id,
             color=discord.Color.blue(),
+            total_label="kampány",
         )
-        if shown < len(rows):
-            embed.set_footer(text=f"{shown}/{len(rows)} kampány megjelenítve (a többi nem fért ki)")
-        else:
-            embed.set_footer(text=f"Összesen: {len(rows)} kampány")
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(
+            embed=view.current_embed(),
+            view=view if view.is_paginated else discord.utils.MISSING,
+        )
 
     @list_.autocomplete("client_name")
     async def list_client_name_autocomplete(

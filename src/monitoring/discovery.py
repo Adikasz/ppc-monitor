@@ -339,16 +339,30 @@ def _deactivate_stale(
     """Soft-delete azokra a kampányokra, amelyeket nem láttunk 24+ óra óta."""
     sb = get_supabase()
 
-    # Összes monitored kampány lekérése ehhez a fiókhoz
-    monitored_res = (
-        sb.table("campaigns")
-        .select("id, external_campaign_id, last_seen_at")
-        .eq("ad_account_id", db_account_id)
-        .eq("is_monitored", True)
-        .execute()
-    )
+    # Összes monitored kampány lekérése ehhez a fiókhoz.
+    # Lapozás: a PostgREST max 1000 sort ad vissza kérésenként — enélkül egy
+    # 1000+ kampányos fiók maradék kampányait sosem néznénk meg.
+    page = 1000
+    start = 0
+    monitored_rows: list[dict[str, Any]] = []
+    while True:
+        rows = (
+            sb.table("campaigns")
+            .select("id, external_campaign_id, last_seen_at")
+            .eq("ad_account_id", db_account_id)
+            .eq("is_monitored", True)
+            .order("id")
+            .range(start, start + page - 1)
+            .execute()
+            .data
+            or []
+        )
+        monitored_rows.extend(rows)
+        if len(rows) < page:
+            break
+        start += page
 
-    for row in (monitored_res.data or []):
+    for row in monitored_rows:
         # Ha a most látott API kampányok között szerepel, hagyjuk
         if row["external_campaign_id"] in api_campaign_ids:
             continue

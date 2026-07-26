@@ -69,16 +69,29 @@ def list_campaigns(
     if not account_ids:
         return []
 
-    # 2) Kampányok lekérdezése ezen fiók-ID-kra
-    query = (
-        sb.table(_TABLE)
-        .select("*")
-        .in_("ad_account_id", account_ids)
-        .order("name")
-    )
-    if active_only:
-        query = query.neq("lifecycle_state", "ended")
-    return query.execute().data or []
+    # 2) Kampányok lekérdezése ezen fiók-ID-kra.
+    #    Lapozás: a PostgREST egy kérésre max 1000 sort ad vissza. Egy nagy
+    #    ügyfél (vagy több fiók összege) ezt átlépheti — `range()`-dzsel addig
+    #    lapozunk, amíg egy oldal 1000-nél kevesebbet ad.
+    page = 1000
+    start = 0
+    out: list[dict[str, Any]] = []
+    while True:
+        query = (
+            sb.table(_TABLE)
+            .select("*")
+            .in_("ad_account_id", account_ids)
+            .order("name")
+            .order("id")
+        )
+        if active_only:
+            query = query.neq("lifecycle_state", "ended")
+        rows = query.range(start, start + page - 1).execute().data or []
+        out.extend(rows)
+        if len(rows) < page:
+            break
+        start += page
+    return out
 
 
 def get_campaign(campaign_id: int) -> dict[str, Any] | None:
@@ -99,16 +112,31 @@ def get_campaigns_by_ad_account(ad_account_id: int) -> list[dict[str, Any]]:
 
     Auto-discovery és fetcher használja — a monitored + nem-monitored
     kampányokat egyaránt visszaadja (a szűrést a hívó végzi).
+
+    Lapozás: a PostgREST 1000-es sorlimitje egy nagy fiókot levágna, ezért
+    `range()`-dzsel addig lapozunk, amíg egy oldal 1000-nél kevesebbet ad.
     """
-    res = (
-        get_supabase()
-        .table(_TABLE)
-        .select("*")
-        .eq("ad_account_id", ad_account_id)
-        .order("name")
-        .execute()
-    )
-    return res.data or []
+    page = 1000
+    start = 0
+    out: list[dict[str, Any]] = []
+    while True:
+        rows = (
+            get_supabase()
+            .table(_TABLE)
+            .select("*")
+            .eq("ad_account_id", ad_account_id)
+            .order("name")
+            .order("id")
+            .range(start, start + page - 1)
+            .execute()
+            .data
+            or []
+        )
+        out.extend(rows)
+        if len(rows) < page:
+            break
+        start += page
+    return out
 
 
 # ---------------------------------------------------------------------------
