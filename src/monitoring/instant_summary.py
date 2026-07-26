@@ -1,18 +1,27 @@
-"""Azonnali (real-time) fiók-összefoglaló — `/account summary-now`.
+"""Azonnali (real-time) összefoglaló — `/account summary-now` és `/my summary-now`.
 
 Különbség a `/summary type:daily`-hoz képest:
 
     /summary daily      — NEM indít adatlekérést; a MÁR TÁROLT alertekből
                           épít összefoglalót az utolsó lezárt napra (tegnap).
     /account summary-now — ÉLŐBEN lehúzza a MAI adatokat a platform API-ból
-                          (1 batch hívás / fiók), lefuttatja rajtuk ugyanazt
+    /my summary-now       (1 batch hívás / fiók), lefuttatja rajtuk ugyanazt
                           az anomália-detektort, mint az óránkénti ciklus, és
                           azonnal visszaadja az eredményt.
 
-Hatókör — SZÁNDÉKOSAN egy fiók:
-    A teljes flotta ~100 ad_account, fiókonként egy batch API hívással ez
-    3-5 percet és ~100 hívást jelentene egyetlen parancsra. Egy fiókra
-    viszont 1 hívás és néhány másodperc. Ezért a parancs fiók-szintű.
+Hatókör:
+    `/account summary-now` — SZÁNDÉKOSAN egy fiók. A teljes flotta ~100
+    ad_account, fiókonként egy batch API hívással ez 3-5 percet és ~100
+    hívást jelentene egyetlen parancsra. Egy fiókra viszont 1 hívás és
+    néhány másodperc.
+
+    `/my summary-now` — egy OM ÖSSZES hozzárendelt fiókja (élő mérésben
+    átlag ~10 fiók/OM). Ez a `generate_instant_summary_for_accounts`
+    KORLÁTOZOTT PÁRHUZAMOSSÁGGAL (lásd `_MAX_CONCURRENT_ACCOUNTS`) futtatja
+    a fiókonkénti lekéréseket — soros végrehajtással 10 fiókra 10-30
+    másodperc jönne össze (fiókonként 1-3 mp), ami rossz UX, bár a Discord
+    followup token 15 percig érvényes (nem a 3 mp-es kezdeti ACK a szűk
+    keresztmetszet, azt a parancs `defer()`-je már lekezeli).
 
 MELLÉKHATÁS-MENTES (fontos):
     Ez egy read-only health check. NEM ír a campaign_insights táblába, NEM
@@ -43,6 +52,11 @@ log = get_logger(__name__)
 # Ugyanaz a rangsor, mint a napi összefoglalóban.
 _SEVERITY_RANK = {"critical": 0, "warning": 1, "insight": 2}
 _TOP_ISSUES_LIMIT = 5
+
+# /my summary-now: ennyi fiók lekérése futhat egyszerre. Egy OM-nek átlag
+# ~10 fiókja van — 5-ös konkurenciával ez ~2 hullámban fut le (kb. a
+# leglassabb fiók 2×-e, nem a fiókok számának összege).
+_MAX_CONCURRENT_ACCOUNTS = 5
 
 # Ezekben az állapotokban lévő kampányokat a detektor amúgy is kihagyná —
 # az élő lekérés előtt szűrjük ki őket, hogy a "figyelt kampány" szám valós legyen.
@@ -259,6 +273,231 @@ def format_instant_summary(summary: dict[str, Any]) -> str:
     lines.append(
         f"**Kampányok figyelve:** {total} "
         f"(ma adattal: {with_data})  |  **Anomáliák most:** {alert_count}"
+    )
+    lines.append(
+        "─────────────\n"
+        "*A nap még nem zárult le — ezek élő, részleges napi adatok. "
+        "Riasztás nem került rögzítésre, ez csak pillanatkép.*"
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Több fiók összesítve — `/my summary-now`
+# ---------------------------------------------------------------------------
+
+async def generate_instant_summary_for_accounts(
+    accounts: list[dict[str, Any]],
+    *,
+    client_names: dict[int, str] | None = None,
+    max_concurrency: int = _MAX_CONCURRENT_ACCOUNTS,
+) -> dict[str, Any]:
+    """Több fiók azonnali összefoglalója, KORLÁTOZOTT PÁRHUZAMOSSÁGGAL.
+
+    Az `/my summary-now` ezt hívja az OM összes hozzárendelt fiókjára.
+    Soros végrehajtással 10 fiókra (fiókonként 1-3 mp) 10-30 másodperc jönne
+    össze; `max_concurrency` egyszerre futó lekéréssel ez kb. a leglassabb
+    fiók futásidejének 2×-ére csökken, nem a fiókok számának összegére.
+
+    Hiba-izoláció: EGY fiók API hibája (pl. lejárt token, jogosultsági hiba)
+    NEM buktatja meg a többit — a hibás fiók az `errors` listába kerül, a
+    többi eredmény érvényes marad (ugyanaz a minta, mint a
+    `discover_campaigns_for_client` fault isolation-jénél).
+
+    Visszatérés:
+        {
+            "accounts_total":  int,   — hány fiókra próbáltunk lekérni
+            "accounts_ok":     int,   — hány sikerült
+            "accounts_failed": int,
+            "errors":          [{"account_label": str, "error": str}, ...],
+            "total_campaigns": int,   — az összes SIKERES fiók figyelt kampányainak összege
+            "campaigns_with_data": int,
+            "critical_count":  int,
+            "warning_count":   int,
+            "healthy_campaigns": int,
+            "alert_count":     int,
+            "spend_today":     float,
+            "per_account":     [...],  — fiókonkénti bontás (csak a sikeresek)
+            "top_issues":      [...],  — összesített, súlyosság szerint rendezve
+            "fetched_at":      str,
+            "is_live":         True,
+        }
+    """
+    client_names = client_names or {}
+    tz = ZoneInfo(get_config().timezone or "UTC")
+    now = datetime.now(tz)
+
+    if not accounts:
+        return {
+            "accounts_total": 0, "accounts_ok": 0, "accounts_failed": 0,
+            "errors": [], "total_campaigns": 0, "campaigns_with_data": 0,
+            "critical_count": 0, "warning_count": 0, "healthy_campaigns": 0,
+            "alert_count": 0, "spend_today": 0.0, "per_account": [],
+            "top_issues": [], "fetched_at": now.isoformat(), "is_live": True,
+        }
+
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def _one(acct: dict[str, Any]) -> tuple[str, dict[str, Any], Any]:
+        label = acct.get("account_name") or acct.get("external_account_id") or f"#{acct.get('id')}"
+        async with sem:
+            try:
+                s = await generate_instant_account_summary(
+                    acct, client_name=client_names.get(acct.get("client_id"))
+                )
+                return ("ok", acct, s)
+            except Exception as exc:  # noqa: BLE001 — egy fiók hibája ne bukjon meg mindent
+                log.error(
+                    "Azonnali (multi) összefoglaló: fiók hiba (%s): %s", label, exc,
+                )
+                return ("error", acct, str(exc))
+
+    results = await asyncio.gather(*[_one(a) for a in accounts])
+
+    ok = [(a, s) for status, a, s in results if status == "ok"]
+    failed = [(a, err) for status, a, err in results if status == "error"]
+
+    top_issues_all: list[dict[str, Any]] = []
+    per_account: list[dict[str, Any]] = []
+    total_campaigns = campaigns_with_data = critical = warning = healthy = alert_count = 0
+    spend_today = 0.0
+
+    for acct, s in ok:
+        total_campaigns += s["total_campaigns"]
+        campaigns_with_data += s["campaigns_with_data"]
+        critical += s["critical_count"]
+        warning += s["warning_count"]
+        healthy += s["healthy_campaigns"]
+        alert_count += s["alert_count"]
+        spend_today += s["spend_today"]
+        top_issues_all.extend(s["top_issues"])
+        per_account.append({
+            "account_label": s["account_label"],
+            "platform": s["platform"],
+            "total_campaigns": s["total_campaigns"],
+            "critical_count": s["critical_count"],
+            "warning_count": s["warning_count"],
+            "alert_count": s["alert_count"],
+        })
+
+    top_issues_all.sort(
+        key=lambda i: _SEVERITY_RANK.get((i.get("severity") or "").lower(), 99)
+    )
+
+    return {
+        "accounts_total": len(accounts),
+        "accounts_ok": len(ok),
+        "accounts_failed": len(failed),
+        "errors": [
+            {
+                "account_label": a.get("account_name") or a.get("external_account_id"),
+                "error": err,
+            }
+            for a, err in failed
+        ],
+        "total_campaigns": total_campaigns,
+        "campaigns_with_data": campaigns_with_data,
+        "critical_count": critical,
+        "warning_count": warning,
+        "healthy_campaigns": healthy,
+        "alert_count": alert_count,
+        "spend_today": round(spend_today, 2),
+        "per_account": per_account,
+        "top_issues": top_issues_all[:_TOP_ISSUES_LIMIT],
+        "fetched_at": now.isoformat(),
+        "is_live": True,
+    }
+
+
+def format_instant_summary_multi(summary: dict[str, Any], *, owner_label: str | None = None) -> str:
+    """Az `/my summary-now` (több fiók) Discord-szövege.
+
+    Fiókonkénti bontást csak a PROBLÉMÁS fiókokra mutat (sok fióknál a "minden
+    OK" sorok zajt jelentenének) — a rendben lévő fiókok darabszáma összesítve
+    jelenik meg.
+    """
+    total_accounts = summary.get("accounts_total", 0)
+    ok_accounts = summary.get("accounts_ok", 0)
+    failed = summary.get("errors") or []
+    total = summary.get("total_campaigns", 0)
+    with_data = summary.get("campaigns_with_data", 0)
+    crit = summary.get("critical_count", 0)
+    warn = summary.get("warning_count", 0)
+    healthy = summary.get("healthy_campaigns", 0)
+    alert_count = summary.get("alert_count", 0)
+    spend = summary.get("spend_today", 0.0)
+    top_issues = summary.get("top_issues") or []
+    per_account = summary.get("per_account") or []
+
+    fetched = str(summary.get("fetched_at") or "")[:16].replace("T", " ")
+    spend_str = f"{spend:,.0f}".replace(",", " ")
+    who = f" — {owner_label}" if owner_label else ""
+
+    header = f"⚡ **Azonnali összefoglaló{who}** — {ok_accounts}/{total_accounts} fiók"
+    meta_line = f"🔄 *Élő adat, lekérve: {fetched}* · mai összköltés: **{spend_str}**"
+
+    lines = [header, meta_line, ""]
+
+    if failed:
+        lines.append(
+            f"⚠️ {len(failed)} fióknál nem sikerült az élő lekérés: "
+            + ", ".join(f"{e['account_label']}" for e in failed)
+        )
+        lines.append("")
+
+    if ok_accounts == 0:
+        lines.append("❌ Egyik fiókra sem sikerült élő adatot lekérni.")
+        return "\n".join(lines)
+
+    if with_data == 0:
+        lines.append(
+            f"ℹ️ Ma még egyik figyelt kampányra sincs adat a platform API-ban "
+            f"(**{total}** figyelt kampány, {ok_accounts} fiókon)."
+        )
+        return "\n".join(lines)
+
+    if alert_count == 0:
+        lines[0] = f"✅ {header}"
+        lines.append(
+            f"Jelenleg nincs anomália egyik fiókban sem. Mind a **{with_data}** "
+            f"ma adatot adó kampány rendben. 🎉"
+        )
+        lines.append(f"**Kampányok figyelve összesen:** {total}")
+        return "\n".join(lines)
+
+    lines.append(
+        f"🔴 Kritikus: {crit}  |  🟡 Figyelmeztetés: {warn}  |  ✅ Egészséges: {healthy}"
+    )
+
+    problem_accounts = [a for a in per_account if a["alert_count"] > 0]
+    if problem_accounts:
+        lines.append("")
+        lines.append("**Fiókonkénti bontás (csak problémás fiókok):**")
+        for a in sorted(problem_accounts, key=lambda a: -a["critical_count"]):
+            lines.append(
+                f"• {a['account_label']} [{a['platform'].upper()}] — "
+                f"🔴 {a['critical_count']} · 🟡 {a['warning_count']} "
+                f"({a['total_campaigns']} kampány figyelve)"
+            )
+        n_clean = ok_accounts - len(problem_accounts)
+        if n_clean > 0:
+            lines.append(f"　+ {n_clean} fiók rendben")
+
+    if top_issues:
+        lines.append("")
+        lines.append("**Top problémák MOST (összes fiókból):**")
+        for issue in top_issues:
+            client = issue.get("client") or "?"
+            account_label = issue.get("account_label")
+            tag = f" [{account_label}]" if account_label else ""
+            lines.append(
+                f"• {client}{tag} — {issue.get('campaign', '?')} — {issue.get('message', '')}"
+            )
+
+    lines.append("")
+    lines.append(
+        f"**Kampányok figyelve:** {total} (ma adattal: {with_data})  |  "
+        f"**Anomáliák most:** {alert_count}"
     )
     lines.append(
         "─────────────\n"

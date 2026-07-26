@@ -13,6 +13,13 @@ Parancsok:
     /my lifecycle account:<#id> campaign:<név|#id> state:<>  — lifecycle állítás
     /my insights  account:<#id> enabled:<bool>      — insight kapcsoló
     /my summary   [type:daily|weekly]               — saját összefoglaló
+    /my summary-now                                 — azonnali (élő) pillanatkép
+                                                       az összes saját fiókra
+
+A `/my summary-now` a `/my summary`-vel szemben nem a tárolt, tegnapi
+alertekből dolgozik, hanem élőben lekéri a mai adatokat MINDEN hozzárendelt
+fiókra (korlátozott párhuzamossággal), és read-only pillanatképet ad — nem
+rögzít alertet és nem küld riasztást.
 
 Jogosultság: minden parancs CSAK az OM-hez rendelt fiók(ok)ra hat. Ha a
 csatornához nincs OM rendelve (pl. admin-config csatorna), a parancs barátságos
@@ -29,6 +36,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from src.integrations import discord_router
+from src.monitoring import instant_summary
 from src.monitoring import summary as summary_gen
 from src.storage import account_assignments as account_assignments_storage
 from src.storage import ad_account_kpis as ad_account_kpis_storage
@@ -686,6 +694,64 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
             await interaction.followup.send(
                 f"⚠️ A {kind.lower()} összefoglaló NEM ment ki — nincs feloldható csatorna."
             )
+
+    # ------------------------------------------------------------------
+    # /my summary-now — azonnali (élő) pillanatkép AZ ÖSSZES saját fiókra
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="summary-now",
+        description="Azonnali összefoglaló ÉLŐ mai adatból a saját összes fiókodra",
+    )
+    async def summary_now(self, interaction: discord.Interaction) -> None:
+        """Élő adatot húz MINDEN hozzárendelt fiókra (korlátozott párhuzamossággal),
+        majd lefuttatja rajtuk az anomália-detektort. Lásd `src.monitoring.
+        instant_summary` modul-docstring: read-only pillanatkép, nem ír insightot,
+        nem rögzít alertet.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        owner = await self._owner_or_reject(interaction)
+        if owner is None:
+            return
+
+        accounts = await asyncio.to_thread(
+            account_assignments_storage.get_accounts_for_user, owner["id"]
+        )
+        accounts = [a for a in accounts if a.get("is_active", True)]
+        if not accounts:
+            await interaction.followup.send(
+                "Nincs hozzád rendelt (aktív) fiók. Szólj az adminnak: `/account assign`."
+            )
+            return
+
+        await interaction.followup.send(
+            f"⏳ Élő adatlekérés indul **{len(accounts)} fiókra** — ez néhány másodpercet vehet igénybe…"
+        )
+
+        client_ids = {a["client_id"] for a in accounts if a.get("client_id") is not None}
+        client_names: dict[int, str] = {}
+        for cid in client_ids:
+            client = await asyncio.to_thread(clients_storage.get_client, cid)
+            client_names[cid] = (client or {}).get("name", f"#{cid}")
+
+        summary = await instant_summary.generate_instant_summary_for_accounts(
+            accounts, client_names=client_names,
+        )
+
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "my_summary_now",
+            entity_type="user", entity_id=owner["id"],
+            details={
+                "accounts_total": summary["accounts_total"],
+                "accounts_failed": summary["accounts_failed"],
+                "alert_count": summary["alert_count"],
+            },
+        )
+        await interaction.followup.send(
+            instant_summary.format_instant_summary_multi(
+                summary, owner_label=owner.get("display_name")
+            )
+        )
 
     # ------------------------------------------------------------------
     # Belső: a célzott kampányok (egy kampány vagy a fiók összes kampánya)
