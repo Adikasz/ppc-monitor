@@ -30,6 +30,7 @@ from discord.ext import commands
 from datetime import datetime, timedelta, timezone
 
 from src.config import get_config
+from src.integrations import account_catalog
 from src.integrations import discord_router
 from src.monitoring.discovery import discover_campaigns_for_client
 from src.storage import account_assignments as account_assignments_storage
@@ -579,6 +580,55 @@ class ClientCog(commands.GroupCog, group_name="client"):
             f"✅ **{name}** onboardolva: {result['inserted']} kampány felfedezve.\n"
             + "\n".join(detail_lines)
         )
+
+    @onboard.autocomplete("account_id")
+    async def onboard_account_id_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Fiók-javaslatok NÉVVEL a platform API-jából (lásd `/account add`).
+
+        A már regisztrált fiókokat `✓`-pel jelöljük és hátrasoroljuk, a kézi
+        ID-beírás pedig végig lehetséges marad (ügynökségi hozzáférésű fiókok
+        nem szerepelnek a `/me/adaccounts` listában).
+        """
+        platform = ""
+        for opt in (interaction.data or {}).get("options", []):
+            for sub in opt.get("options", []) or []:
+                if sub.get("name") == "platform":
+                    platform = str(sub.get("value") or "")
+        if not platform:
+            return []
+
+        try:
+            existing = {
+                a["external_account_id"]
+                for a in await asyncio.to_thread(ad_accounts_storage.list_ad_accounts)
+            }
+        except Exception:  # noqa: BLE001
+            existing = set()
+
+        matches = await asyncio.to_thread(
+            account_catalog.search_accounts, platform, current, limit=24,
+        )
+        matches.sort(key=lambda a: str(a.get("id")) in existing)
+
+        choices = [
+            app_commands.Choice(
+                name=(
+                    f"{'✓ ' if str(a['id']) in existing else ''}{a['name']} — {a['id']}"
+                )[:100],
+                value=str(a["id"])[:100],
+            )
+            for a in matches
+        ]
+
+        typed = (current or "").strip()
+        if typed and not any(c.value == typed for c in choices):
+            choices.insert(
+                0,
+                app_commands.Choice(name=f"↵ Kézi azonosító: {typed}"[:100], value=typed[:100]),
+            )
+        return choices[:25]
 
     # ------------------------------------------------------------------
     # /client unassign client:<> user:<@OM>

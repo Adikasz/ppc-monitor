@@ -26,6 +26,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from src.config import get_config
+from src.integrations import account_catalog
 from src.storage import account_assignments as account_assignments_storage
 from src.storage import ad_account_kpis as ad_account_kpis_storage
 from src.storage import ad_accounts as ad_accounts_storage
@@ -252,7 +253,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     @app_commands.describe(
         client="Az ügyfél neve vagy numerikus azonosítója",
         platform="Hirdetési platform: meta vagy google",
-        account_id="Fiók azonosító (Meta: act_123 vagy 123, Google: 123-456-7890)",
+        account_id="Válassz a listából (név szerint kereshető), vagy írd be kézzel az ID-t",
         account_name="Opcionális: a fiók emberi neve",
     )
     @app_commands.choices(platform=_PLATFORM_CHOICES)
@@ -330,6 +331,67 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     ) -> list[app_commands.Choice[str]]:
         rows = await asyncio.to_thread(clients_storage.search_clients, current, active=True)
         return [app_commands.Choice(name=r["name"][:100], value=str(r["id"])) for r in rows][:25]
+
+    @add.autocomplete("account_id")
+    async def add_account_id_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Fiók-javaslatok NÉVVEL a platform API-jából (Meta/Google).
+
+        A kiválasztott elem ÉRTÉKE a technikai azonosító, a felhasználó viszont
+        a fiók nevét látja — így nem kell `act_...` ID-t begépelni.
+
+        A már regisztrált fiókokat NEM szűrjük ki, csak megjelöljük (`✓`) és
+        hátrasoroljuk: jelenleg mind a 66 API-fiók regisztrálva van, így a
+        kiszűrésük néma, üres autocomplete-et adna, ami elrontott funkciónak
+        látszik. A `/account add` amúgy is kezeli a duplikátumot (jelzi, hogy
+        már létezik, és szükség esetén újraaktiválja).
+
+        Ha az API nem elérhető, vagy a keresett fiók nincs a listában (pl.
+        ügynökségi hozzáférésű Meta fiók), a mező KÉZZEL is kitölthető marad —
+        ezért a beírt szöveget mindig felajánljuk választható elemként.
+        """
+        # A platform a már kitöltött mezőkből olvasható ki.
+        platform = ""
+        for opt in (interaction.data or {}).get("options", []):
+            for sub in opt.get("options", []) or []:
+                if sub.get("name") == "platform":
+                    platform = str(sub.get("value") or "")
+        if not platform:
+            return []
+
+        try:
+            existing = {
+                a["external_account_id"]
+                for a in await asyncio.to_thread(ad_accounts_storage.list_ad_accounts)
+            }
+        except Exception:  # noqa: BLE001
+            existing = set()
+
+        matches = await asyncio.to_thread(
+            account_catalog.search_accounts, platform, current, limit=24,
+        )
+        # Még nem regisztrált fiókok előre — azok az érdekesek egy `add`-nál.
+        matches.sort(key=lambda a: str(a.get("id")) in existing)
+
+        choices = [
+            app_commands.Choice(
+                name=(
+                    f"{'✓ ' if str(a['id']) in existing else ''}{a['name']} — {a['id']}"
+                )[:100],
+                value=str(a["id"])[:100],
+            )
+            for a in matches
+        ]
+
+        # Kézi beírás mindig maradjon lehetséges (lásd account_catalog korlátok).
+        typed = (current or "").strip()
+        if typed and not any(c.value == typed for c in choices):
+            choices.insert(
+                0,
+                app_commands.Choice(name=f"↵ Kézi azonosító: {typed}"[:100], value=typed[:100]),
+            )
+        return choices[:25]
 
     # ------------------------------------------------------------------
     # /account remove account_id:<>

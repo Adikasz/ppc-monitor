@@ -166,6 +166,45 @@ class MetaAdsClient:
         cls._instance = None
 
     # ------------------------------------------------------------------
+    # Elérhető hirdetési fiókok (autocomplete-hez)
+    # ------------------------------------------------------------------
+
+    def list_accessible_accounts(self) -> list[dict[str, Any]]:
+        """A tokennel elérhető Meta hirdetési fiókok (ID + NÉV).
+
+        A `/account add` autocomplete ebből épít választható listát, hogy ne
+        kelljen kézzel `act_...` ID-t begépelni.
+
+        FONTOS KORLÁT: a `/me/adaccounts` csak azokat a fiókokat adja vissza,
+        amelyek KÖZVETLENÜL a token tulajdonosához vannak rendelve. Ügynökségi /
+        business hozzáférésű fiókok kimaradhatnak (éles mérésben 66 fiók jött
+        vissza, miközben 71 Meta fiók van használatban) — ezért az autocomplete
+        csak JAVASLAT, a kézi ID-beírás továbbra is működik.
+
+        Visszatérés: [{"id": "act_123", "name": "Fiók neve", "status": 1}, ...]
+        Hiba esetén ÜRES lista (nem dob) — az autocomplete sosem törhet el.
+        """
+        try:
+            from facebook_business.adobjects.user import User
+
+            accounts = User(fbid="me").get_ad_accounts(
+                fields=["id", "name", "account_status"]
+            )
+            result = [
+                {
+                    "id": str(a.get("id")),
+                    "name": a.get("name") or str(a.get("id")),
+                    "status": a.get("account_status"),
+                }
+                for a in accounts
+            ]
+            log.info("Meta API — elérhető fiókok: %d", len(result))
+            return result
+        except Exception as exc:  # noqa: BLE001 — az autocomplete nem törhet el
+            log.error("Meta elérhető fiókok lekérése sikertelen: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
     # Kampányok
     # ------------------------------------------------------------------
 

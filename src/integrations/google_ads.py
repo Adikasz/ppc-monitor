@@ -187,6 +187,82 @@ class GoogleAdsClient:
         cls._instance = None
 
     # ------------------------------------------------------------------
+    # Elérhető fiókok (autocomplete-hez)
+    # ------------------------------------------------------------------
+
+    def list_accessible_accounts(self) -> list[dict[str, Any]]:
+        """A hitelesítéssel elérhető Google Ads fiókok (ID + NÉV).
+
+        Két lépés:
+          1. `CustomerService.list_accessible_customers` — a refresh tokennel
+             elérhető gyökér-fiókok (jellemzően az MCC/manager).
+          2. Ha van `login_customer_id` (MCC), a `customer_client` view-n
+             keresztül lekérjük az MCC alá tartozó ÖSSZES nem-manager fiókot
+             névvel együtt — ez adja az érdemi listát.
+
+        Ha a 2. lépés bármiért nem megy, az 1. lépés nyers ID-listájával térünk
+        vissza (név nélkül) — így az autocomplete akkor is ad valamit.
+
+        Visszatérés: [{"id": "1234567890", "name": "Fiók neve"}, ...]
+        Hiba esetén ÜRES lista (nem dob) — az autocomplete sosem törhet el.
+        """
+        try:
+            customer_service = self._client.get_service("CustomerService")
+            accessible = customer_service.list_accessible_customers()
+            # resource_name formátum: "customers/1234567890"
+            root_ids = [
+                rn.split("/")[-1] for rn in accessible.resource_names
+            ]
+            log.info("Google Ads — elérhető gyökér-fiókok: %d", len(root_ids))
+        except Exception as exc:  # noqa: BLE001
+            log.error("Google Ads list_accessible_customers hiba: %s", exc)
+            return []
+
+        # Az MCC alatti fiókok névvel — a login_customer_id-t preferáljuk,
+        # de ha nincs, minden elérhető gyökeret végigpróbálunk.
+        manager_ids = [self._login_customer_id] if self._login_customer_id else root_ids
+
+        found: dict[str, str] = {}
+        for manager_id in manager_ids:
+            if not manager_id:
+                continue
+            try:
+                ga_service = self._client.get_service("GoogleAdsService")
+                query = """
+                    SELECT
+                        customer_client.id,
+                        customer_client.descriptive_name,
+                        customer_client.manager,
+                        customer_client.status
+                    FROM customer_client
+                    WHERE customer_client.status = 'ENABLED'
+                """
+                response = ga_service.search(customer_id=str(manager_id), query=query)
+                for row in response:
+                    cc = row.customer_client
+                    # A manager (MCC) fiókokban nincsenek kampányok — kihagyjuk.
+                    if cc.manager:
+                        continue
+                    cid = str(cc.id)
+                    found[cid] = cc.descriptive_name or cid
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Google Ads customer_client lekérés hiba (manager=%s): %s",
+                    manager_id, exc,
+                )
+
+        if not found:
+            # Fallback: legalább a nyers gyökér-ID-k, név nélkül.
+            log.warning(
+                "Google Ads — customer_client lista üres, fallback a "
+                "gyökér-ID-kre (%d db, név nélkül)", len(root_ids),
+            )
+            return [{"id": cid, "name": cid} for cid in root_ids]
+
+        log.info("Google Ads — elérhető fiókok névvel: %d", len(found))
+        return [{"id": cid, "name": name} for cid, name in sorted(found.items(), key=lambda kv: kv[1].lower())]
+
+    # ------------------------------------------------------------------
     # Kampányok
     # ------------------------------------------------------------------
 
