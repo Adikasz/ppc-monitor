@@ -6,7 +6,9 @@ Meta- és Google-fiókja, külön OM-mel és külön KPI-val (21. lépés).
 
 Parancsok:
     /account list   [client:<>] [page:<>]     — fiókok #id-vel (OM + kampány + KPI)
-    /account add    client:<> platform:<> account_id:<>  — fiók regisztrálása (admin)
+    /account add    client:<> platform:<> account:<>  — fiók regisztrálása (admin)
+                                          (account: platform-szűrt, névre kereshető
+                                           autocomplete — kézi ID-beírás is marad)
     /account remove account_id:<>             — fiók soft-delete (admin)
     /account assign account:<#id> user:<@OM> [role]  — OM a fiók minden kampányára (admin)
     /account unassign account:<#id> user:<@OM>       — OM eltávolítása a fiókról (admin)
@@ -262,8 +264,8 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     @app_commands.command(name="add", description="Hirdetési fiók regisztrálása ügyfélhez (admin)")
     @app_commands.describe(
         client="Az ügyfél neve vagy numerikus azonosítója",
-        platform="Hirdetési platform: meta vagy google",
-        account_id="Válassz a listából (név szerint kereshető), vagy írd be kézzel az ID-t",
+        platform="Hirdetési platform: meta vagy google — válaszd ki ELŐSZÖR (az account: ez alapján szűr)",
+        account="Válaszd ki a fiókot NÉV alapján a listából, vagy írd be kézzel az azonosítót",
         account_name="Opcionális: a fiók emberi neve",
     )
     @app_commands.choices(platform=_PLATFORM_CHOICES)
@@ -272,7 +274,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         interaction: discord.Interaction,
         client: str,
         platform: str,
-        account_id: str,
+        account: str,
         account_name: str | None = None,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -281,7 +283,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             await interaction.followup.send("Ez a parancs csak az admin csatornában használható.")
             return
 
-        account_id = (account_id or "").strip()
+        account_id = (account or "").strip()
         if not account_id:
             await interaction.followup.send("❌ A fiók azonosító nem lehet üres.")
             return
@@ -342,14 +344,19 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         rows = await asyncio.to_thread(clients_storage.search_clients, current, active=True)
         return [app_commands.Choice(name=r["name"][:100], value=str(r["id"])) for r in rows][:25]
 
-    @add.autocomplete("account_id")
-    async def add_account_id_autocomplete(
+    @add.autocomplete("account")
+    async def add_account_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        """Fiók-javaslatok NÉVVEL a platform API-jából (Meta/Google).
+        """Platform-szűrt fiók-javaslatok NÉVVEL a platform API-jából (Meta/Google).
 
         A kiválasztott elem ÉRTÉKE a technikai azonosító, a felhasználó viszont
         a fiók nevét látja — így nem kell `act_...` ID-t begépelni.
+
+        A platformot a namespace-ből olvassuk (ugyanaz a minta, mint a
+        `/my lifecycle` / `/my mute` campaign-autocomplete-jénél a `MyCommandsCog.
+        _owned_campaign_choices`-ban) — amíg a `platform` mező nincs kitöltve,
+        üres listát adunk, hogy Meta és Google fiók sose keveredjen egy listában.
 
         A már regisztrált fiókokat NEM szűrjük ki, csak megjelöljük (`✓`) és
         hátrasoroljuk: jelenleg mind a 66 API-fiók regisztrálva van, így a
@@ -361,13 +368,8 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         ügynökségi hozzáférésű Meta fiók), a mező KÉZZEL is kitölthető marad —
         ezért a beírt szöveget mindig felajánljuk választható elemként.
         """
-        # A platform a már kitöltött mezőkből olvasható ki.
-        platform = ""
-        for opt in (interaction.data or {}).get("options", []):
-            for sub in opt.get("options", []) or []:
-                if sub.get("name") == "platform":
-                    platform = str(sub.get("value") or "")
-        if not platform:
+        platform = (interaction.namespace.platform or "").strip().lower()
+        if platform not in ("meta", "google"):
             return []
 
         try:
@@ -387,7 +389,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         choices = [
             app_commands.Choice(
                 name=(
-                    f"{'✓ ' if str(a['id']) in existing else ''}{a['name']} — {a['id']}"
+                    f"{'✓ ' if str(a['id']) in existing else ''}{a['name']} ({a['id']})"
                 )[:100],
                 value=str(a["id"])[:100],
             )
