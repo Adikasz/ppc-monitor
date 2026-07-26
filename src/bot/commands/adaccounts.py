@@ -11,8 +11,14 @@ Parancsok:
     /account assign account:<#id> user:<@OM> [role]  — OM a fiók minden kampányára (admin)
     /account unassign account:<#id> user:<@OM>       — OM eltávolítása a fiókról (admin)
     /account kpi    account:<#id> [KPI mezők...]      — fiók KPI + lecsorgatás (admin)
+    /account summary-now account:<#id>       — azonnali összefoglaló ÉLŐ mai adatból
 
 A fiókokat a #szám (ad_accounts.id) azonosítja — ezt a `/account list` írja ki.
+
+A `/account summary-now` a `/summary type:daily`-vel szemben nem a tárolt,
+tegnapi alertekből dolgozik, hanem élőben lekéri a mai adatokat a platform
+API-ból (1 batch hívás / fiók), és read-only pillanatképet ad — nem rögzít
+alertet és nem küld riasztást.
 """
 from __future__ import annotations
 
@@ -27,6 +33,10 @@ from discord.ext import commands
 
 from src.config import get_config
 from src.integrations import account_catalog
+from src.monitoring.instant_summary import (
+    format_instant_summary,
+    generate_instant_account_summary,
+)
 from src.storage import account_assignments as account_assignments_storage
 from src.storage import ad_account_kpis as ad_account_kpis_storage
 from src.storage import ad_accounts as ad_accounts_storage
@@ -1313,6 +1323,106 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             app_commands.Choice(name=c.name, value=f"{prefix}{c.value}"[:100])
             for c in base
         ]
+
+    # ------------------------------------------------------------------
+    # /account summary-now account:<> — azonnali (élő) health check
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="summary-now",
+        description="Azonnali összefoglaló ÉLŐ mai adatból egy fiókra (nem a tegnapiból)",
+    )
+    @app_commands.describe(
+        account="Egy fiók: #id, külső azonosító VAGY kliensnév (pl. 2 / act_165… / Stopvill)",
+    )
+    async def summary_now(
+        self,
+        interaction: discord.Interaction,
+        account: str,
+    ) -> None:
+        """Élő adatot húz a platform API-ból, majd lefuttatja az anomália-detektort.
+
+        Hatókör — egy fiók: a teljes flotta ~100 ad_account, fiókonként egy
+        batch API hívással az 3-5 perc lenne egyetlen parancsra. Egy fiókra
+        1 hívás és néhány másodperc.
+
+        Jogosultság: a saját #alerts csatornából a hozzád rendelt fiókokra,
+        VAGY az admin csatornából bármelyik fiókra.
+
+        Ez read-only pillanatkép: nem ír insightot, nem rögzít alertet és nem
+        küld riasztást (különben duplázná az órás ciklus alertjeit).
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        channel_owner = await asyncio.to_thread(
+            users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
+        )
+        is_admin_ch = _is_admin_channel(interaction)
+
+        if channel_owner is None and not is_admin_ch:
+            await interaction.followup.send(
+                "❌ Ez a parancs a saját #alerts csatornádból (saját fiókjaidra) "
+                "vagy az admin csatornából (bármely fiókra) futtatható."
+            )
+            return
+
+        acct = await self._resolve_single_account(interaction, account)
+        if acct is None:
+            return
+
+        # Az #alerts csatornában csak a saját fiókok kérdezhetők le.
+        if not is_admin_ch:
+            owned = await asyncio.to_thread(
+                account_assignments_storage.get_account_ids_for_user,
+                channel_owner["id"],
+            )
+            if acct["id"] not in owned:
+                await interaction.followup.send("❌ Ez a fiók nincs hozzád rendelve.")
+                return
+
+        client = await asyncio.to_thread(clients_storage.get_client, acct["client_id"])
+        cname = (client or {}).get("name") or f"#{acct['client_id']}"
+
+        await interaction.followup.send(
+            f"⏳ Élő adatlekérés indul: **{cname}** · `{acct['platform']}` "
+            f"`{_short_account(acct['external_account_id'])}` — ez néhány másodperc…"
+        )
+
+        try:
+            summary = await generate_instant_account_summary(acct, client_name=cname)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Azonnali összefoglaló hiba (fiók #%s)", acct["id"])
+            await interaction.followup.send(
+                f"❌ Nem sikerült az élő adatlekérés: `{exc}`\n"
+                f"Fiók: **{cname}** · `{acct['platform']}` "
+                f"`{_short_account(acct['external_account_id'])}`"
+            )
+            return
+
+        await asyncio.to_thread(
+            audit.log_action, str(interaction.user.id), "account_summary_now",
+            entity_type="ad_account", entity_id=acct["id"],
+            details={
+                "client_name": cname,
+                "platform": acct["platform"],
+                "campaigns": summary["total_campaigns"],
+                "alerts": summary["alert_count"],
+            },
+        )
+        await interaction.followup.send(format_instant_summary(summary))
+
+    @summary_now.autocomplete("account")
+    async def summary_now_account_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Alerts csatornában a saját fiókok, admin csatornában az összes."""
+        owner = await asyncio.to_thread(
+            users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
+        )
+        if owner is not None:
+            return await self._owned_account_choices(owner, current)
+        if _is_admin_channel(interaction):
+            return await self._account_choices(current)
+        return []
 
 
 async def setup(bot: commands.Bot) -> None:
