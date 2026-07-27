@@ -41,6 +41,29 @@ _EXTENSIONS: tuple[str, ...] = (
 )
 
 
+def describe_synced_commands(synced: list) -> list[str]:
+    """A `tree.sync()` eredményéből (list[AppCommand]) ember-olvasható sorok.
+
+    Deploy-verifikációhoz: Railway logban ez mutatja PONTOSAN milyen mezőkkel
+    regisztrálódott minden parancs a legutóbbi induláskor — anélkül, hogy
+    kézzel kellene a Discord API-t hívni. Ha egy várt mező-változás
+    (pl. `/account add` `client:` eltávolítása) nem látszik itt, az azt
+    jelenti, hogy EZ a `setup_hook` nem a várt kód-állapottal futott le
+    (lásd `main()` "commit=" log sora — hasonlítsd össze `git rev-parse HEAD`-del).
+    """
+    lines: list[str] = []
+    for cmd in synced:
+        subgroups = [o for o in cmd.options if isinstance(o, app_commands.AppCommandGroup)]
+        if subgroups:
+            for sub in subgroups:
+                opt_names = [o.name for o in sub.options]
+                lines.append(f"  /{cmd.name} {sub.name} -> mezők: {opt_names}")
+        else:
+            opt_names = [o.name for o in cmd.options]
+            lines.append(f"  /{cmd.name} -> mezők: {opt_names}")
+    return lines
+
+
 class PpcBot(commands.Bot):
     """A projekt bot-osztálya. A cog-betöltés és slash-szinkron itt történik,
     hogy a `commands.Bot` event loopjához igazítva, biztonságosan fusson."""
@@ -53,6 +76,17 @@ class PpcBot(commands.Bot):
 
         # 2) Slash parancsok szinkronizálása. Guild-szintű sync azonnal él,
         # globális sync akár 1 órát is várhat. Fejlesztésben mindig guildre.
+        #
+        # A sync() egy TELJES bulk-overwrite Discord oldalon (nem inkrementális
+        # diff) — minden induláskor a MOST betöltött cog-kód alapján épül fel a
+        # parancsfa, a korábbi (guild-szintű) regisztráció teljesen felülíródik.
+        # Ha egy régi mező (pl. `/account add` `client:`) a redeploy UTÁN is
+        # látszik Discordban, az nem itt a hiba forrása — azt jelenti, hogy EZ
+        # a kód (a mostani setup_hook) NEM futott le a jelenlegi commit-tal.
+        # Ellenőrzés: a lenti log sorban a parancsonkénti mező-lista, PLUSZ a
+        # fenti "Discord bot indítása… (commit=...)" sor (main()) — hasonlítsd
+        # össze `git rev-parse HEAD`-del. Ha eltér, Railway-en nem történt
+        # valódi rebuild (Restart ≠ Redeploy — lásd korábbi incidens).
         guild_id_raw = get_config().discord_guild_id
         if guild_id_raw:
             guild = discord.Object(id=int(guild_id_raw))
@@ -65,6 +99,9 @@ class PpcBot(commands.Bot):
         else:
             synced = await self.tree.sync()
             log.info("Slash parancsok globálisan szinkronizálva (%d)", len(synced))
+
+        for line in describe_synced_commands(synced):
+            log.info(line)
 
 
 def build_bot() -> commands.Bot:
