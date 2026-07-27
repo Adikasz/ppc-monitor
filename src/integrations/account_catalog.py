@@ -108,6 +108,24 @@ def search_accounts(
     return matches[:limit]
 
 
+def find_account_name(platform: str, account_id: str) -> str | None:
+    """Egy adott fiók API-NEVE a katalógusból, ha ismert. None ha nincs (kézi eset).
+
+    A `/account add` ezzel dönti el, hogy az `account:` mezőbe API-listás fiók
+    került (van API-név → abból automatikus kliensnév és `ad_accounts.
+    account_name`), vagy kézi azonosító (nincs API-név → kliensnév kötelező
+    bekérése, lásd a modul-docstring korlátjait).
+
+    A `account_id`-t a hívó normalizálja (`normalize_external_account_id`),
+    ugyanolyan formában, mint a katalógus `id` mezője (act_... / csak számjegy).
+    """
+    account_id = str(account_id)
+    for a in get_accounts(platform):
+        if str(a.get("id")) == account_id:
+            return a.get("name")
+    return None
+
+
 def invalidate(platform: str | None = None) -> None:
     """Cache ürítése (teszthez, vagy ha friss listát akarunk kényszeríteni)."""
     if platform is None:

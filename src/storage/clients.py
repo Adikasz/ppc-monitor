@@ -53,6 +53,30 @@ def get_client_by_name(name: str) -> dict[str, Any] | None:
     return res.data[0] if res.data else None
 
 
+def find_client_by_name_ci(name: str) -> dict[str, Any] | None:
+    """Egy ügyfél lekérdezése NÉV alapján, kis/nagybetű-FÜGGETLEN egyezéssel.
+
+    A `clients.name` unique constraint case-SENSITIVE (`text unique`), tehát
+    "stopvill" és "Stopvill" a DB szintjén nem ütközne — ez a függvény az
+    APPLIKÁCIÓ szintjén véd a duplikátum ellen a `/account add` automatikus
+    kliens-feloldásánál (a Meta/Google API fióknév kis/nagybetűzése eltérhet
+    a DB-ben már rögzített klienstől).
+
+    Az `ilike` mintaillesztő karaktereit (`%`, `_`) escapeljük, hogy PONTOS
+    (nem részleges) egyezést kapjunk — ellentétben a `search_clients`-szel.
+    """
+    escaped = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .select("*")
+        .ilike("name", escaped)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
 def create_client(
     name: str,
     *,

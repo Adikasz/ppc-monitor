@@ -6,9 +6,12 @@ Meta- és Google-fiókja, külön OM-mel és külön KPI-val (21. lépés).
 
 Parancsok:
     /account list   [client:<>] [page:<>]     — fiókok #id-vel (OM + kampány + KPI)
-    /account add    client:<> platform:<> account:<>  — fiók regisztrálása (admin)
-                                          (account: platform-szűrt, névre kereshető
-                                           autocomplete — kézi ID-beírás is marad)
+    /account add    platform:<> account:<> [client_name:<>] [account_name:<>]
+                                          — fiók regisztrálása (admin); a kliens
+                                           NINCS külön mezőként — automatikusan
+                                           létrejön/összekötődik a fiók API neve
+                                           alapján (kézi azonosító esetén a
+                                           client_name kötelező, lásd korlátok)
     /account remove account_id:<>             — fiók soft-delete (admin)
     /account assign account:<#id> user:<@OM> [role]  — OM a fiók minden kampányára (admin)
     /account unassign account:<#id> user:<@OM>       — OM eltávolítása a fiókról (admin)
@@ -259,24 +262,32 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         return [app_commands.Choice(name=r["name"][:100], value=str(r["id"])) for r in rows][:25]
 
     # ------------------------------------------------------------------
-    # /account add client:<> platform:<> account_id:<>
+    # /account add platform:<> account:<> [client_name:<>] [account_name:<>]
     # ------------------------------------------------------------------
-    @app_commands.command(name="add", description="Hirdetési fiók regisztrálása ügyfélhez (admin)")
+    @app_commands.command(
+        name="add",
+        description="Hirdetési fiók regisztrálása — a kliens automatikusan létrejön/összekötődik a fiók API neve alapján (admin)",
+    )
     @app_commands.describe(
-        client="Az ügyfél neve vagy numerikus azonosítója",
         platform="Hirdetési platform: meta vagy google — válaszd ki ELŐSZÖR (az account: ez alapján szűr)",
         account="Válaszd ki a fiókot NÉV alapján a listából, vagy írd be kézzel az azonosítót",
-        account_name="Opcionális: a fiók emberi neve",
+        client_name="CSAK kézi azonosító esetén kötelező (ügynökségi fiók, nincs API-név) — ilyenkor az ügyfél neve",
+        account_name="Opcionális: a fiók megjelenítési nevének felülírása (alapból az API-ból kapott nevet menti el)",
     )
     @app_commands.choices(platform=_PLATFORM_CHOICES)
     async def add(
         self,
         interaction: discord.Interaction,
-        client: str,
         platform: str,
         account: str,
+        client_name: str | None = None,
         account_name: str | None = None,
     ) -> None:
+        """A kliens NEM külön mező — automatikusan feloldódik/létrejön a fiók
+        API-neve alapján (lásd modul-docstring). Ha a választott `account`
+        nem szerepel a platform API-katalógusában (kézi azonosító, pl.
+        ügynökségi hozzáférésű Meta fiók), a `client_name` megadása kötelező.
+        """
         await interaction.response.defer(ephemeral=True)
 
         if not _is_admin_channel(interaction):
@@ -288,26 +299,62 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             await interaction.followup.send("❌ A fiók azonosító nem lehet üres.")
             return
 
-        c = await asyncio.to_thread(_resolve_client, client)
-        if c is None:
+        normalized = ad_accounts_storage.normalize_external_account_id(platform, account_id)
+
+        # 1) A fiók NEVE: elsődlegesen a platform API-katalógusából (ha a
+        #    választott azonosító ott van), egyébként a kézzel megadott
+        #    client_name — ez adja a kliens nevét is.
+        api_name = await asyncio.to_thread(
+            account_catalog.find_account_name, platform, normalized
+        )
+        if api_name:
+            resolved_name = api_name
+            name_source = "api"
+        else:
+            resolved_name = (client_name or "").strip()
+            if not resolved_name:
+                await interaction.followup.send(
+                    "❌ Ez a fiók nem szerepel a platform API-listájában (kézzel "
+                    "megadott azonosító — pl. ügynökségi hozzáférésű fiók, amit a "
+                    "`/me/adaccounts` nem lát).\n"
+                    "Ilyenkor add meg az ügyfél nevét is: `client_name:<...>`"
+                )
+                return
+            name_source = "manual"
+
+        # 2) Kliens feloldása (kis/nagybetű-független egyezés — ne duplikáljon),
+        #    vagy létrehozása, ha még nincs ilyen nevű ügyfél.
+        client = await asyncio.to_thread(clients_storage.find_client_by_name_ci, resolved_name)
+        client_created = False
+        if client is None:
+            try:
+                client = await asyncio.to_thread(clients_storage.create_client, resolved_name)
+                client_created = True
+            except Exception as exc:  # noqa: BLE001 — pl. race a unique constrainten
+                log.warning("Ügyfél automatikus létrehozása ütközött (%s): %s", resolved_name, exc)
+                client = await asyncio.to_thread(clients_storage.find_client_by_name_ci, resolved_name)
+                if client is None:
+                    await interaction.followup.send(f"❌ Nem sikerült az ügyfél létrehozása: `{exc}`")
+                    return
+        elif not client.get("is_active", True):
             await interaction.followup.send(
-                f"❌ Nem található ügyfél: **{client}**\nNézd meg: `/client list`"
+                f"❌ **{client['name']}** ügyfélnévvel már létezik egy INAKTÍV ügyfél — "
+                f"aktiváld előbb (`/client list` → reactivate), majd próbáld újra."
             )
             return
-        if not c.get("is_active", True):
-            await interaction.followup.send(f"❌ Az ügyfél **{c['name']}** inaktív.")
-            return
 
-        normalized = ad_accounts_storage.normalize_external_account_id(platform, account_id)
+        # A fiók saját megjelenítési neve (ad_accounts.account_name) — az
+        # opcionális felülírás VAGY az imént feloldott név (API vagy kézi).
+        stored_account_name = (account_name or "").strip() or resolved_name
 
         try:
             row, created = await asyncio.to_thread(
                 ad_accounts_storage.get_or_create_ad_account,
-                c["id"], platform, normalized,
-                account_name=account_name.strip() if account_name else None,
+                client["id"], platform, normalized,
+                account_name=stored_account_name,
             )
         except Exception as exc:  # noqa: BLE001
-            log.exception("Hiba a fiók regisztrálásakor (%s / %s)", c["name"], normalized)
+            log.exception("Hiba a fiók regisztrálásakor (%s / %s)", client["name"], normalized)
             await interaction.followup.send(f"❌ Hiba: `{exc}`")
             return
 
@@ -317,32 +364,51 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
                 await asyncio.to_thread(ad_accounts_storage.set_ad_account_active, row["id"], True)
                 reactivated = True
             note = " — újra aktiválva ✅" if reactivated else ""
+            # A fiók a MÁR LÉTEZŐ sorhoz tartozó (esetleg más) klienshez van
+            # kötve — pl. ha a Meta account neve közben megváltozott, és most
+            # egy másik névre oldódott fel. A TÉNYLEGES tulajdonost mutatjuk,
+            # ne a most (esetleg félrevezetően) feloldott klienst.
+            owner_client = client
+            if row.get("client_id") != client["id"]:
+                owner_client = (
+                    await asyncio.to_thread(clients_storage.get_client, row["client_id"])
+                    or client
+                )
             await interaction.followup.send(
                 f"ℹ️ Ez a fiók már regisztrálva van: **{platform}** / `{normalized}` "
-                f"→ **{c['name']}** *(#{row['id']})*{note}"
+                f"→ **{owner_client['name']}** *(#{row['id']})*{note}"
             )
             return
 
         await asyncio.to_thread(
             audit.log_action, str(interaction.user.id), "account_add",
             entity_type="ad_account", entity_id=row["id"],
-            details={"client_id": c["id"], "client_name": c["name"],
-                     "platform": platform, "external_account_id": normalized},
+            details={
+                "client_id": client["id"], "client_name": client["name"],
+                "client_created": client_created, "name_source": name_source,
+                "platform": platform, "external_account_id": normalized,
+            },
         )
-        log.info("Hirdetési fiók regisztrálva: %s / %s → %s (#%s)",
-                 platform, normalized, c["name"], row["id"])
-        await interaction.followup.send(
-            f"✅ Hirdetési fiók regisztrálva: **{platform}** / `{normalized}`\n"
-            f"Ügyfél: **{c['name']}** *(#{row['id']})*\n"
-            f"Következő: `/discover client:{c['name']}`, majd `/account assign account:{row['id']} user:@OM`"
+        log.info(
+            "Hirdetési fiók regisztrálva: %s / %s → %s (#%s, kliens_uj=%s, nev_forras=%s)",
+            platform, normalized, client["name"], row["id"], client_created, name_source,
         )
 
-    @add.autocomplete("client")
-    async def add_client_autocomplete(
-        self, interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        rows = await asyncio.to_thread(clients_storage.search_clients, current, active=True)
-        return [app_commands.Choice(name=r["name"][:100], value=str(r["id"])) for r in rows][:25]
+        client_note = (
+            f"🆕 ÚJ ügyfél létrehozva a fiók neve alapján: **{client['name']}**"
+            if client_created else
+            f"🔗 meglévő ügyfélhez kötve: **{client['name']}**"
+        )
+        manual_note = (
+            "\nℹ️ Ez a fiók nem volt az API-listában — a kliensnév kézzel megadott."
+            if name_source == "manual" else ""
+        )
+        await interaction.followup.send(
+            f"✅ Hirdetési fiók regisztrálva: **{platform}** / `{normalized}`\n"
+            f"{client_note} *(#{client['id']})*{manual_note}\n"
+            f"Ellenőrizd, hogy ez a helyes ügyfélnév — ha nem, jelezd az adminnak az átnevezéshez.\n"
+            f"Következő: `/discover client:{client['name']}`, majd `/account assign account:{row['id']} user:@OM`"
+        )
 
     @add.autocomplete("account")
     async def add_account_autocomplete(
