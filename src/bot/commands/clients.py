@@ -515,13 +515,22 @@ class ClientCog(commands.GroupCog, group_name="client"):
                 return
             client_created = True
 
-        # 2) Hirdetési fiók regisztrálása (normalizált external id-vel)
+        # 2) Hirdetési fiók regisztrálása (normalizált external id-vel).
+        #    Az account_name-t a platform API-katalógusából próbáljuk kitölteni
+        #    (ugyanaz a forrás, mint a `/account add`-nál) — ha a fiók nincs a
+        #    katalógusban (pl. ügynökségi hozzáférés), NULL marad; a napi
+        #    összefoglaló ekkor a technikai ID-re esik vissza (lásd
+        #    `src.monitoring.summary._multi_account_label`).
+        api_account_name = await asyncio.to_thread(
+            account_catalog.find_account_name, platform, normalized
+        )
         try:
             account, account_created = await asyncio.to_thread(
                 ad_accounts_storage.get_or_create_ad_account,
                 client["id"],
                 platform,
                 normalized,
+                account_name=api_account_name,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("Onboard: hiba a fiók regisztrálásakor (%s / %s)", name, normalized)

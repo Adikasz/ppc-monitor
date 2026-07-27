@@ -147,6 +147,31 @@ def test_top_issues_show_account_label_when_client_has_multiple_accounts_same_pl
     assert res["top_issues"][0]["account_label"] == "act_111"
 
 
+def test_top_issues_account_label_prefers_readable_name_over_technical_id():
+    """account_name jelenlétekor az OLVASHATÓ nevet mutatja, NEM a technikai
+    ID-t — ez a fiók megkülönböztetés fő elvárása (lásd account_catalog +
+    scripts/backfill_account_names.py: ezek töltik fel az account_name-t)."""
+    import contextlib
+    frm = datetime(2026, 6, 15, 0, 0, tzinfo=TZ)
+    to = datetime(2026, 6, 16, 0, 0, tzinfo=TZ)
+    ad_account = {
+        "id": 1, "platform": "meta", "external_account_id": "act_111",
+        "account_name": "Stopvill Ads", "client_id": 5, "clients": {"name": "Stopvill"},
+    }
+    sibling = {**ad_account, "id": 2, "external_account_id": "act_222",
+               "account_name": "Stopvill Google Ads"}
+    alerts = [_alert(10, "critical", "A", "ROAS 0.00", "2026-06-15T10:00:00+02:00", ad_account)]
+    with contextlib.ExitStack() as stack:
+        _patch(stack, campaign_ids=[10], alerts=alerts)
+        stack.enter_context(mock.patch.object(
+            s.ad_accounts_storage, "get_ad_accounts_for_client", return_value=[ad_account, sibling],
+        ))
+        res = s._build_summary_sync(1, frm, to)
+
+    assert res["top_issues"][0]["account_label"] == "Stopvill Ads"
+    assert "act_111" not in res["top_issues"][0]["account_label"]
+
+
 def test_format_top_issue_line_with_client_and_account_label():
     out = _format_summary(
         {"total_campaigns": 1, "critical_count": 1, "warning_count": 0,

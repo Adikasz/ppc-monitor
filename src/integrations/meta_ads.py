@@ -204,6 +204,27 @@ class MetaAdsClient:
             log.error("Meta elérhető fiókok lekérése sikertelen: %s", exc)
             return []
 
+    def get_account_name(self, ad_account_id: str) -> str | None:
+        """Egy fiók OLVASHATÓ NEVE, KÖZVETLEN (nem katalógusból jövő) lekérdezéssel.
+
+        A `list_accessible_accounts()` a `/me/adaccounts` listát adja — ha egy
+        fiók onnan hiányzik (ügynökségi/business hozzáférés), ez a metódus egy
+        célzott lekérdezéssel próbálkozik közvetlenül az adott fiókra. Éles
+        mérésben a katalógusból kimaradó mind az 5 ügynökségi fiókra 403-at
+        adott EZ a hívás is (nem csak az insights) — vagyis ezekre a token
+        semennyi mezőt nem tud olvasni, a név backfill sem oldható meg API-ból.
+
+        A `scripts/backfill_account_names.py` és a `/account add` kézi eset
+        másodlagos próbálkozásaként használva. Hiba esetén None — sosem dob.
+        """
+        try:
+            account = AdAccount(ad_account_id)
+            account.api_get(fields=["name"])
+            return account.get("name") or None
+        except Exception as exc:  # noqa: BLE001 — a hívó (backfill) nem törhet el
+            log.warning("Meta fiók név lekérés hiba (fiók=%s): %s", ad_account_id, exc)
+            return None
+
     # ------------------------------------------------------------------
     # Kampányok
     # ------------------------------------------------------------------

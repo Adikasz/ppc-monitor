@@ -262,6 +262,33 @@ class GoogleAdsClient:
         log.info("Google Ads — elérhető fiókok névvel: %d", len(found))
         return [{"id": cid, "name": name} for cid, name in sorted(found.items(), key=lambda kv: kv[1].lower())]
 
+    def get_account_name(self, customer_id: str) -> str | None:
+        """Egy fiók OLVASHATÓ NEVE (descriptive_name), KÖZVETLEN lekérdezéssel.
+
+        A `list_accessible_accounts()`-tól eltérően ez NEM az MCC
+        `customer_client` view-n megy át, hanem egyetlen GAQL sorral
+        közvetlenül az adott customer resource-ot kérdezi le — működhet olyan
+        fiókra is, ami valamiért nem jelenik meg az MCC-view-ban, feltéve hogy
+        a refresh token hozzáfér.
+
+        A `scripts/backfill_account_names.py` és a `/account add` kézi eset
+        másodlagos próbálkozásaként használva. Hiba esetén None — sosem dob
+        (a hívó felelős a fallback kezeléséért).
+        """
+        cid = _normalize_customer_id(customer_id)
+        try:
+            ga_service = self._client.get_service("GoogleAdsService")
+            response = ga_service.search(
+                customer_id=cid,
+                query="SELECT customer.descriptive_name FROM customer LIMIT 1",
+            )
+            for row in response:
+                return row.customer.descriptive_name or None
+            return None
+        except Exception as exc:  # noqa: BLE001 — a hívó (backfill) nem törhet el
+            log.warning("Google Ads fiók név lekérés hiba (fiók=%s): %s", cid, exc)
+            return None
+
     # ------------------------------------------------------------------
     # Kampányok
     # ------------------------------------------------------------------

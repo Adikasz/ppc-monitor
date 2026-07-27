@@ -162,6 +162,24 @@ def set_ad_account_active(ad_account_id: int, is_active: bool) -> dict[str, Any]
     return res.data[0] if res.data else None
 
 
+def set_account_name(ad_account_id: int, account_name: str) -> dict[str, Any] | None:
+    """Fiók megjelenítési nevének (account_name) beállítása/frissítése.
+
+    A `scripts/backfill_account_names.py` használja a régebbi (account_name
+    IS NULL) fiókok visszamenőleges kitöltésére, API-ból lekért névvel.
+
+    Visszaadja a frissített sort, vagy None-t, ha nincs ilyen fiók.
+    """
+    res = (
+        get_supabase()
+        .table(_TABLE)
+        .update({"account_name": account_name})
+        .eq("id", ad_account_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
 def find_ad_accounts_by_external_id(candidates: list[str]) -> list[dict[str, Any]]:
     """Hirdetési fiók(ok) keresése külső azonosító alapján, platform NÉLKÜL.
 
