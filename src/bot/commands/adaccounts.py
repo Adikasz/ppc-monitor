@@ -266,7 +266,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     # ------------------------------------------------------------------
     @app_commands.command(
         name="add",
-        description="Hirdetési fiók regisztrálása — a kliens automatikusan létrejön/összekötődik a fiók API neve alapján (admin)",
+        description="Hirdetési fiók regisztrálása — a kliens automatikusan létrejön a fiók API-neve alapján (admin)",
     )
     @app_commands.describe(
         platform="Hirdetési platform: meta vagy google — válaszd ki ELŐSZÖR (az account: ez alapján szűr)",
