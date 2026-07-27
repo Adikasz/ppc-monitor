@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git config *)",
+      "Bash(git remote *)",
+      "Bash(git branch *)",
+      "Bash(git push *)",
+      "Bash(gh --version)",
+      "Bash(gh auth *)",
+      "Bash(gh repo *)",
+      "Bash(python -m scripts.check_setup)",
+      "Bash(python -X utf8 -m scripts.check_setup)",
+      "Bash(dir /a .env* 2>nul & echo --- & type .env.example)",
+      "Bash(awk '{print $1, $5, $NF}')",
+      "Bash(python -c \"import supabase, sys; print\\('supabase version:', getattr\\(supabase, '__version__', '?'\\)\\); print\\('location:', supabase.__file__\\); print\\('exports:', [x for x in dir\\(supabase\\) if not x.startswith\\('_'\\)][:20]\\)\")",
+      "Bash(python -m pip --version)",
+      "Bash(python -m pip list)",
+      "Bash(findstr /i \"supabase discord dotenv\")",
+      "Bash(python -c \"import sys; print\\('prefix:', sys.prefix\\)\")",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/python.exe -m pip install --upgrade pip)",
+      "Bash(.venv/Scripts/python.exe -m pip install -r requirements.txt)",
+      "Bash(.venv/Scripts/python.exe -m scripts.check_setup)",
+      "Bash(.venv/Scripts/python.exe -c \"from src.config import get_config; k=get_config\\(\\).supabase_service_key; print\\('length:', len\\(k\\)\\); print\\('dots:', k.count\\('.'\\)\\); print\\('starts with eyJ:', k.startswith\\('eyJ'\\)\\); print\\('has whitespace:', any\\(c.isspace\\(\\) for c in k\\)\\); print\\('first 4:', k[:4]\\); print\\('last 4:', k[-4:]\\)\")",
+      "Bash(.venv/Scripts/python.exe -m pip index versions supabase)",
+      "Bash(.venv/Scripts/python.exe -m pip install --upgrade \"supabase==2.30.1\")",
+      "Bash(.venv/Scripts/python.exe -m pip install \"supabase==2.17.0\")",
+      "Bash(git stash *)",
+      "Bash(git pull *)",
+      "Bash(.venv/Scripts/python.exe -m src.bot.main)",
+      "Bash(git checkout *)",
+      "Bash(.venv/Scripts/python.exe -c \"from src.bot.main import build_bot; b = build_bot\\(\\); print\\('OK: bot constructed:', type\\(b\\).__name__\\); print\\('intents:', b.intents\\)\")",
+      "Bash(.venv/Scripts/python.exe -m pip install audioop-lts)",
+      "Bash(.venv/Scripts/python.exe -c \"from src.bot.main import build_bot; b = build_bot\\(\\); print\\('OK: bot constructed:', type\\(b\\).__name__\\); print\\('intents members:', b.intents.members\\); print\\('command_prefix:', b.command_prefix\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from src.bot.main import build_bot, PpcBot; from src.bot.commands.clients import ClientsCog; from src.storage import clients; print\\('imports OK'\\); print\\('storage funcs:', [n for n in dir\\(clients\\) if not n.startswith\\('_'\\)]\\); print\\('cog group_name:', ClientsCog.__cog_settings__ if hasattr\\(ClientsCog, '__cog_settings__'\\) else 'n/a'\\); b = build_bot\\(\\); print\\('bot built:', type\\(b\\).__name__\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from src.storage import clients; rows = clients.list_clients\\(active_only=False\\); print\\(f'list_clients ok: {len\\(rows\\)} rows'\\); print\\('get_client\\(1\\):', clients.get_client\\(1\\)\\); print\\('get_client_by_name\\(\\\\\"nonexistent\\\\\"\\):', clients.get_client_by_name\\('nonexistent'\\)\\)\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\nagya\\OneDrive\\Development\\ppc-monitor"
+    ]
+  }
+}
