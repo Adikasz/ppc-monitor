@@ -10,7 +10,7 @@ from datetime import datetime
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from src.integrations.discord_router import _format_summary
+from src.integrations.discord_router import _format_summary, split_message
 from src.monitoring import summary as s
 
 TZ = ZoneInfo("Europe/Budapest")
@@ -224,5 +224,192 @@ def test_format_weekly_with_alerts_has_range_and_title():
         is_weekly=True,
     )
     assert "📊 **Hétvégi összefoglaló** — 2026-06-13 → 2026-06-16" in out
-    assert "Top problémák hétvégén" in out
+    assert "Problémák hétvégén" in out
     assert "Alertek hétvégén:** 4" in out
+
+
+# ---------------------------------------------------------------------------
+# Teljes problémalista (NINCS top-5 vágás)
+# ---------------------------------------------------------------------------
+
+def _many_alerts(n_critical: int, n_warning: int) -> list[dict]:
+    """n_critical + n_warning alert, kampányonként külön ID-val."""
+    alerts = []
+    for i in range(n_critical):
+        alerts.append(_alert(100 + i, "critical", f"C{i}", f"CPA +{i}%",
+                             "2026-06-15T10:00:00+02:00"))
+    for i in range(n_warning):
+        alerts.append(_alert(200 + i, "warning", f"W{i}", f"CTR -{i}%",
+                             "2026-06-15T11:00:00+02:00"))
+    return alerts
+
+
+def test_all_critical_and_warning_issues_are_listed_not_just_top5():
+    """A fő regresszió: korábban fix top-5 volt, így 12 riasztásból 7 kimaradt."""
+    import contextlib
+    frm = datetime(2026, 6, 15, 0, 0, tzinfo=TZ)
+    to = datetime(2026, 6, 16, 0, 0, tzinfo=TZ)
+    alerts = _many_alerts(7, 5)  # 12 riasztás
+    with contextlib.ExitStack() as stack:
+        _patch(stack, campaign_ids=list(range(100, 112)), alerts=alerts)
+        res = s._build_summary_sync(1, frm, to)
+
+    assert len(res["top_issues"]) == 12
+    assert res["issues_truncated"] == 0
+    assert res["critical_count"] == 7
+    assert res["warning_count"] == 5
+
+
+def test_issue_list_is_capped_only_by_safety_ceiling_and_reports_the_rest():
+    """A biztonsági plafon nem néma: az `issues_truncated` a kimaradt sorok száma."""
+    import contextlib
+    frm = datetime(2026, 6, 15, 0, 0, tzinfo=TZ)
+    to = datetime(2026, 6, 16, 0, 0, tzinfo=TZ)
+    alerts = _many_alerts(2, s._MAX_ISSUE_LINES + 8)
+    with contextlib.ExitStack() as stack:
+        _patch(stack, campaign_ids=[], alerts=alerts)
+        res = s._build_summary_sync(1, frm, to)
+
+    assert len(res["top_issues"]) == s._MAX_ISSUE_LINES
+    assert res["issues_truncated"] == 10
+    # Az összesített számok a TELJES halmazt tükrözik, nem a listát.
+    assert res["warning_count"] == s._MAX_ISSUE_LINES + 8
+
+
+def test_short_list_stays_flat():
+    """15 alattinál marad a régi, lapos felsorolás (nincs fölösleges csoport-fejléc)."""
+    issues = [{"client": "X", "campaign": f"K{i}", "severity": "critical", "message": "m"}
+              for i in range(4)]
+    out = _format_summary(
+        {"total_campaigns": 10, "critical_count": 4, "warning_count": 0,
+         "alert_count": 4, "healthy_campaigns": 6, "top_issues": issues,
+         "from": "2026-06-15T00:00:00+02:00", "to": "2026-06-16T00:00:00+02:00"},
+        is_weekly=False,
+    )
+    assert "KRITIKUS: 4 db" not in out
+    for i in range(4):
+        assert f"K{i}" in out
+
+
+def test_long_list_is_grouped_by_severity_with_counts():
+    issues = (
+        [{"client": "X", "campaign": f"C{i}", "severity": "critical", "message": "m"}
+         for i in range(12)]
+        + [{"client": "X", "campaign": f"W{i}", "severity": "warning", "message": "m"}
+           for i in range(8)]
+    )
+    out = _format_summary(
+        {"total_campaigns": 30, "critical_count": 12, "warning_count": 8,
+         "alert_count": 20, "healthy_campaigns": 10, "top_issues": issues,
+         "from": "2026-06-15T00:00:00+02:00", "to": "2026-06-16T00:00:00+02:00"},
+        is_weekly=False,
+    )
+    assert "🔴 **KRITIKUS: 12 db**" in out
+    assert "🟡 **FIGYELMEZTETÉS: 8 db**" in out
+    # A critical csoport a warning ELŐTT áll.
+    assert out.index("KRITIKUS: 12 db") < out.index("FIGYELMEZTETÉS: 8 db")
+    # Minden sor kint van, egy sem esett ki.
+    for i in range(12):
+        assert f"C{i}" in out
+    for i in range(8):
+        assert f"W{i}" in out
+
+
+def test_aggregate_counts_are_totals_not_displayed_row_count():
+    """"Kritikus: X | Figyelmeztetés: Y" az ÖSSZESÍTETT szám akkor is,
+    ha a biztonsági plafon miatt kevesebb sor látszik."""
+    issues = [{"client": "X", "campaign": f"C{i}", "severity": "critical", "message": "m"}
+              for i in range(20)]
+    out = _format_summary(
+        {"total_campaigns": 60, "critical_count": 45, "warning_count": 30,
+         "alert_count": 75, "healthy_campaigns": 5, "top_issues": issues,
+         "issues_truncated": 55,
+         "from": "2026-06-15T00:00:00+02:00", "to": "2026-06-16T00:00:00+02:00"},
+        is_weekly=False,
+    )
+    assert "🔴 Kritikus: 45  |  🟡 Figyelmeztetés: 30" in out
+    # A csoport-fejléc is a teljes darabszámot mutatja...
+    assert "🔴 **KRITIKUS: 45 db**" in out
+    # ...és jelzi, hogy 25 kritikus sor nem fért ki (45 - 20 kilistázott).
+    assert "és még 25 további kritikus riasztás" in out
+
+
+def test_grouped_and_overall_truncation_notes_do_not_double_count():
+    """A csoportszinten már jelzett rejtett sorokat a záró megjegyzés nem ismétli."""
+    issues = (
+        [{"client": "X", "campaign": f"C{i}", "severity": "critical", "message": "m"}
+         for i in range(10)]
+        + [{"client": "X", "campaign": f"W{i}", "severity": "warning", "message": "m"}
+           for i in range(10)]
+    )
+    out = _format_summary(
+        {"total_campaigns": 40, "critical_count": 10, "warning_count": 14,
+         "alert_count": 24, "healthy_campaigns": 16, "top_issues": issues,
+         "issues_truncated": 4,
+         "from": "2026-06-15T00:00:00+02:00", "to": "2026-06-16T00:00:00+02:00"},
+        is_weekly=False,
+    )
+    # A 4 rejtett sor mind warning → csak a csoportnál jelenik meg.
+    assert "*… és még 4 további figyelmeztetés*" in out
+    assert "*… és még 4 további riasztás*" not in out
+
+
+def test_unknown_severity_issues_are_not_dropped_from_grouped_list():
+    issues = (
+        [{"client": "X", "campaign": f"C{i}", "severity": "critical", "message": "m"}
+         for i in range(16)]
+        + [{"client": "X", "campaign": "ODD", "severity": "", "message": "m"}]
+    )
+    out = _format_summary(
+        {"total_campaigns": 20, "critical_count": 16, "warning_count": 0,
+         "alert_count": 17, "healthy_campaigns": 3, "top_issues": issues,
+         "from": "2026-06-15T00:00:00+02:00", "to": "2026-06-16T00:00:00+02:00"},
+        is_weekly=False,
+    )
+    assert "ODD" in out
+
+
+# ---------------------------------------------------------------------------
+# Üzenet-darabolás (Discord 2000 karakteres limit)
+# ---------------------------------------------------------------------------
+
+def test_split_message_keeps_short_content_in_one_piece():
+    assert split_message("rövid") == ["rövid"]
+
+
+def test_split_message_respects_limit_and_loses_nothing():
+    lines = [f"• sor {i} — " + "x" * 60 for i in range(120)]
+    content = "\n".join(lines)
+    parts = split_message(content)
+
+    assert len(parts) > 1
+    assert all(len(p) <= 1900 for p in parts)
+    # Minden sor pontosan egyszer szerepel, sorrendhelyesen.
+    assert "\n".join(parts).split("\n") == lines
+
+
+def test_split_message_handles_a_single_overlong_line():
+    parts = split_message("y" * 5000, limit=1900)
+    assert all(len(p) <= 1900 for p in parts)
+    assert "".join(parts) == "y" * 5000
+
+
+def test_full_summary_of_a_noisy_day_survives_the_discord_limit():
+    """Végponttól végpontig: 120 riasztás → több üzenet, egyik sem lépi túl a limitet."""
+    issues = [
+        {"client": "Ügyfél", "campaign": f"Kampány-{i}", "platform": "meta",
+         "account_label": f"act_{i}", "severity": "critical" if i % 2 else "warning",
+         "message": "ROAS 0.00 a cél 3.00 alatt"}
+        for i in range(120)
+    ]
+    out = _format_summary(
+        {"total_campaigns": 200, "critical_count": 60, "warning_count": 60,
+         "alert_count": 120, "healthy_campaigns": 80, "top_issues": issues,
+         "from": "2026-06-15T00:00:00+02:00", "to": "2026-06-16T00:00:00+02:00"},
+        is_weekly=False,
+    )
+    parts = split_message(out)
+
+    assert len(out) > 1900          # egy üzenetbe tényleg nem férne
+    assert all(len(p) <= 1900 for p in parts)
+    assert "\n".join(parts) == out  # semmi nem veszett el

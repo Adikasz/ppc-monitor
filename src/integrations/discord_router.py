@@ -29,6 +29,10 @@ from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
+# Discord üzenet-limit 2000 karakter; kis margóval dolgozunk (a `channel.send`
+# HTTP 400-zal elszáll, ha átlépjük — lásd `split_message`).
+_MAX_MESSAGE_CHARS = 1900
+
 # A futó bot kliens (commands.Bot). A main.py on_ready állítja be.
 _client: Any = None
 
@@ -249,8 +253,95 @@ def _date_label(iso: str | None) -> str:
         return str(iso)[:10]
 
 
+# Ennyi problémáig lapos listát adunk (mint korábban); efölött severity
+# szerint csoportosítunk, hogy a hosszú lista is átlátható maradjon.
+_FLAT_ISSUE_LIST_MAX = 15
+
+# Csoport-fejlécek a súlyosság szerinti bontáshoz (megjelenítési sorrendben):
+# (severity, emoji, fejléc-címke, ragozott alak a "… és még N további …" sorhoz)
+_SEVERITY_GROUPS: tuple[tuple[str, str, str, str], ...] = (
+    ("critical", "🔴", "KRITIKUS", "kritikus riasztás"),
+    ("warning", "🟡", "FIGYELMEZTETÉS", "figyelmeztetés"),
+    ("insight", "💡", "INSIGHT", "insight"),
+)
+
+
+def _issue_line(issue: dict[str, Any]) -> str:
+    """Egy problémasor: `• Ügyfél [PLATFORM · fiók] — kampány — üzenet`."""
+    client = issue.get("client") or "?"
+    plat = issue.get("platform")
+    account_label = issue.get("account_label")
+    if plat and account_label:
+        tag = f" [{plat.upper()} · {account_label}]"
+    elif plat:
+        tag = f" [{plat.upper()}]"
+    else:
+        tag = ""
+    return f"• {client}{tag} — {issue.get('campaign', '?')} — {issue.get('message', '')}"
+
+
+def _grouped_issue_lines(
+    top_issues: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> tuple[list[str], int]:
+    """Súlyosság szerint csoportosított problémalista, csoportonkénti darabszámmal.
+
+    A csoport-fejlécben a TELJES napi darabszám áll (`critical_count` /
+    `warning_count`), nem a kilistázott sorok száma — ha a biztonsági plafon
+    miatt kevesebb sor jelenik meg, azt a csoport végén külön jelezzük.
+
+    Visszatérés: (sorok, csoportszinten már jelzett rejtett sorok száma) — így
+    a hívó csak a maradékot írja ki, nem számol duplán.
+    """
+    by_severity: dict[str, list[dict[str, Any]]] = {}
+    for issue in top_issues:
+        by_severity.setdefault((issue.get("severity") or "").lower(), []).append(issue)
+
+    # A fenti táblában nem szereplő (ismeretlen) severity-k se vesszenek el.
+    known = {key for key, _, _, _ in _SEVERITY_GROUPS}
+    groups = list(_SEVERITY_GROUPS) + [
+        (sev, "⚪", (sev or "EGYÉB").upper(), "riasztás")
+        for sev in by_severity
+        if sev not in known
+    ]
+
+    # A teljes darabszám csak a critical/warning-ra ismert az összesítőből;
+    # a többinél a kilistázott sorok száma az igazság.
+    totals = {
+        "critical": summary.get("critical_count"),
+        "warning": summary.get("warning_count"),
+    }
+
+    lines: list[str] = []
+    accounted_hidden = 0
+    for severity, emoji, label, hidden_noun in groups:
+        issues = by_severity.get(severity) or []
+        if not issues:
+            continue
+        total_for_group = totals.get(severity)
+        if not isinstance(total_for_group, int) or total_for_group < len(issues):
+            total_for_group = len(issues)
+
+        lines.append("")
+        lines.append(f"{emoji} **{label}: {total_for_group} db**")
+        lines.extend(_issue_line(issue) for issue in issues)
+
+        hidden = total_for_group - len(issues)
+        if hidden > 0:
+            accounted_hidden += hidden
+            lines.append(f"*… és még {hidden} további {hidden_noun}*")
+
+    return lines, accounted_hidden
+
+
 def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
-    """Összefoglaló Discord-üzenet szövege (napi vagy heti formátum)."""
+    """Összefoglaló Discord-üzenet szövege (napi vagy heti formátum).
+
+    A problémalista NINCS top-N-re vágva: minden aznapi riasztás szerepel.
+    Rövid listánál (≤ 15) lapos felsorolás, efölött súlyosság szerinti
+    csoportosítás darabszámmal. A 2000 karakteres Discord-limitet a küldő
+    (`send_summary_to_user`) kezeli több üzenetre bontással.
+    """
     total = summary.get("total_campaigns", 0)
     crit = summary.get("critical_count", 0)
     warn = summary.get("warning_count", 0)
@@ -275,13 +366,14 @@ def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
 
     if is_weekly:
         header = f"📊 **Hétvégi összefoglaló** — {from_label} → {to_label}"
-        issues_title = "**Top problémák hétvégén:**"
+        issues_title = "**Problémák hétvégén:**"
         alerts_label = "Alertek hétvégén"
     else:
         header = f"📊 **Napi összefoglaló** — {from_label}"
-        issues_title = "**Top problémák:**"
+        issues_title = "**Problémák:**"
         alerts_label = "Alertek tegnap"
 
+    # Az összesítő sor MINDIG a teljes darabszám (nem a kilistázott soroké).
     lines = [
         header,
         "",
@@ -291,24 +383,89 @@ def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
     if top_issues:
         lines.append("")
         lines.append(issues_title)
-        for issue in top_issues:
-            client = issue.get("client") or "?"
-            plat = issue.get("platform")
-            account_label = issue.get("account_label")
-            if plat and account_label:
-                tag = f" [{plat.upper()} · {account_label}]"
-            elif plat:
-                tag = f" [{plat.upper()}]"
-            else:
-                tag = ""
-            lines.append(
-                f"• {client}{tag} — {issue.get('campaign', '?')} — {issue.get('message', '')}"
-            )
+        accounted_hidden = 0
+        if len(top_issues) <= _FLAT_ISSUE_LIST_MAX:
+            lines.extend(_issue_line(issue) for issue in top_issues)
+        else:
+            group_lines, accounted_hidden = _grouped_issue_lines(top_issues, summary)
+            lines.extend(group_lines)
+
+        # A summary-réteg biztonsági plafonja (lásd summary._MAX_ISSUE_LINES):
+        # sose csonkítsunk csendben. Amit a csoport-fejlécek már jeleztek, azt
+        # itt nem számoljuk újra.
+        remaining_hidden = (summary.get("issues_truncated") or 0) - accounted_hidden
+        if remaining_hidden > 0:
+            lines.append(f"*… és még {remaining_hidden} további riasztás*")
 
     lines.append("")
     lines.append(f"**Kampányok figyelve:** {total}  |  **{alerts_label}:** {alert_count}")
     lines.append("─────────────")
     return "\n".join(lines)
+
+
+def split_message(content: str, limit: int = _MAX_MESSAGE_CHARS) -> list[str]:
+    """Hosszú üzenet felbontása a Discord 2000 karakteres limitje alá.
+
+    Sorhatáron vág, hogy egy problémasor ne törjön ketté. Semmi nem vész el:
+    egy önmagában túl hosszú sor (elvben nem fordul elő, de a `message` mező
+    szabad szöveg) darabokra bontva megy ki.
+
+    Ez a napi/heti összefoglalónál vált szükségessé: mióta MINDEN riasztás
+    szerepel benne (nem csak top 5), egy zajos nap átlépheti a 2000 karaktert —
+    darabolás nélkül a `channel.send` HTTP 400-zal elszállna, és az ügyfél az
+    EGÉSZ összefoglalót elveszítené.
+    """
+    if len(content) <= limit:
+        return [content]
+
+    parts: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for line in content.split("\n"):
+        while len(line) > limit:
+            if current:
+                parts.append("\n".join(current))
+                current, current_len = [], 0
+            parts.append(line[:limit])
+            line = line[limit:]
+
+        projected = current_len + len(line) + (1 if current else 0)
+        if current and projected > limit:
+            parts.append("\n".join(current))
+            current, current_len = [line], len(line)
+        else:
+            current.append(line)
+            current_len = projected
+
+    if current:
+        parts.append("\n".join(current))
+    return parts
+
+
+async def _send_with_retry(
+    channel: Any,
+    content: str,
+    allowed: discord.AllowedMentions,
+    *,
+    user_id: Any,
+) -> Any | None:
+    """Egy üzenetdarab kiküldése 429-re exponenciális visszalépéssel."""
+    for attempt in range(3):
+        try:
+            return await channel.send(content, allowed_mentions=allowed)
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 429 and attempt < 2:
+                wait = 2 ** attempt
+                log.warning("Discord 429 (összefoglaló) — újrapróba %ss múlva", wait)
+                await asyncio.sleep(wait)
+                continue
+            log.error("Összefoglaló küldési hiba (user #%s): %s", user_id, exc)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log.error("Összefoglaló váratlan küldési hiba (user #%s): %s", user_id, exc)
+            return None
+    return None
 
 
 async def send_summary_to_user(
@@ -319,7 +476,10 @@ async def send_summary_to_user(
 ) -> dict[str, Any] | None:
     """Egy összefoglaló kiküldése a user személyes csatornájába (vagy admin fallback).
 
-    Visszatérés: {"channel_id", "message_id"} siker esetén, különben None.
+    Hosszú összefoglaló több üzenetre bomlik (Discord 2000 karakteres limit).
+
+    Visszatérés: {"channel_id", "message_id", "message_ids"} siker esetén (a
+    `message_id` az ELSŐ darabé — ez a horgony), különben None.
     """
     channel_id = user.get("alerts_channel_id") or get_config().discord_admin_channel_id
 
@@ -348,25 +508,30 @@ async def send_summary_to_user(
 
     content = _format_summary(summary, is_weekly)
     allowed = discord.AllowedMentions.none()
+    parts = split_message(content)
 
-    for attempt in range(3):
-        try:
-            msg = await channel.send(content, allowed_mentions=allowed)
-            log.info(
-                "Összefoglaló kiküldve (user #%s, weekly=%s, csatorna=%s, msg=%s)",
-                user.get("id"), is_weekly, channel.id, msg.id,
+    message_ids: list[int] = []
+    for index, part in enumerate(parts):
+        msg = await _send_with_retry(channel, part, allowed, user_id=user.get("id"))
+        if msg is None:
+            # Részleges kiküldés: ami kiment, az kiment — az első darab ID-ja
+            # a horgony, hogy a hívó lássa, nem volt teljes némaság.
+            log.error(
+                "Összefoglaló megszakadt a %d/%d. darabnál (user #%s)",
+                index + 1, len(parts), user.get("id"),
             )
-            return {"channel_id": channel.id, "message_id": msg.id}
-        except discord.HTTPException as exc:
-            if getattr(exc, "status", None) == 429 and attempt < 2:
-                wait = 2 ** attempt
-                log.warning("Discord 429 (összefoglaló) — újrapróba %ss múlva", wait)
-                await asyncio.sleep(wait)
-                continue
-            log.error("Összefoglaló küldési hiba (user #%s): %s", user.get("id"), exc)
-            return None
-        except Exception as exc:  # noqa: BLE001
-            log.error("Összefoglaló váratlan küldési hiba (user #%s): %s", user.get("id"), exc)
-            return None
+            break
+        message_ids.append(msg.id)
 
-    return None
+    if not message_ids:
+        return None
+
+    log.info(
+        "Összefoglaló kiküldve (user #%s, weekly=%s, csatorna=%s, %d üzenet, msg=%s)",
+        user.get("id"), is_weekly, channel.id, len(message_ids), message_ids[0],
+    )
+    return {
+        "channel_id": channel.id,
+        "message_id": message_ids[0],
+        "message_ids": message_ids,
+    }

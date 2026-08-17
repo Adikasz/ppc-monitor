@@ -10,6 +10,12 @@ Időablakok (Europe/Budapest, config.timezone):
     - weekly: a legutóbbi hétvége — péntek 22:00 → hétfő 08:00
 
 A riasztás időbélyege `detected_at` (lásd alerts séma — NEM `created_at`).
+
+A problémalista (`top_issues`) NINCS top-N-re vágva: az időablak MINDEN
+riasztása szerepel benne (csak egy magas biztonsági plafon védi, lásd
+`_MAX_ISSUE_LINES`). A megjelenítést — rövid listánál lapos felsorolás,
+hosszúnál súlyosság szerinti csoportosítás — a `discord_router._format_summary`
+végzi, a 2000 karakteres Discord-limitet pedig a küldő bontja több üzenetre.
 """
 from __future__ import annotations
 
@@ -26,9 +32,20 @@ from src.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-# Severity prioritás a "top problémák" rendezéséhez (kisebb = előrébb).
+# Severity prioritás a problémalista rendezéséhez (kisebb = előrébb).
 _SEVERITY_RANK = {"critical": 0, "warning": 1, "insight": 2}
-_TOP_ISSUES_LIMIT = 5
+
+# NINCS "top N" vágás: az ügyfél elvárása, hogy MINDEN aznapi CRITICAL és
+# WARNING szerepeljen az összefoglalóban (korábban fix top-5 volt, így egy
+# 20-alertes napból 15 riasztás némán kimaradt).
+#
+# Ez itt csak egy végső biztonsági plafon egy elszabadult nap ellen (pl. API-
+# hiba miatt minden kampányra alert keletkezik) — a Discord-üzenetek számát
+# tartja kordában. Ha életbe lép, NEM néma: a `issues_truncated` mezőt a
+# formázó kiírja ("… és még N további"), és WARNING logot is kap.
+# A severity-sorrend miatt előbb az insightok, majd a warningok esnek ki —
+# critical csak akkor, ha egyetlen napon 200+ kritikus riasztás van.
+_MAX_ISSUE_LINES = 200
 
 
 def _tz() -> ZoneInfo:
@@ -98,7 +115,7 @@ def _build_summary_sync(user_id: int, from_dt: datetime, to_dt: datetime) -> dic
     critical_count = sum(1 for a in alerts if (a.get("severity") or "").lower() == "critical")
     warning_count = sum(1 for a in alerts if (a.get("severity") or "").lower() == "warning")
 
-    # Top problémák: severity-prioritás szerint. A lista a DB-ből már
+    # Problémalista: severity-prioritás szerint. A lista a DB-ből már
     # detected_at DESC-ben jön, és a sorted() stabil → azonos severity-n belül
     # megmarad a "legfrissebb előre" sorrend.
     ordered = sorted(
@@ -107,7 +124,7 @@ def _build_summary_sync(user_id: int, from_dt: datetime, to_dt: datetime) -> dic
     )
     account_cache: dict[tuple[int, str], int] = {}
     top_issues = []
-    for a in ordered[:_TOP_ISSUES_LIMIT]:
+    for a in ordered[:_MAX_ISSUE_LINES]:
         campaign = a.get("campaigns") or {}
         ad_account = campaign.get("ad_accounts") or {}
         client = ad_account.get("clients") or {}
@@ -120,15 +137,27 @@ def _build_summary_sync(user_id: int, from_dt: datetime, to_dt: datetime) -> dic
             "message": a.get("message") or a.get("metric") or "",
         })
 
+    issues_truncated = max(0, len(ordered) - len(top_issues))
+    if issues_truncated:
+        log.warning(
+            "Összefoglaló user #%s: %d riasztásból csak %d fér a listába "
+            "(biztonsági plafon: %d) — %d sor összevontan jelenik meg",
+            user_id, len(ordered), len(top_issues), _MAX_ISSUE_LINES, issues_truncated,
+        )
+
     campaigns_with_alerts = {a.get("campaign_id") for a in alerts if a.get("campaign_id") is not None}
     healthy_campaigns = max(0, total_campaigns - len(campaigns_with_alerts & set(campaign_ids)))
 
     return {
         "total_campaigns": total_campaigns,
+        # FONTOS: a critical_count / warning_count MINDIG a teljes időablak
+        # összesítése — nem a `top_issues` megjelenített sorainak száma.
+        # A formázó ezt írja ki "Kritikus: X | Figyelmeztetés: Y" néven.
         "critical_count": critical_count,
         "warning_count": warning_count,
         "alert_count": len(alerts),
         "top_issues": top_issues,
+        "issues_truncated": issues_truncated,
         "healthy_campaigns": healthy_campaigns,
         "from": from_dt.isoformat(),
         "to": to_dt.isoformat(),
