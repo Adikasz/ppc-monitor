@@ -373,6 +373,112 @@ def test_unknown_severity_issues_are_not_dropped_from_grouped_list():
 # Üzenet-darabolás (Discord 2000 karakteres limit)
 # ---------------------------------------------------------------------------
 
+def test_detected_at_is_carried_into_the_issue_rows():
+    import contextlib
+    frm = datetime(2026, 6, 15, 0, 0, tzinfo=TZ)
+    to = datetime(2026, 6, 16, 0, 0, tzinfo=TZ)
+    alerts = [_alert(10, "critical", "A", "ROAS 0.00", "2026-06-15T10:32:00+02:00")]
+    with contextlib.ExitStack() as stack:
+        _patch(stack, campaign_ids=[10], alerts=alerts)
+        res = s._build_summary_sync(1, frm, to)
+
+    assert res["top_issues"][0]["detected_at"] == "2026-06-15T10:32:00+02:00"
+
+
+def _one_issue_summary(detected_at, **over):
+    base = {
+        "total_campaigns": 1, "critical_count": 1, "warning_count": 0,
+        "alert_count": 1, "healthy_campaigns": 0,
+        "top_issues": [{
+            "client": "Stopvill", "campaign": "Sales-LEGRAND", "platform": "meta",
+            "account_label": None, "severity": "critical",
+            "message": "ROAS 0.00 a cél alatt", "detected_at": detected_at,
+        }],
+        "from": "2026-06-15T00:00:00+02:00", "to": "2026-06-16T00:00:00+02:00",
+    }
+    base.update(over)
+    return base
+
+
+def test_issue_line_ends_with_the_detection_time():
+    out = _format_summary(_one_issue_summary("2026-06-15T14:32:00+02:00"), is_weekly=False)
+    assert "• Stopvill [META] — Sales-LEGRAND — ROAS 0.00 a cél alatt (14:32)" in out
+
+
+def test_detection_time_is_converted_from_utc_to_local():
+    """A DB `timestamptz`-t tárol, a PostgREST UTC-ben adja vissza — a 12:32 UTC
+    magyar nyári idő szerint 14:32. Konverzió nélkül rossz órát mutatnánk."""
+    out = _format_summary(_one_issue_summary("2026-06-15T12:32:00+00:00"), is_weekly=False)
+    assert "(14:32)" in out
+    assert "(12:32)" not in out
+
+
+def test_naive_timestamp_is_treated_as_utc():
+    out = _format_summary(_one_issue_summary("2026-06-15T12:32:00"), is_weekly=False)
+    assert "(14:32)" in out
+
+
+def test_missing_or_broken_timestamp_does_not_break_the_line():
+    for value in (None, "", "nem-idobelyeg", "2026-13-45T99:99:99"):
+        out = _format_summary(_one_issue_summary(value), is_weekly=False)
+        assert "Sales-LEGRAND — ROAS 0.00 a cél alatt" in out
+        assert "(" not in out.split("Sales-LEGRAND")[1].split("\n")[0]
+
+
+def test_weekly_multi_day_list_shows_the_date_too():
+    """Hétvégi ablakban (péntek 22:00 → hétfő 08:00) a puszta óra:perc
+    félrevezető lenne — péntek 14:32 és vasárnap 14:32 egyformán nézne ki."""
+    issues = [
+        {"client": "A", "campaign": "P", "severity": "critical", "message": "m",
+         "detected_at": "2026-06-13T14:32:00+02:00"},
+        {"client": "B", "campaign": "Q", "severity": "warning", "message": "m",
+         "detected_at": "2026-06-14T14:32:00+02:00"},
+    ]
+    out = _format_summary(
+        {"total_campaigns": 5, "critical_count": 1, "warning_count": 1,
+         "alert_count": 2, "healthy_campaigns": 3, "top_issues": issues,
+         "from": "2026-06-13T22:00:00+02:00", "to": "2026-06-15T08:00:00+02:00"},
+        is_weekly=True,
+    )
+    assert "(06-13 14:32)" in out
+    assert "(06-14 14:32)" in out
+
+
+def test_single_day_list_omits_the_date():
+    issues = [
+        {"client": "A", "campaign": "P", "severity": "critical", "message": "m",
+         "detected_at": "2026-06-15T09:05:00+02:00"},
+        {"client": "B", "campaign": "Q", "severity": "warning", "message": "m",
+         "detected_at": "2026-06-15T14:32:00+02:00"},
+    ]
+    out = _format_summary(
+        {"total_campaigns": 5, "critical_count": 1, "warning_count": 1,
+         "alert_count": 2, "healthy_campaigns": 3, "top_issues": issues,
+         "from": "2026-06-15T00:00:00+02:00", "to": "2026-06-16T00:00:00+02:00"},
+        is_weekly=False,
+    )
+    assert "(09:05)" in out
+    assert "(14:32)" in out
+    assert "06-15" not in out.split("Problémák:")[1]
+
+
+def test_grouped_list_also_gets_timestamps():
+    issues = [
+        {"client": "A", "campaign": f"C{i}", "severity": "critical", "message": "m",
+         "detected_at": f"2026-06-15T10:{i:02d}:00+02:00"}
+        for i in range(20)
+    ]
+    out = _format_summary(
+        {"total_campaigns": 30, "critical_count": 20, "warning_count": 0,
+         "alert_count": 20, "healthy_campaigns": 10, "top_issues": issues,
+         "from": "2026-06-15T00:00:00+02:00", "to": "2026-06-16T00:00:00+02:00"},
+        is_weekly=False,
+    )
+    assert "🔴 **KRITIKUS: 20 db**" in out
+    for i in range(20):
+        assert f"C{i} — m (10:{i:02d})" in out
+
+
 def test_split_message_keeps_short_content_in_one_piece():
     assert split_message("rövid") == ["rövid"]
 

@@ -287,6 +287,47 @@ def test_format_multi_jelzi_a_kimaradt_sorokat():
     assert "*… és még 25 további kritikus riasztás*" in text
 
 
+def test_format_multi_kiirja_az_eszleles_idejet():
+    text = isum.format_instant_summary_multi(_base_multi(
+        accounts_total=2, accounts_ok=2,
+        critical_count=1, warning_count=0, alert_count=1,
+        top_issues=[{
+            "client": "GTX Kft", "campaign": "Prospecting", "severity": "critical",
+            "message": "ROAS 0.5", "account_label": "GTX",
+            "detected_at": "2026-07-27T09:15:00+02:00",
+        }],
+    ))
+    assert "• GTX Kft [GTX] — Prospecting — ROAS 0.5 (09:15)" in text
+
+
+@pytest.mark.asyncio
+async def test_multi_a_fiokonkenti_eszlelesi_idot_orokli(monkeypatch):
+    """A fiókok külön-külön, eltérő időpontban futnak le (korlátozott
+    párhuzamosság) — mindegyik sor a SAJÁT fiókja lekérési idejét viszi."""
+    accounts = [_account(1, "act_1"), _account(2, "act_2")]
+    stamps = {1: "2026-07-27T09:15:00+02:00", 2: "2026-07-27T09:16:00+02:00"}
+
+    async def _fake_single(acct, *, client_name=None):
+        aid = acct["id"]
+        return {
+            "total_campaigns": 5, "campaigns_with_data": 5, "critical_count": 1,
+            "warning_count": 0, "healthy_campaigns": 4, "alert_count": 1,
+            "spend_today": 10.0, "issues_truncated": 0,
+            "top_issues": [{
+                "severity": "critical", "campaign": f"K{aid}", "client": "X",
+                "account_label": f"Fiok{aid}", "message": "m",
+                "detected_at": stamps[aid],
+            }],
+            "account_label": f"Fiok{aid}", "platform": "meta",
+        }
+
+    monkeypatch.setattr(isum, "generate_instant_account_summary", _fake_single)
+
+    s = await isum.generate_instant_summary_for_accounts(accounts)
+
+    assert {i["detected_at"] for i in s["top_issues"]} == set(stamps.values())
+
+
 def test_multi_osszefoglalo_atlepi_a_discord_limitet_es_darabolhato():
     """Végponttól végpontig: 120 anomália → több üzenet, egyik sem lépi túl a limitet."""
     from src.integrations.discord_router import split_message

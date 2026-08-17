@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import discord
 
@@ -248,10 +250,49 @@ def _date_label(iso: str | None) -> str:
     if not iso:
         return "?"
     try:
-        from datetime import datetime
         return datetime.fromisoformat(iso).strftime("%Y-%m-%d")
     except ValueError:
         return str(iso)[:10]
+
+
+def _local_detected_at(issue: dict[str, Any]) -> datetime | None:
+    """Az anomália észlelési ideje a KONFIGURÁLT időzónában. None, ha nincs/hibás.
+
+    A konverzió nem elhagyható: az `alerts.detected_at` `timestamptz`, amit a
+    PostgREST UTC-ben ad vissza — nyers string-vágással egy 10:32-es magyar
+    észlelés 08:32-ként jelenne meg.
+
+    Sosem dob: hibás/hiányzó időbélyeg miatt nem eshet szét az összefoglaló,
+    olyankor egyszerűen elmarad az időpont a sor végéről.
+    """
+    raw = issue.get("detected_at")
+    if not raw:
+        return None
+
+    if isinstance(raw, datetime):
+        parsed = raw
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
+    if parsed.tzinfo is None:
+        # A DB UTC-ben tárol — a tz nélküli érték ennek a konvenciónak felel meg.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    try:
+        return parsed.astimezone(ZoneInfo(get_config().timezone or "UTC"))
+    except (KeyError, ValueError):  # ismeretlen/hibás időzóna a configban
+        return parsed
+
+
+def _detected_at_suffix(issue: dict[str, Any], *, with_date: bool) -> str:
+    """` (14:32)` a problémasor végére — több napot átfogó listánál ` (06-14 14:32)`."""
+    detected = _local_detected_at(issue)
+    if detected is None:
+        return ""
+    return f" ({detected.strftime('%m-%d %H:%M' if with_date else '%H:%M')})"
 
 
 # Ennyi problémáig lapos listát adunk (mint korábban); efölött severity
@@ -353,16 +394,28 @@ def issue_section_lines(
     A `line_fn` teszi hívhatóvá többféle összefoglalóból: minden nézetnek más a
     sor-formátuma (a napiban benne a platform, az azonnaliban a fiók már a
     fejlécben szerepel), a csoportosítás és a csonkítás-jelzés viszont közös.
+
+    Minden sor végére kerül az észlelés időpontja (`detected_at`), ha az adott
+    nézet megadja — így elég ide beépíteni, mindhárom összefoglaló megkapja.
     """
     if not top_issues:
         return []
 
+    # Ha a lista több napot fog át (heti összefoglaló: péntek 22:00 → hétfő
+    # 08:00), a puszta óra:perc félrevezető — péntek 14:32 és vasárnap 14:32
+    # ugyanúgy nézne ki. Ilyenkor dátummal írjuk ki.
+    days = {d.date() for d in map(_local_detected_at, top_issues) if d is not None}
+    with_date = len(days) > 1
+
+    def _render(issue: dict[str, Any]) -> str:
+        return line_fn(issue) + _detected_at_suffix(issue, with_date=with_date)
+
     accounted_hidden = 0
     if len(top_issues) <= _FLAT_ISSUE_LIST_MAX:
-        lines = [line_fn(issue) for issue in top_issues]
+        lines = [_render(issue) for issue in top_issues]
     else:
         lines, accounted_hidden = _grouped_issue_lines(
-            top_issues, summary, line_fn=line_fn
+            top_issues, summary, line_fn=_render
         )
 
     remaining_hidden = (summary.get("issues_truncated") or 0) - accounted_hidden

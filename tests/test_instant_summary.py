@@ -107,6 +107,7 @@ async def test_top_issues_a_napi_osszefoglalo_szerkezeteben(wired):
     issue = s["top_issues"][0]
     assert set(issue) == {
         "client", "campaign", "platform", "account_label", "severity", "message",
+        "detected_at",
     }
     assert issue["client"] == "GTX"
     assert issue["campaign"] == "Kampany 1"
@@ -305,6 +306,28 @@ def test_format_rovid_lista_lapos_marad():
     assert "KRITIKUS: 4 db" not in text
     for i in range(4):
         assert f"C{i}" in text
+
+
+@pytest.mark.asyncio
+async def test_elo_anomalia_a_lekeres_idejet_kapja_eszlelesi_idonek(wired):
+    """Az élő pillanatképnél nincs DB (nincs `detected_at` a detektorból) — az
+    észlelés ideje maga a lekérés pillanata, hogy a sor ugyanúgy kapjon
+    időbélyeget, mint a napi összefoglalóban."""
+    s = await isum.generate_instant_account_summary(_ACCOUNT, client_name="GTX")
+    issue = s["top_issues"][0]
+    assert issue["detected_at"] == s["fetched_at"]
+
+
+def test_format_kiirja_az_eszleles_idejet_a_sor_vegen():
+    text = isum.format_instant_summary(_base_summary(
+        critical_count=1, alert_count=1, healthy_campaigns=4,
+        top_issues=[{
+            "client": "GTX", "campaign": "Prospecting", "platform": "meta",
+            "account_label": "GTX reklama", "severity": "critical",
+            "message": "ROAS 0.5", "detected_at": "2026-07-26T20:40:00+02:00",
+        }],
+    ))
+    assert "• GTX — Prospecting — ROAS 0.5 (20:40)" in text
 
 
 def test_format_soraiban_nincs_redundans_fiokcimke():

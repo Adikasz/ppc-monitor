@@ -203,6 +203,12 @@ async def generate_instant_account_summary(
             "account_label": account_label,
             "severity": (a.get("severity") or "").lower(),
             "message": a.get("message") or a.get("metric") or "",
+            # ÉLŐ pillanatkép: a detektor most, ebben a pillanatban találta az
+            # anomáliát (a tárolt alerteknél a DB tölti a detected_at-et — itt
+            # nincs DB-írás, lásd modul-docstring). A lekérés ideje = az
+            # észlelés ideje, így a sorok ugyanúgy kapnak időbélyeget, mint a
+            # napi összefoglalóban.
+            "detected_at": now.isoformat(),
         }
         for a in ordered[:_MAX_ISSUE_LINES]
     ]

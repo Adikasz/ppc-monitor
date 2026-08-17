@@ -135,6 +135,9 @@ def _build_summary_sync(user_id: int, from_dt: datetime, to_dt: datetime) -> dic
             "account_label": _multi_account_label(ad_account, account_cache),
             "severity": (a.get("severity") or "").lower(),
             "message": a.get("message") or a.get("metric") or "",
+            # Az észlelés időpontja a sor végére (a formázó teszi ki, helyi
+            # időzónára váltva) — az OM így látja, mikor keletkezett a gond.
+            "detected_at": a.get("detected_at"),
         })
 
     issues_truncated = max(0, len(ordered) - len(top_issues))
