@@ -91,3 +91,104 @@ def test_impressions_drop_critical():
     hits = _metrics(out, "impressions_drop")
     assert len(hits) == 1 and hits[0]["severity"] == "critical"
     assert "1,000" in hits[0]["message"] and "500" in hits[0]["message"]
+
+
+# --- Minimum-adat kapu az arány-metrikákhoz (issue #5) ----------------------
+#
+# A nap elején (02:00-s ciklus) még alig van aznapi adat: 0 megjelenés mellett a
+# CTR és a ROAS is 0.00 → a detektor CRITICAL-nak látná. A napi dedup miatt ez
+# EGÉSZ NAPRA elnyomná a később keletkező VALÓDI riasztást ugyanarra a
+# kampány+metrika párra, ezért az arány-alapú szabályok csak elég adat mellett
+# futnak.
+
+_NULLA_ADAT = {"roas": 0.0, "ctr": 0.0, "cpa": 0.0, "cpm": 0.0, "frequency": 0.0}
+_KPIK = {
+    "target_roas": 5.0, "target_ctr": 1.0, "max_cpa": 4000.0,
+    "min_ctr": 1.0, "max_cpm": 2000.0, "max_frequency": 3.0,
+}
+
+
+def test_no_data_at_all_produces_no_ratio_alerts():
+    """A pontosan az éles kimenetben látott eset: 0 megjelenés → CTR/ROAS 0.00."""
+    out = detector._evaluate_rules(
+        1, {**_NULLA_ADAT, "impressions": 0, "spend": 0.0}, _eff(**_KPIK), False,
+    )
+    assert out == [], f"nulla adatnál nem lehet arány-riasztás, kaptunk: {out}"
+
+
+def test_few_impressions_produce_no_ratio_alerts():
+    """Néhány megjelenés még nem elég — a 0.00-s arányok itt is adathiányt jelentenek."""
+    out = detector._evaluate_rules(
+        1,
+        {**_NULLA_ADAT, "impressions": detector._MIN_IMPRESSIONS_FOR_RATIOS - 1,
+         "spend": 500.0},
+        _eff(**_KPIK),
+        False,
+    )
+    assert {a["metric"] for a in out} == set()
+
+
+def test_enough_impressions_still_alert_normally():
+    """A kapu csak az adathiányt szűri — valós adatnál a szabályok futnak."""
+    out = detector._evaluate_rules(
+        1,
+        {"impressions": 5_000, "ctr": 0.001, "roas": 0.5, "spend": 5_000.0},
+        _eff(target_roas=5.0, min_ctr=1.0),
+        False,
+    )
+    metrikak = {a["metric"] for a in out}
+    assert "roas_drop" in metrikak
+    assert "ctr_drop" in metrikak
+
+
+def test_boundary_exactly_at_the_threshold_is_enough():
+    """A küszöb INKLUZÍV: pontosan annyi megjelenés már elég."""
+    kozos = {"ctr": 0.001, "roas": 0.5, "spend": 5_000.0}
+    kapun_belul = detector._evaluate_rules(
+        1, {**kozos, "impressions": detector._MIN_IMPRESSIONS_FOR_RATIOS},
+        _eff(target_roas=5.0), False,
+    )
+    kapun_kivul = detector._evaluate_rules(
+        1, {**kozos, "impressions": detector._MIN_IMPRESSIONS_FOR_RATIOS - 1},
+        _eff(target_roas=5.0), False,
+    )
+    assert _metrics(kapun_belul, "roas_drop") != []
+    assert _metrics(kapun_kivul, "roas_drop") == []
+
+
+def test_ads_stopped_still_fires_without_impressions():
+    """A kapu NEM némíthatja el az `ads_stopped`-ot: 0 megjelenés + van költés
+    épp a valódi kritikus eset (leálltak a hirdetések, de fogy a pénz)."""
+    out = detector._evaluate_rules(
+        1, {"impressions": 0, "spend": 12_000.0, **_NULLA_ADAT}, _eff(**_KPIK), False,
+    )
+    hits = _metrics(out, "ads_stopped")
+    assert len(hits) == 1 and hits[0]["severity"] == "critical"
+
+
+def test_budget_and_no_conversion_rules_are_not_gated():
+    """A nem arány-alapú szabályok adathiány mellett is futnak."""
+    out = detector._evaluate_rules(
+        1,
+        {"impressions": 0, "spend": 100_000.0, "conversions": 0,
+         "days_without_conversion": 5},
+        _eff(monthly_budget=50_000.0, no_conversion_critical_days=3),
+        False,
+    )
+    metrikak = {a["metric"] for a in out}
+    assert "budget_depleted" in metrikak
+    assert "no_conversion" in metrikak
+
+
+def test_impressions_drop_is_not_gated_by_the_ratio_threshold():
+    """Az `impressions_drop` magát a darabszámot nézi — ha a megjelenés-küszöb
+    elnémítaná, pont a legfontosabb esetét veszítenénk el (alig van megjelenés).
+    """
+    out = detector._evaluate_rules(
+        1,
+        {"impressions": detector._MIN_IMPRESSIONS_FOR_RATIOS - 1, "conversions": 1},
+        _eff(min_impressions=10_000),
+        False,
+    )
+    hits = _metrics(out, "impressions_drop")
+    assert len(hits) == 1 and hits[0]["severity"] == "critical"
