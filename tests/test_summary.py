@@ -6,7 +6,7 @@ A storage réteget mockoljuk; a tiszta összesítő- és formázó-logikát tesz
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -14,6 +14,7 @@ from src.integrations.discord_router import _format_summary, split_message
 from src.monitoring import summary as s
 
 TZ = ZoneInfo("Europe/Budapest")
+UTC = timezone.utc
 
 
 def _alert(campaign_id, severity, name, message, detected_at, ad_account=None):
@@ -52,6 +53,172 @@ def test_weekend_range_on_monday_morning():
     frm, to = s.weekend_range(now)
     assert (frm.month, frm.day, frm.hour) == (6, 12, 22)
     assert (to.month, to.day, to.hour) == (6, 15, 8)
+
+
+# ---------------------------------------------------------------------------
+# A napi ablak PONTOS határai
+#
+# A napi összefoglaló a scheduleren KEDD–PÉNTEK 09:00-kor fut
+# (scheduler.py: trigger="cron", hour=9, day_of_week="tue-fri", a scheduler
+# időzónája a config.timezone). Az itt tesztelt elvárás: az ablak a TELJES
+# ELŐZŐ NAPTÁRI NAP legyen a konfigurált időzónában — NEM "az elmúlt 24 óra a
+# futás pillanatától", és NEM valamilyen "még nyitott probléma" szűrés.
+# ---------------------------------------------------------------------------
+
+def test_daily_range_starts_and_ends_at_exact_local_midnight():
+    """09:00-s futás → tegnap 00:00:00.000000 → ma 00:00:00.000000 (helyi idő).
+
+    A futás órája/perce NEM szivároghat be az ablakba: a `daily_range` a
+    `now`-ból csak a NAPOT használja, az időt nullázza.
+    """
+    frm, to = s.daily_range(datetime(2026, 8, 18, 9, 0, 37, 123456, tzinfo=TZ))
+
+    assert frm.isoformat() == "2026-08-17T00:00:00+02:00"
+    assert to.isoformat() == "2026-08-18T00:00:00+02:00"
+    # Explicit: minden idő-komponens nulla, és a konfigurált időzónában vagyunk.
+    for boundary in (frm, to):
+        assert (boundary.hour, boundary.minute, boundary.second, boundary.microsecond) == (0, 0, 0, 0)
+        assert boundary.tzinfo is not None
+        assert boundary.utcoffset() is not None
+
+
+def test_daily_range_is_not_a_rolling_24h_window():
+    """Ugyanaz a nap, más futásidő → UGYANAZ az ablak.
+
+    Ha "az elmúlt 24 óra" logika futna, a 09:00-s és a 23:00-s futás ablaka
+    eltérne — ez a teszt épp ezt zárja ki.
+    """
+    reggel = s.daily_range(datetime(2026, 8, 18, 9, 0, tzinfo=TZ))
+    keso_este = s.daily_range(datetime(2026, 8, 18, 23, 59, 59, tzinfo=TZ))
+    hajnal = s.daily_range(datetime(2026, 8, 18, 0, 0, 1, tzinfo=TZ))
+
+    assert reggel == keso_este == hajnal
+
+
+def test_daily_range_covers_the_whole_calendar_day_across_dst():
+    """Óraátállításkor is a TELJES naptári napot fedi (25, illetve 23 óra).
+
+    A `today0 - timedelta(days=1)` fali-óra aritmetika: a tegnapi 00:00-t adja,
+    nem "24 órával korábbat" — így az óraátállítás napja sem csúszik el.
+    """
+    # 2026-10-25: óra vissza → a nap 25 órás
+    frm, to = s.daily_range(datetime(2026, 10, 26, 9, 0, tzinfo=TZ))
+    assert frm.isoformat() == "2026-10-25T00:00:00+02:00"
+    assert to.isoformat() == "2026-10-26T00:00:00+01:00"
+    assert (to.astimezone(UTC) - frm.astimezone(UTC)) == timedelta(hours=25)
+
+    # 2026-03-29: óra előre → a nap 23 órás
+    frm, to = s.daily_range(datetime(2026, 3, 30, 9, 0, tzinfo=TZ))
+    assert frm.isoformat() == "2026-03-29T00:00:00+01:00"
+    assert to.isoformat() == "2026-03-30T00:00:00+02:00"
+    assert (to.astimezone(UTC) - frm.astimezone(UTC)) == timedelta(hours=23)
+
+
+def test_daily_query_filter_is_gte_from_and_lt_to():
+    """A tényleges WHERE feltétel: detected_at >= tegnap 00:00 ÉS < ma 00:00.
+
+    Ez a teszt a storage rétegig megy le, és rögzíti a PostgREST-nek küldött
+    KONKRÉT határértékeket — a felső határ szigorúan `lt` (nem `lte`), így a
+    ma 00:00:00-kor keletkezett alert már a KÖVETKEZŐ napé.
+    """
+    from src.storage import alerts as alerts_storage
+
+    calls: dict[str, tuple] = {}
+
+    class _Query:
+        def select(self, *a):
+            return self
+
+        def in_(self, *a):
+            return self
+
+        def gte(self, field, value):
+            calls["gte"] = (field, value)
+            return self
+
+        def lt(self, field, value):
+            calls["lt"] = (field, value)
+            return self
+
+        def order(self, *a, **k):
+            return self
+
+        def execute(self):
+            return mock.Mock(data=[])
+
+    frm, to = s.daily_range(datetime(2026, 8, 18, 9, 0, tzinfo=TZ))
+    with mock.patch.object(
+        alerts_storage, "get_supabase",
+        return_value=mock.Mock(table=lambda _t: _Query()),
+    ), mock.patch(
+        "src.storage.assignments.get_campaign_ids_for_user", return_value=[10]
+    ):
+        alerts_storage.get_alerts_for_user_in_range(1, frm, to)
+
+    # Alsó határ: tegnap 00:00 (inkluzív) — felső: ma 00:00 (EXKLUZÍV).
+    assert calls["gte"] == ("detected_at", "2026-08-17T00:00:00+02:00")
+    assert calls["lt"] == ("detected_at", "2026-08-18T00:00:00+02:00")
+    assert "lte" not in calls  # `lte` felső határral a ma 00:00-s alert is beesne
+
+
+def _in_daily_window(detected_at: datetime, now: datetime) -> bool:
+    """A tárolt lekérdezés szemantikája: from <= detected_at < to."""
+    frm, to = s.daily_range(now)
+    return frm <= detected_at < to
+
+
+def test_yesterday_2350_is_included_day_before_yesterday_2350_is_not():
+    """A konkrét elvárás: a tegnap 23:50-es alert BENNE van a mai reggeli
+    összefoglalóban, a tegnapelőtt 23:50-es NINCS."""
+    reggeli_futas = datetime(2026, 8, 18, 9, 0, tzinfo=TZ)  # kedd 09:00
+
+    tegnap_2350 = datetime(2026, 8, 17, 23, 50, tzinfo=TZ)
+    tegnapelott_2350 = datetime(2026, 8, 16, 23, 50, tzinfo=TZ)
+
+    assert _in_daily_window(tegnap_2350, reggeli_futas) is True
+    assert _in_daily_window(tegnapelott_2350, reggeli_futas) is False
+
+
+def test_daily_window_boundaries_are_inclusive_start_exclusive_end():
+    """A fél-nyitott intervallum két széle — egyik nap se lógjon át a másikba."""
+    reggeli_futas = datetime(2026, 8, 18, 9, 0, tzinfo=TZ)
+    cases = [
+        # (időpont,                                            benne van?)
+        (datetime(2026, 8, 16, 23, 59, 59, 999999, tzinfo=TZ), False),  # tegnapelőtt vége
+        (datetime(2026, 8, 17, 0, 0, 0, tzinfo=TZ), True),              # tegnap 00:00 — alsó határ
+        (datetime(2026, 8, 17, 12, 0, 0, tzinfo=TZ), True),             # tegnap dél
+        (datetime(2026, 8, 17, 23, 59, 59, 999999, tzinfo=TZ), True),   # tegnap utolsó pillanata
+        (datetime(2026, 8, 18, 0, 0, 0, tzinfo=TZ), False),             # ma 00:00 — felső határ
+        (datetime(2026, 8, 18, 8, 30, 0, tzinfo=TZ), False),            # ma reggel, a futás előtt
+    ]
+    for detected_at, expected in cases:
+        assert _in_daily_window(detected_at, reggeli_futas) is expected, detected_at
+
+
+def test_daily_summary_covers_yesterday_end_to_end():
+    """Végponttól végpontig: a `_build_summary_sync` a kapott ablakkal dolgozik,
+    és a tegnap 23:50-es alert megjelenik a listában."""
+    import contextlib
+
+    frm, to = s.daily_range(datetime(2026, 8, 18, 9, 0, tzinfo=TZ))
+    osszes = [
+        _alert(10, "critical", "Tegnap-2350", "ROAS 0.00", "2026-08-17T23:50:00+02:00"),
+        _alert(11, "warning", "Tegnapelott-2350", "CTR drop", "2026-08-16T23:50:00+02:00"),
+    ]
+    # A storage a fenti fél-nyitott feltétellel szűr — itt ugyanezt szimuláljuk.
+    szurt = [
+        a for a in osszes
+        if frm <= datetime.fromisoformat(a["detected_at"]) < to
+    ]
+
+    with contextlib.ExitStack() as stack:
+        _patch(stack, campaign_ids=[10, 11], alerts=szurt)
+        res = s._build_summary_sync(1, frm, to)
+
+    kampanyok = [i["campaign"] for i in res["top_issues"]]
+    assert "Tegnap-2350" in kampanyok
+    assert "Tegnapelott-2350" not in kampanyok
+    assert res["alert_count"] == 1
 
 
 # ---------------------------------------------------------------------------

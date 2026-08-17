@@ -174,6 +174,16 @@ def get_alerts_for_user_in_range(
     (kampány- + ügyfél-szintű), majd az alerts táblát szűrjük:
         campaign_id IN (user kampányai) AND detected_at ∈ [from_dt, to_dt)
 
+    A határok fél-nyitottak: `.gte(from_dt)` INKLUZÍV, `.lt(to_dt)` EXKLUZÍV —
+    így két egymást követő ablak sem fed át, és egyetlen alert sem esik ki
+    közülük. A napi összefoglalónál ez a teljes előző naptári napot jelenti
+    (lásd `monitoring.summary.daily_range`).
+
+    A szűrés KIZÁRÓLAG időalapú: nincs `status` feltétel, tehát a már kiküldött
+    (`sent`) és az elnyomott (`suppressed`) alertek is beleszámítanak — az
+    összefoglaló az adott nap TELJES riasztás-naplója, nem a "még nyitott
+    problémák" listája.
+
     FIGYELEM: az alerts időbélyege `detected_at` (NEM `created_at`).
     Rendezés: detected_at szerint csökkenő (a severity-prioritást a hívó
     summary réteg végzi, mert az SQL ABC-sorrendje nem szemantikus).
