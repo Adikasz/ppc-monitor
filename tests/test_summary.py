@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from src.integrations.discord_router import _format_summary, split_message
 from src.monitoring import summary as s
 
@@ -193,6 +195,339 @@ def test_daily_window_boundaries_are_inclusive_start_exclusive_end():
     ]
     for detected_at, expected in cases:
         assert _in_daily_window(detected_at, reggeli_futas) is expected, detected_at
+
+
+# ---------------------------------------------------------------------------
+# A heti MUNKANAPI ablak (hétfő 00:00 → szombat 00:00)
+#
+# A job péntek 16:00-kor fut (scheduler.py: cron hour=16, day_of_week="fri") —
+# a hét utolsó összefoglalója, a pénteki napi összefoglaló MELLÉ, külön
+# üzenetben. Ugyanaz az elvárás, mint a `daily_range`-nél: fix naptári ablak,
+# nem gördülő "utolsó 5×24 óra".
+# ---------------------------------------------------------------------------
+
+def test_workweek_range_is_monday_midnight_to_saturday_midnight():
+    """Péntek 16:00-s futás → hétfő 00:00 → szombat 00:00 (5 teljes nap)."""
+    frm, to = s.workweek_range(datetime(2026, 8, 21, 16, 0, tzinfo=TZ))  # péntek
+
+    assert frm.isoformat() == "2026-08-17T00:00:00+02:00"  # hétfő
+    assert to.isoformat() == "2026-08-22T00:00:00+02:00"   # szombat
+    assert frm.weekday() == 0 and to.weekday() == 5
+    for boundary in (frm, to):
+        assert (boundary.hour, boundary.minute, boundary.second, boundary.microsecond) == (0, 0, 0, 0)
+
+
+def test_workweek_range_is_not_a_rolling_5_day_window():
+    """Ugyanazon a pénteken bármikor futtatva UGYANAZ az ablak.
+
+    Ha "az utolsó 5×24 óra" logika futna, a 16:00-s és a reggeli lekérés
+    ablaka eltérne.
+    """
+    delutan = s.workweek_range(datetime(2026, 8, 21, 16, 0, tzinfo=TZ))
+    reggel = s.workweek_range(datetime(2026, 8, 21, 9, 5, tzinfo=TZ))
+    ejfel_utan = s.workweek_range(datetime(2026, 8, 21, 0, 0, 1, tzinfo=TZ))
+    keso = s.workweek_range(datetime(2026, 8, 21, 23, 59, 59, tzinfo=TZ))
+
+    assert delutan == reggel == ejfel_utan == keso
+
+
+def test_workweek_range_anchors_to_the_current_week_on_any_weekday():
+    """A hét BÁRMELY napján ugyanannak a hétnek a hétfőjétől számol."""
+    vart = ("2026-08-17T00:00:00+02:00", "2026-08-22T00:00:00+02:00")
+    for nap in range(17, 24):  # hétfő (17.) … vasárnap (23.)
+        frm, to = s.workweek_range(datetime(2026, 8, nap, 12, 0, tzinfo=TZ))
+        assert (frm.isoformat(), to.isoformat()) == vart, nap
+
+
+def test_workweek_range_covers_five_calendar_days_across_dst():
+    """Óraátállítás hetében is 5 TELJES naptári nap (nem 5×24 óra).
+
+    2026-03-29 (vasárnap) az óraátállítás — az azt KÖVETŐ hét munkanapjai már
+    nyári időszámításban vannak, a hetet záró szombat 00:00 is.
+    """
+    # Az óraátállítás hetét záró péntek: 2026-03-27 (még téli idő).
+    frm, to = s.workweek_range(datetime(2026, 3, 27, 16, 0, tzinfo=TZ))
+    assert frm.isoformat() == "2026-03-23T00:00:00+01:00"
+    assert to.isoformat() == "2026-03-28T00:00:00+01:00"
+    assert (to.astimezone(UTC) - frm.astimezone(UTC)) == timedelta(days=5)
+
+    # Az őszi átállítás (2026-10-25, vasárnap) UTÁNI hét: hétfőtől szombatig
+    # végig téli idő, de az átállítás a hét ELŐTT volt → sima 5 nap.
+    frm, to = s.workweek_range(datetime(2026, 10, 30, 16, 0, tzinfo=TZ))
+    assert frm.isoformat() == "2026-10-26T00:00:00+01:00"
+    assert to.isoformat() == "2026-10-31T00:00:00+01:00"
+    assert (to.astimezone(UTC) - frm.astimezone(UTC)) == timedelta(days=5)
+
+
+def _in_workweek_window(detected_at: datetime, now: datetime) -> bool:
+    frm, to = s.workweek_range(now)
+    return frm <= detected_at < to
+
+
+def test_workweek_window_boundaries_are_inclusive_start_exclusive_end():
+    """A hétfő eleje benne, a szombat eleje már nem — és a péntek TELJESEN benne."""
+    pentek_1600 = datetime(2026, 8, 21, 16, 0, tzinfo=TZ)
+    cases = [
+        # (időpont,                                            benne van?)
+        (datetime(2026, 8, 16, 23, 59, 59, 999999, tzinfo=TZ), False),  # előző vasárnap vége
+        (datetime(2026, 8, 17, 0, 0, 0, tzinfo=TZ), True),              # hétfő 00:00 — alsó határ
+        (datetime(2026, 8, 17, 23, 50, tzinfo=TZ), True),               # hétfő este
+        (datetime(2026, 8, 19, 12, 0, tzinfo=TZ), True),                # szerda dél
+        (datetime(2026, 8, 21, 15, 59, 59, tzinfo=TZ), True),           # péntek, a futás előtt
+        (datetime(2026, 8, 21, 23, 59, 59, 999999, tzinfo=TZ), True),   # péntek utolsó pillanata
+        (datetime(2026, 8, 22, 0, 0, 0, tzinfo=TZ), False),             # szombat 00:00 — felső határ
+    ]
+    for detected_at, expected in cases:
+        assert _in_workweek_window(detected_at, pentek_1600) is expected, detected_at
+
+
+def test_workweek_query_filter_is_gte_monday_and_lt_saturday():
+    """A tényleges WHERE feltétel a storage rétegig lemenve."""
+    from src.storage import alerts as alerts_storage
+
+    calls: dict[str, tuple] = {}
+
+    class _Query:
+        def select(self, *a):
+            return self
+
+        def in_(self, *a):
+            return self
+
+        def gte(self, field, value):
+            calls["gte"] = (field, value)
+            return self
+
+        def lt(self, field, value):
+            calls["lt"] = (field, value)
+            return self
+
+        def order(self, *a, **k):
+            return self
+
+        def execute(self):
+            return mock.Mock(data=[])
+
+    frm, to = s.workweek_range(datetime(2026, 8, 21, 16, 0, tzinfo=TZ))
+    with mock.patch.object(
+        alerts_storage, "get_supabase",
+        return_value=mock.Mock(table=lambda _t: _Query()),
+    ), mock.patch(
+        "src.storage.assignments.get_campaign_ids_for_user", return_value=[10]
+    ):
+        alerts_storage.get_alerts_for_user_in_range(1, frm, to)
+
+    assert calls["gte"] == ("detected_at", "2026-08-17T00:00:00+02:00")
+    assert calls["lt"] == ("detected_at", "2026-08-22T00:00:00+02:00")
+    assert "lte" not in calls
+
+
+def test_workweek_summary_covers_monday_to_friday_end_to_end():
+    """Végponttól végpontig: a hét mind az 5 munkanapja benne, az előző hét nem."""
+    import contextlib
+
+    frm, to = s.workweek_range(datetime(2026, 8, 21, 16, 0, tzinfo=TZ))
+    osszes = [
+        _alert(1, "critical", "Elozo-vasarnap", "m", "2026-08-16T23:50:00+02:00"),
+        _alert(2, "critical", "Hetfo", "m", "2026-08-17T00:00:00+02:00"),
+        _alert(3, "warning", "Kedd", "m", "2026-08-18T10:00:00+02:00"),
+        _alert(4, "warning", "Szerda", "m", "2026-08-19T10:00:00+02:00"),
+        _alert(5, "warning", "Csutortok", "m", "2026-08-20T10:00:00+02:00"),
+        _alert(6, "warning", "Pentek-delelott", "m", "2026-08-21T09:30:00+02:00"),
+        _alert(7, "critical", "Szombat", "m", "2026-08-22T00:00:00+02:00"),
+    ]
+    szurt = [a for a in osszes if frm <= datetime.fromisoformat(a["detected_at"]) < to]
+
+    with contextlib.ExitStack() as stack:
+        _patch(stack, campaign_ids=list(range(1, 8)), alerts=szurt)
+        res = s._build_summary_sync(1, frm, to)
+
+    kampanyok = {i["campaign"] for i in res["top_issues"]}
+    assert kampanyok == {
+        "Hetfo", "Kedd", "Szerda", "Csutortok", "Pentek-delelott",
+    }
+    assert "Elozo-vasarnap" not in kampanyok
+    assert "Szombat" not in kampanyok
+    assert res["alert_count"] == 5
+
+
+def test_workweek_window_does_not_overlap_the_weekend_window():
+    """A munkanapi ablak szombat 00:00-kor zár, a hétvégi péntek 22:00-kor nyit —
+    az átfedés tudatos: a péntek esti riasztás mindkettőben szerepel, de a
+    munkanapi összefoglaló 16:00-kor megy ki, tehát akkor még nem is létezik."""
+    pentek = datetime(2026, 8, 21, 16, 0, tzinfo=TZ)
+    munkanapi_to = s.workweek_range(pentek)[1]
+    hetvege_from = s.weekend_range(datetime(2026, 8, 24, 9, 0, tzinfo=TZ))[0]  # köv. hétfő
+
+    assert munkanapi_to.isoformat() == "2026-08-22T00:00:00+02:00"
+    assert hetvege_from.isoformat() == "2026-08-21T22:00:00+02:00"
+    # A hétvégi ablak a munkanapi ablak VÉGE előtt nyit — nincs lefedetlen rés.
+    assert hetvege_from < munkanapi_to
+
+
+# ---------------------------------------------------------------------------
+# A munkanapi összefoglaló FORMÁTUMA (megkülönböztetés a hétvégitől)
+# ---------------------------------------------------------------------------
+
+def _workweek_summary(**over):
+    base = {
+        "total_campaigns": 40, "critical_count": 1, "warning_count": 1,
+        "alert_count": 2, "healthy_campaigns": 38,
+        "top_issues": [
+            {"client": "Stopvill", "campaign": "Sales", "platform": "meta",
+             "account_label": None, "severity": "critical", "message": "ROAS 0.00",
+             "detected_at": "2026-08-17T10:15:00+02:00"},
+            {"client": "Marquard", "campaign": "Brand", "platform": "google",
+             "account_label": None, "severity": "warning", "message": "CTR -34%",
+             "detected_at": "2026-08-20T14:32:00+02:00"},
+        ],
+        "from": "2026-08-17T00:00:00+02:00", "to": "2026-08-22T00:00:00+02:00",
+    }
+    base.update(over)
+    return base
+
+
+def test_workweek_format_header_differs_from_the_weekend_one():
+    out = _format_summary(_workweek_summary(), kind="workweek")
+
+    assert "📊 **Heti összefoglaló — munkanapok (hétfő–péntek)**" in out
+    assert "Hétvégi összefoglaló" not in out
+    assert "Problémák a héten:" in out
+    assert "Alertek a héten:** 2" in out
+
+
+def test_workweek_format_header_shows_friday_not_saturday():
+    """A felső határ EXKLUZÍV szombat 00:00 — a fejlécben az utolsó BENNE lévő
+    nap (péntek) dátuma szerepeljen, különben szombatot írnánk ki."""
+    out = _format_summary(_workweek_summary(), kind="workweek")
+
+    assert "2026-08-17 → 2026-08-21" in out   # hétfő → péntek
+    assert "2026-08-22" not in out            # szombat sehol
+
+
+def test_workweek_format_keeps_timestamps_and_grouping():
+    """Ugyanaz a rendering, mint a többi nézetben: időbélyeg + csoportosítás."""
+    # Rövid lista → időbélyegek, több napot átfog → dátummal.
+    out = _format_summary(_workweek_summary(), kind="workweek")
+    assert "(08-17 10:15)" in out
+    assert "(08-20 14:32)" in out
+
+    # Hosszú lista → súlyosság szerinti csoportosítás.
+    sok = [
+        {"client": "A", "campaign": f"C{i}", "platform": "meta", "account_label": None,
+         "severity": "critical", "message": "m",
+         "detected_at": f"2026-08-18T10:{i:02d}:00+02:00"}
+        for i in range(20)
+    ]
+    out = _format_summary(
+        _workweek_summary(top_issues=sok, critical_count=20, warning_count=0, alert_count=20),
+        kind="workweek",
+    )
+    assert "🔴 **KRITIKUS: 20 db**" in out
+    for i in range(20):
+        assert f"C{i}" in out
+
+
+def test_workweek_format_no_alerts_branch():
+    out = _format_summary(
+        _workweek_summary(critical_count=0, warning_count=0, alert_count=0, top_issues=[]),
+        kind="workweek",
+    )
+    assert out.startswith("✅ **Heti összefoglaló — munkanapok (hétfő–péntek)**")
+    assert "A héten nem volt anomália" in out
+    assert "2026-08-17 → 2026-08-21" in out
+
+
+def test_format_summary_kind_defaults_stay_backwards_compatible():
+    """`kind` nélkül az `is_weekly` dönt — a régi hívások nem törnek el."""
+    napi = _format_summary(_workweek_summary(), is_weekly=False)
+    hetvegi = _format_summary(_workweek_summary(), is_weekly=True)
+
+    assert "Napi összefoglaló" in napi
+    assert "Hétvégi összefoglaló" in hetvegi
+
+
+# ---------------------------------------------------------------------------
+# Ütemezés: a munkanapi job regisztrálása és a kiküldés
+# ---------------------------------------------------------------------------
+
+def _registered_jobs():
+    """A `start_scheduler` által regisztrált jobok: {id: (függvény, kwargs)}."""
+    from types import SimpleNamespace
+
+    from src.monitoring import scheduler as sched
+
+    jobs: dict[str, tuple] = {}
+    fake = mock.Mock()
+    fake.add_job.side_effect = lambda func, **kw: jobs.__setitem__(kw.get("id"), (func, kw))
+
+    with mock.patch.object(sched, "AsyncIOScheduler", return_value=fake), \
+         mock.patch.object(
+             sched, "get_config",
+             return_value=SimpleNamespace(timezone="Europe/Budapest"),
+         ):
+        sched._scheduler = None
+        try:
+            sched.start_scheduler()
+        finally:
+            sched._scheduler = None
+    return jobs
+
+
+def test_workweek_job_runs_on_friday_at_16():
+    jobs = _registered_jobs()
+    from src.monitoring import scheduler as sched
+
+    assert "workweek_summary" in jobs
+    func, kw = jobs["workweek_summary"]
+    assert func is sched.workweek_summary_job
+    assert (kw["hour"], kw["minute"], kw["day_of_week"]) == (16, 0, "fri")
+
+
+def test_workweek_job_does_not_replace_the_friday_daily_summary():
+    """A pénteki napi összefoglaló VÁLTOZATLANUL kimegy 09:00-kor — a munkanapi
+    összefoglaló MELLÉ jön, külön üzenetben (külön job, külön id)."""
+    jobs = _registered_jobs()
+
+    _, napi = jobs["daily_summary"]
+    assert (napi["hour"], napi["minute"], napi["day_of_week"]) == (9, 0, "tue-fri")
+
+    _, hetvegi = jobs["weekly_summary"]
+    assert (hetvegi["hour"], hetvegi["minute"], hetvegi["day_of_week"]) == (9, 0, "mon")
+
+    # Három külön job, három külön id — egyik sem írja felül a másikat.
+    assert len({"daily_summary", "weekly_summary", "workweek_summary"} & set(jobs)) == 3
+
+
+@pytest.mark.asyncio
+async def test_workweek_job_sends_the_workweek_kind_to_every_user():
+    """A job a munkanapi generátort hívja, és `kind="workweek"`-kel küld —
+    ez viszi tovább a megkülönböztetett fejlécet a formázóig."""
+    from src.monitoring import scheduler as sched
+
+    users = [{"id": 1}, {"id": 2}]
+    generated: list[int] = []
+    sent: list[tuple] = []
+
+    async def _fake_generate(uid):
+        generated.append(uid)
+        return {"alert_count": 0, "total_campaigns": 0, "critical_count": 0,
+                "warning_count": 0, "healthy_campaigns": 0, "top_issues": []}
+
+    async def _fake_send(user, summary, *, is_weekly=False, kind=None):
+        sent.append((user["id"], kind))
+        return {"channel_id": 1, "message_id": 1}
+
+    with mock.patch.object(sched.users_storage, "list_users", return_value=users), \
+         mock.patch.dict(
+             sched._SUMMARY_KINDS,
+             {"workweek": (_fake_generate, "heti munkanapi")},
+         ), \
+         mock.patch.object(sched, "send_summary_to_user", new=_fake_send):
+        await sched.workweek_summary_job()
+
+    assert generated == [1, 2]
+    assert sent == [(1, "workweek"), (2, "workweek")]
 
 
 def test_daily_summary_covers_yesterday_end_to_end():

@@ -98,6 +98,36 @@ def weekend_range(now: datetime | None = None) -> tuple[datetime, datetime]:
     return friday, monday
 
 
+def workweek_range(now: datetime | None = None) -> tuple[datetime, datetime]:
+    """A HÉT MUNKANAPJAI: hétfő 00:00 → szombat 00:00 a konfigurált időzónában.
+
+    Vagyis a hétfő–péntek öt teljes naptári nap. A `daily_range` mintáját
+    követi, a határok ugyanúgy fél-nyitottak:
+        detected_at >= hétfő 00:00  ÉS  detected_at < szombat 00:00
+    Így a péntek 23:59:59.999999-kor keletkezett riasztás még benne van, a
+    szombat 00:00:00-kor keletkezett viszont már nem.
+
+    NEM gördülő "utolsó 5×24 óra": a `now`-ból CSAK a naptári napot vesszük
+    (a `weekday()` adja, hányadik napon állunk), az időt nullázzuk. A péntek
+    16:00-s ütemezett futás és egy kézi, délelőtti lekérés tehát PONTOSAN
+    ugyanazt az ablakot adja.
+
+    Óraátállításkor is a teljes naptári napokat fedi: a `timedelta` itt
+    fali-óra aritmetika (hétfő 00:00 + 5 nap = szombat 00:00), nem "120 óra".
+
+    FIGYELEM: az ütemezett job péntek 16:00-kor fut, amikor a péntek még nem
+    telt el teljesen. Az ablak felső határa szándékosan mégis szombat 00:00 —
+    így a szombat 00:00-ig keletkező riasztások mind beleesnek, és az ablak
+    nem függ a futás órájától. A 16:00 utáni pénteki riasztások értelemszerűen
+    már nem szerepelhetnek a 16:00-kor kiküldött üzenetben.
+    """
+    tz = _tz()
+    now = now.astimezone(tz) if now else datetime.now(tz)
+    today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    monday0 = today0 - timedelta(days=now.weekday())   # weekday(): hétfő=0
+    return monday0, monday0 + timedelta(days=5)        # szombat 00:00
+
+
 def _multi_account_label(
     ad_account: dict[str, Any],
     cache: dict[tuple[int, str], int],
@@ -206,6 +236,22 @@ async def generate_weekly_summary(user_id: int) -> dict[str, Any]:
     summary = await asyncio.to_thread(_build_summary_sync, user_id, from_dt, to_dt)
     log.info(
         "Hétvégi összefoglaló user #%s: %d kampány, %d alert (crit=%d, warn=%d)",
+        user_id, summary["total_campaigns"], summary["alert_count"],
+        summary["critical_count"], summary["warning_count"],
+    )
+    return summary
+
+
+async def generate_workweek_summary(user_id: int) -> dict[str, Any]:
+    """Heti MUNKANAPI összefoglaló (hétfő 00:00 → szombat 00:00).
+
+    Ugyanazt az aggregáló logikát használja, mint a napi és a hétvégi
+    összefoglaló — csak az időablak más (lásd `workweek_range`).
+    """
+    from_dt, to_dt = workweek_range()
+    summary = await asyncio.to_thread(_build_summary_sync, user_id, from_dt, to_dt)
+    log.info(
+        "Heti munkanapi összefoglaló user #%s: %d kampány, %d alert (crit=%d, warn=%d)",
         user_id, summary["total_campaigns"], summary["alert_count"],
         summary["critical_count"], summary["warning_count"],
     )

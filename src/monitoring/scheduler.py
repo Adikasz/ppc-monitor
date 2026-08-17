@@ -33,7 +33,11 @@ from src.monitoring.ai_insights import generate_ai_insight
 from src.monitoring.detector import detect_anomalies_for_campaign
 from src.monitoring.insight_engine import detect_insights_for_campaign
 from src.monitoring.router import route_alert
-from src.monitoring.summary import generate_daily_summary, generate_weekly_summary
+from src.monitoring.summary import (
+    generate_daily_summary,
+    generate_weekly_summary,
+    generate_workweek_summary,
+)
 from src.monitoring.token_monitor import token_health_check
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import campaigns as campaigns_storage
@@ -229,9 +233,21 @@ async def hourly_monitoring() -> None:
 # Napi / heti összefoglaló jobok (13. lépés)
 # ---------------------------------------------------------------------------
 
-async def _send_summaries(*, is_weekly: bool) -> None:
-    """Minden aktív usernek összefoglaló kiküldése (daily vagy weekly)."""
-    label = "heti" if is_weekly else "napi"
+# Az összefoglaló-fajták: (generátor, emberi címke a loghoz).
+# A `kind` megy tovább a formázóig (fejléc/lista-cím), lásd
+# `discord_router._format_summary`.
+_SUMMARY_KINDS = {
+    "daily": (generate_daily_summary, "napi"),
+    "weekend": (generate_weekly_summary, "hétvégi"),
+    "workweek": (generate_workweek_summary, "heti munkanapi"),
+}
+
+
+async def _send_summaries(*, is_weekly: bool = False, kind: str | None = None) -> None:
+    """Minden aktív usernek összefoglaló kiküldése (daily / weekend / workweek)."""
+    kind = kind or ("weekend" if is_weekly else "daily")
+    generate, label = _SUMMARY_KINDS[kind]
+
     try:
         users = await asyncio.to_thread(users_storage.list_users, active_only=True)
     except Exception:
@@ -242,11 +258,8 @@ async def _send_summaries(*, is_weekly: bool) -> None:
     for user in users:
         uid = user.get("id")
         try:
-            if is_weekly:
-                summary = await generate_weekly_summary(uid)
-            else:
-                summary = await generate_daily_summary(uid)
-            res = await send_summary_to_user(user, summary, is_weekly=is_weekly)
+            summary = await generate(uid)
+            res = await send_summary_to_user(user, summary, kind=kind)
             if res:
                 sent += 1
         except Exception as exc:  # noqa: BLE001 — egy user hibája ne állítsa le a kört
@@ -258,13 +271,24 @@ async def _send_summaries(*, is_weekly: bool) -> None:
 async def daily_summary_job() -> None:
     """Napi összefoglaló (kedd–péntek reggel; hétfőn a heti összefoglaló váltja)."""
     log.info("Napi összefoglaló job indítva…")
-    await _send_summaries(is_weekly=False)
+    await _send_summaries(kind="daily")
 
 
 async def weekly_summary_job() -> None:
     """Hétvégi összefoglaló (hétfő reggel) — a hétfői napi összefoglalót VÁLTJA."""
     log.info("Hétvégi összefoglaló job indítva…")
-    await _send_summaries(is_weekly=True)
+    await _send_summaries(kind="weekend")
+
+
+async def workweek_summary_job() -> None:
+    """Heti MUNKANAPI összefoglaló (péntek délután) — hétfő 00:00 → szombat 00:00.
+
+    A hét UTOLSÓ összefoglalója: a pénteki napi összefoglaló (reggel 09:00, a
+    csütörtöki napról) mellé délután megy ki a teljes hétfő–pénteki kép.
+    Külön üzenet, nem váltja ki a napit.
+    """
+    log.info("Heti munkanapi összefoglaló job indítva…")
+    await _send_summaries(kind="workweek")
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +513,27 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
     )
 
+    # Heti MUNKANAPI összefoglaló: PÉNTEK 16:00 — a hét utolsó összefoglalója,
+    # a teljes hétfő 00:00 → szombat 00:00 ablakról. A pénteki napi
+    # összefoglalót (09:00, a csütörtöki napról) NEM váltja ki: külön üzenet.
+    #
+    # Miért 16:00 és nem reggel? Reggel a péntek még alig kezdődött el, így a
+    # "hétfő–péntek" kép csonka lenne. A munkanap végén viszont a péntek is
+    # benne van. (Az ablak felső határa ettől függetlenül fix szombat 00:00 —
+    # lásd summary.workweek_range: a futás órája nem befolyásolja.)
+    _scheduler.add_job(
+        workweek_summary_job,
+        trigger="cron",
+        hour=16,
+        minute=0,
+        day_of_week="fri",
+        id="workweek_summary",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Heti Meta token-ellenőrzés: HÉTFŐ 08:00 (a napi munka előtt, hogy időben
     # kiderüljön, ha a token lejárt vagy hamarosan lejár).
     _scheduler.add_job(
@@ -537,8 +582,9 @@ def start_scheduler() -> AsyncIOScheduler:
 
     _scheduler.start()
     log.info(
-        "Monitoring scheduler indítva (óránkénti ciklus + napi/heti összefoglaló "
-        "+ napi insight scan 08:00, tz=%s)",
+        "Monitoring scheduler indítva (óránkénti ciklus + napi összefoglaló 09:00 "
+        "+ hétvégi összefoglaló hétfő 09:00 + heti munkanapi összefoglaló péntek "
+        "16:00 + napi insight scan 08:00, tz=%s)",
         timezone,
     )
     return _scheduler
