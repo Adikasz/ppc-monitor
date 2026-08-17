@@ -53,7 +53,28 @@ def _tz() -> ZoneInfo:
 
 
 def daily_range(now: datetime | None = None) -> tuple[datetime, datetime]:
-    """Tegnap 00:00 → ma 00:00 a konfigurált időzónában."""
+    """A TELJES előző naptári nap a konfigurált időzónában: tegnap 00:00 → ma 00:00.
+
+    A visszaadott pár közvetlenül a lekérdezés két határa lesz:
+        detected_at >= from_dt  ÉS  detected_at < to_dt
+    (lásd `storage.alerts.get_alerts_for_user_in_range` — `.gte()` / `.lt()`).
+
+    Fél-nyitott intervallum, szándékosan:
+      - az alsó határ INKLUZÍV → a tegnap 00:00:00-kor keletkezett alert benne van
+      - a felső határ EXKLUZÍV → a ma 00:00:00-kor keletkezett alert már a
+        következő napé, viszont a tegnap 23:59:59.999999 még benne van
+    Ez pontosabb, mint egy `<= 23:59:59` felső határ, ami a másodperc törtrészében
+    keletkezett riasztásokat némán elhagyná.
+
+    NEM gördülő 24 óra: a `now`-ból CSAK a naptári napot vesszük, az időt
+    nullázzuk — így teljesen mindegy, hogy a scheduler 09:00-kor futtatja
+    (scheduler.py: cron hour=9, day_of_week="tue-fri"), vagy valaki kézzel
+    kéri le a `/summary`-val délután; az ablak ugyanaz.
+
+    Óraátállításkor is a teljes napot fedi: a `today0 - timedelta(days=1)`
+    fali-óra aritmetika (a tegnapi 00:00-t adja, nem "24 órával korábbat"),
+    így az őszi nap 25, a tavaszi 23 órányi valós időt jelent.
+    """
     tz = _tz()
     now = now.astimezone(tz) if now else datetime.now(tz)
     today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -75,6 +96,37 @@ def weekend_range(now: datetime | None = None) -> tuple[datetime, datetime]:
         hour=22, minute=0, second=0, microsecond=0
     )
     return friday, monday
+
+
+def workweek_range(now: datetime | None = None) -> tuple[datetime, datetime]:
+    """A HÉT MUNKANAPJAI: hétfő 00:00 → szombat 00:00 a konfigurált időzónában.
+
+    Vagyis a hétfő–péntek öt teljes naptári nap. A `daily_range` mintáját
+    követi, a határok ugyanúgy fél-nyitottak:
+        detected_at >= hétfő 00:00  ÉS  detected_at < szombat 00:00
+    Így a péntek 23:59:59.999999-kor keletkezett riasztás még benne van, a
+    szombat 00:00:00-kor keletkezett viszont már nem.
+
+    NEM gördülő "utolsó 5×24 óra": a `now`-ból CSAK a naptári napot vesszük
+    (a `weekday()` adja, hányadik napon állunk), az időt nullázzuk. A péntek
+    17:05-ös ütemezett futás és egy kézi, délelőtti lekérés tehát PONTOSAN
+    ugyanazt az ablakot adja.
+
+    Óraátállításkor is a teljes naptári napokat fedi: a `timedelta` itt
+    fali-óra aritmetika (hétfő 00:00 + 5 nap = szombat 00:00), nem "120 óra".
+
+    FIGYELEM: az ütemezett job péntek 17:05-kor fut (a munkanap végén), amikor
+    a péntek még nem telt el teljesen. Az ablak felső határa szándékosan mégis
+    szombat 00:00 — így a szombat 00:00-ig keletkező riasztások mind beleesnek,
+    és az ablak nem függ a futás órájától. A 17:05 után keletkező pénteki
+    riasztások értelemszerűen már nem szerepelhetnek a 17:05-kor kiküldött
+    üzenetben (lásd a scheduler kommentjét a vállalt résről).
+    """
+    tz = _tz()
+    now = now.astimezone(tz) if now else datetime.now(tz)
+    today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    monday0 = today0 - timedelta(days=now.weekday())   # weekday(): hétfő=0
+    return monday0, monday0 + timedelta(days=5)        # szombat 00:00
 
 
 def _multi_account_label(
@@ -135,6 +187,9 @@ def _build_summary_sync(user_id: int, from_dt: datetime, to_dt: datetime) -> dic
             "account_label": _multi_account_label(ad_account, account_cache),
             "severity": (a.get("severity") or "").lower(),
             "message": a.get("message") or a.get("metric") or "",
+            # Az észlelés időpontja a sor végére (a formázó teszi ki, helyi
+            # időzónára váltva) — az OM így látja, mikor keletkezett a gond.
+            "detected_at": a.get("detected_at"),
         })
 
     issues_truncated = max(0, len(ordered) - len(top_issues))
@@ -186,3 +241,59 @@ async def generate_weekly_summary(user_id: int) -> dict[str, Any]:
         summary["critical_count"], summary["warning_count"],
     )
     return summary
+
+
+async def generate_workweek_summary(user_id: int) -> dict[str, Any]:
+    """Heti MUNKANAPI összefoglaló (hétfő 00:00 → szombat 00:00).
+
+    Ugyanazt az aggregáló logikát használja, mint a napi és a hétvégi
+    összefoglaló — csak az időablak más (lásd `workweek_range`).
+    """
+    from_dt, to_dt = workweek_range()
+    summary = await asyncio.to_thread(_build_summary_sync, user_id, from_dt, to_dt)
+    log.info(
+        "Heti munkanapi összefoglaló user #%s: %d kampány, %d alert (crit=%d, warn=%d)",
+        user_id, summary["total_campaigns"], summary["alert_count"],
+        summary["critical_count"], summary["warning_count"],
+    )
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Az összefoglaló-fajták EGYETLEN forrása
+#
+# Ezt használja MINDHÁROM hívó — az ütemezett jobok (scheduler), a `/summary`
+# és a `/my summary` —, így egyik sem duplikálja a leképezést, és a kézzel kért
+# összefoglaló bitre az, amit a scheduler küldene.
+# ---------------------------------------------------------------------------
+
+# kind → (generátor, emberi címke). A `kind` megy tovább a formázóig
+# (discord_router._format_summary: fejléc, lista-cím, alert-címke).
+SUMMARY_KINDS: dict[str, tuple[Any, str]] = {
+    "daily": (generate_daily_summary, "Napi"),
+    "weekend": (generate_weekly_summary, "Hétvégi"),
+    "workweek": (generate_workweek_summary, "Heti munkanapi"),
+}
+
+# A Discord-parancsok `type:` értéke → `kind`.
+#
+# A kettő SZÁNDÉKOSAN nem mindenhol azonos: a felhasználói "weekly" érték
+# megmarad (meglévő szokás, ne törjön a megszokott parancs), de belül
+# "weekend"-re képződik — a "workweek" a hétfő–pénteki változat.
+SUMMARY_TYPE_TO_KIND: dict[str, str] = {
+    "daily": "daily",
+    "weekly": "weekend",
+    "workweek": "workweek",
+}
+
+
+def resolve_summary_type(type_value: str | None) -> tuple[Any, str, str]:
+    """A parancs `type:` értéke → (generátor, formázó-`kind`, emberi címke).
+
+    Ismeretlen vagy hiányzó érték esetén a napi összefoglalóra esik vissza —
+    a Discord `choices` amúgy is korlátozza a lehetséges értékeket, ez csak
+    védőháló (pl. régi kliensből érkező hívásra).
+    """
+    kind = SUMMARY_TYPE_TO_KIND.get(type_value or "daily", "daily")
+    generate, label = SUMMARY_KINDS[kind]
+    return generate, kind, label

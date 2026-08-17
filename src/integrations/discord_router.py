@@ -20,7 +20,10 @@ Hibatűrés:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import discord
 
@@ -247,10 +250,63 @@ def _date_label(iso: str | None) -> str:
     if not iso:
         return "?"
     try:
-        from datetime import datetime
         return datetime.fromisoformat(iso).strftime("%Y-%m-%d")
     except ValueError:
         return str(iso)[:10]
+
+
+def _inclusive_end_date_label(iso: str | None) -> str:
+    """EXKLUZÍV felső határ → az utolsó BENNE lévő nap dátuma (fejléchez).
+
+    A munkanapi ablak szombat 00:00-val zárul, de az összefoglaló hétfő–péntek —
+    a fejlécben ezért a péntek dátuma a helyes.
+    """
+    if not iso:
+        return "?"
+    try:
+        return (datetime.fromisoformat(iso) - timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        return str(iso)[:10]
+
+
+def _local_detected_at(issue: dict[str, Any]) -> datetime | None:
+    """Az anomália észlelési ideje a KONFIGURÁLT időzónában. None, ha nincs/hibás.
+
+    A konverzió nem elhagyható: az `alerts.detected_at` `timestamptz`, amit a
+    PostgREST UTC-ben ad vissza — nyers string-vágással egy 10:32-es magyar
+    észlelés 08:32-ként jelenne meg.
+
+    Sosem dob: hibás/hiányzó időbélyeg miatt nem eshet szét az összefoglaló,
+    olyankor egyszerűen elmarad az időpont a sor végéről.
+    """
+    raw = issue.get("detected_at")
+    if not raw:
+        return None
+
+    if isinstance(raw, datetime):
+        parsed = raw
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
+    if parsed.tzinfo is None:
+        # A DB UTC-ben tárol — a tz nélküli érték ennek a konvenciónak felel meg.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    try:
+        return parsed.astimezone(ZoneInfo(get_config().timezone or "UTC"))
+    except (KeyError, ValueError):  # ismeretlen/hibás időzóna a configban
+        return parsed
+
+
+def _detected_at_suffix(issue: dict[str, Any], *, with_date: bool) -> str:
+    """` (14:32)` a problémasor végére — több napot átfogó listánál ` (06-14 14:32)`."""
+    detected = _local_detected_at(issue)
+    if detected is None:
+        return ""
+    return f" ({detected.strftime('%m-%d %H:%M' if with_date else '%H:%M')})"
 
 
 # Ennyi problémáig lapos listát adunk (mint korábban); efölött severity
@@ -283,6 +339,8 @@ def _issue_line(issue: dict[str, Any]) -> str:
 def _grouped_issue_lines(
     top_issues: list[dict[str, Any]],
     summary: dict[str, Any],
+    *,
+    line_fn: Callable[[dict[str, Any]], str],
 ) -> tuple[list[str], int]:
     """Súlyosság szerint csoportosított problémalista, csoportonkénti darabszámmal.
 
@@ -324,7 +382,7 @@ def _grouped_issue_lines(
 
         lines.append("")
         lines.append(f"{emoji} **{label}: {total_for_group} db**")
-        lines.extend(_issue_line(issue) for issue in issues)
+        lines.extend(line_fn(issue) for issue in issues)
 
         hidden = total_for_group - len(issues)
         if hidden > 0:
@@ -334,14 +392,73 @@ def _grouped_issue_lines(
     return lines, accounted_hidden
 
 
-def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
-    """Összefoglaló Discord-üzenet szövege (napi vagy heti formátum).
+def issue_section_lines(
+    top_issues: list[dict[str, Any]],
+    summary: dict[str, Any],
+    *,
+    line_fn: Callable[[dict[str, Any]], str] = _issue_line,
+) -> list[str]:
+    """A problémalista sorai — a napi és az azonnali összefoglaló KÖZÖS logikája.
 
-    A problémalista NINCS top-N-re vágva: minden aznapi riasztás szerepel.
-    Rövid listánál (≤ 15) lapos felsorolás, efölött súlyosság szerinti
-    csoportosítás darabszámmal. A 2000 karakteres Discord-limitet a küldő
-    (`send_summary_to_user`) kezeli több üzenetre bontással.
+    Rövid listánál (≤ `_FLAT_ISSUE_LIST_MAX`) lapos felsorolás, efölött
+    súlyosság szerinti csoportosítás darabszámmal. A végén — ha a summary-réteg
+    biztonsági plafonja levágott sorokat (`issues_truncated`) — jelzi a
+    maradékot; amit a csoport-fejlécek már jeleztek, azt nem számolja újra.
+
+    A `line_fn` teszi hívhatóvá többféle összefoglalóból: minden nézetnek más a
+    sor-formátuma (a napiban benne a platform, az azonnaliban a fiók már a
+    fejlécben szerepel), a csoportosítás és a csonkítás-jelzés viszont közös.
+
+    Minden sor végére kerül az észlelés időpontja (`detected_at`), ha az adott
+    nézet megadja — így elég ide beépíteni, mindhárom összefoglaló megkapja.
     """
+    if not top_issues:
+        return []
+
+    # Ha a lista több napot fog át (heti összefoglaló: péntek 22:00 → hétfő
+    # 08:00), a puszta óra:perc félrevezető — péntek 14:32 és vasárnap 14:32
+    # ugyanúgy nézne ki. Ilyenkor dátummal írjuk ki.
+    days = {d.date() for d in map(_local_detected_at, top_issues) if d is not None}
+    with_date = len(days) > 1
+
+    def _render(issue: dict[str, Any]) -> str:
+        return line_fn(issue) + _detected_at_suffix(issue, with_date=with_date)
+
+    accounted_hidden = 0
+    if len(top_issues) <= _FLAT_ISSUE_LIST_MAX:
+        lines = [_render(issue) for issue in top_issues]
+    else:
+        lines, accounted_hidden = _grouped_issue_lines(
+            top_issues, summary, line_fn=_render
+        )
+
+    remaining_hidden = (summary.get("issues_truncated") or 0) - accounted_hidden
+    if remaining_hidden > 0:
+        lines.append(f"*… és még {remaining_hidden} további riasztás*")
+    return lines
+
+
+def _format_summary(
+    summary: dict[str, Any],
+    is_weekly: bool = False,
+    *,
+    kind: str | None = None,
+) -> str:
+    """Összefoglaló Discord-üzenet szövege.
+
+    Három változat (`kind`): "daily", "weekend" és "workweek" — a fejléc, a
+    lista-cím és az alert-címke tér el, a tartalom-előállítás azonos.
+    A `kind` elhagyható; ilyenkor az `is_weekly` dönt ("weekend" vagy "daily"),
+    így a régi hívások változatlanul működnek.
+
+    A problémalista NINCS top-N-re vágva: az ablak minden riasztása szerepel.
+    Rövid listánál (≤ 15) lapos felsorolás, efölött súlyosság szerinti
+    csoportosítás darabszámmal, soronként az észlelés idejével. A 2000
+    karakteres Discord-limitet a küldő (`send_summary_to_user`) kezeli több
+    üzenetre bontással.
+    """
+    kind = kind or ("weekend" if is_weekly else "daily")
+
     total = summary.get("total_campaigns", 0)
     crit = summary.get("critical_count", 0)
     warn = summary.get("warning_count", 0)
@@ -351,10 +468,20 @@ def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
 
     from_label = _date_label(summary.get("from"))
     to_label = _date_label(summary.get("to"))
+    # A munkanapi ablak felső határa EXKLUZÍV (szombat 00:00) — a fejlécben az
+    # utolsó BENNE lévő napot (péntek) mutatjuk, különben szombatot írnánk ki
+    # egy hétfő–péntek összefoglalóra.
+    workweek_to_label = _inclusive_end_date_label(summary.get("to"))
 
     # Nincs anomália → rövid, pozitív üzenet.
     if alert_count == 0:
-        if is_weekly:
+        if kind == "workweek":
+            return (
+                f"✅ **Heti összefoglaló — munkanapok (hétfő–péntek)** — "
+                f"{from_label} → {workweek_to_label}\n"
+                f"A héten nem volt anomália. Minden kampány rendben. 🎉"
+            )
+        if kind == "weekend":
             return (
                 f"✅ **Hétvégi összefoglaló** — {from_label} → {to_label}\n"
                 f"A hétvégén nem volt anomália. Minden kampány rendben. 🎉"
@@ -364,7 +491,14 @@ def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
             f"Tegnap nem volt anomália. Minden kampány rendben. 🎉"
         )
 
-    if is_weekly:
+    if kind == "workweek":
+        header = (
+            f"📊 **Heti összefoglaló — munkanapok (hétfő–péntek)** — "
+            f"{from_label} → {workweek_to_label}"
+        )
+        issues_title = "**Problémák a héten:**"
+        alerts_label = "Alertek a héten"
+    elif kind == "weekend":
         header = f"📊 **Hétvégi összefoglaló** — {from_label} → {to_label}"
         issues_title = "**Problémák hétvégén:**"
         alerts_label = "Alertek hétvégén"
@@ -383,19 +517,7 @@ def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
     if top_issues:
         lines.append("")
         lines.append(issues_title)
-        accounted_hidden = 0
-        if len(top_issues) <= _FLAT_ISSUE_LIST_MAX:
-            lines.extend(_issue_line(issue) for issue in top_issues)
-        else:
-            group_lines, accounted_hidden = _grouped_issue_lines(top_issues, summary)
-            lines.extend(group_lines)
-
-        # A summary-réteg biztonsági plafonja (lásd summary._MAX_ISSUE_LINES):
-        # sose csonkítsunk csendben. Amit a csoport-fejlécek már jeleztek, azt
-        # itt nem számoljuk újra.
-        remaining_hidden = (summary.get("issues_truncated") or 0) - accounted_hidden
-        if remaining_hidden > 0:
-            lines.append(f"*… és még {remaining_hidden} további riasztás*")
+        lines.extend(issue_section_lines(top_issues, summary))
 
     lines.append("")
     lines.append(f"**Kampányok figyelve:** {total}  |  **{alerts_label}:** {alert_count}")
@@ -473,8 +595,12 @@ async def send_summary_to_user(
     summary: dict[str, Any],
     *,
     is_weekly: bool = False,
+    kind: str | None = None,
 ) -> dict[str, Any] | None:
     """Egy összefoglaló kiküldése a user személyes csatornájába (vagy admin fallback).
+
+    A `kind` ("daily" | "weekend" | "workweek") választja a formátumot; ha
+    nincs megadva, az `is_weekly` dönt (visszafelé kompatibilis).
 
     Hosszú összefoglaló több üzenetre bomlik (Discord 2000 karakteres limit).
 
@@ -506,7 +632,7 @@ async def send_summary_to_user(
         )
         return None
 
-    content = _format_summary(summary, is_weekly)
+    content = _format_summary(summary, is_weekly, kind=kind)
     allowed = discord.AllowedMentions.none()
     parts = split_message(content)
 
@@ -527,8 +653,9 @@ async def send_summary_to_user(
         return None
 
     log.info(
-        "Összefoglaló kiküldve (user #%s, weekly=%s, csatorna=%s, %d üzenet, msg=%s)",
-        user.get("id"), is_weekly, channel.id, len(message_ids), message_ids[0],
+        "Összefoglaló kiküldve (user #%s, típus=%s, csatorna=%s, %d üzenet, msg=%s)",
+        user.get("id"), kind or ("weekend" if is_weekly else "daily"),
+        channel.id, len(message_ids), message_ids[0],
     )
     return {
         "channel_id": channel.id,

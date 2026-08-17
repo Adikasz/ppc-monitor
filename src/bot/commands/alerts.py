@@ -313,7 +313,7 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
 
 
 class SummaryCog(commands.Cog):
-    """A `/summary` parancs — manuális napi/heti összefoglaló (13. lépés).
+    """A `/summary` parancs — manuális napi/hétvégi/heti munkanapi összefoglaló.
 
     NEM az /alert csoport alatt van (top-level /summary), ezért külön cog.
     """
@@ -323,16 +323,19 @@ class SummaryCog(commands.Cog):
 
     @app_commands.command(
         name="summary",
-        description="Napi vagy heti összefoglaló kérése (saját, vagy admin: mindenkinek)",
+        description="Napi, hétvégi vagy heti munkanapi összefoglaló (saját, vagy admin: mindenkinek)",
     )
     @app_commands.describe(
-        type="daily (tegnapi) vagy weekly (hétvégi) — alap: daily",
+        type="daily (tegnapi), weekly (hétvégi) vagy workweek (hétfő–péntek) — alap: daily",
         scope="me (csak nekem) vagy all (minden user — csak admin csatornában)",
     )
     @app_commands.choices(
         type=[
             app_commands.Choice(name="daily — napi (tegnap)", value="daily"),
             app_commands.Choice(name="weekly — hétvégi", value="weekly"),
+            app_commands.Choice(
+                name="workweek — heti munkanapi (hétfő–péntek)", value="workweek"
+            ),
         ],
         scope=[
             app_commands.Choice(name="me — csak nekem", value="me"),
@@ -347,15 +350,12 @@ class SummaryCog(commands.Cog):
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
-        is_weekly = bool(type and type.value == "weekly")
+        # A leképezés (type → generátor/kind/címke) a summary modulban él —
+        # ugyanazt hívja a `/my summary` és az ütemezett job is.
+        generate, kind, kind_label = summary_gen.resolve_summary_type(
+            type.value if type else None
+        )
         scope_value = scope.value if scope else "me"
-
-        async def _gen(uid: int) -> dict:
-            if is_weekly:
-                return await summary_gen.generate_weekly_summary(uid)
-            return await summary_gen.generate_daily_summary(uid)
-
-        kind_label = "Hétvégi" if is_weekly else "Napi"
 
         # --- scope: all (minden aktív user) — csak admin csatornában ---
         if scope_value == "all":
@@ -369,9 +369,9 @@ class SummaryCog(commands.Cog):
             sent = 0
             for user in users:
                 try:
-                    summary = await _gen(user["id"])
+                    summary = await generate(user["id"])
                     res = await discord_router.send_summary_to_user(
-                        user, summary, is_weekly=is_weekly
+                        user, summary, kind=kind
                     )
                     if res:
                         sent += 1
@@ -388,9 +388,9 @@ class SummaryCog(commands.Cog):
             str(interaction.user.id),
             interaction.user.display_name or interaction.user.name,
         )
-        summary = await _gen(user_row["id"])
+        summary = await generate(user_row["id"])
         res = await discord_router.send_summary_to_user(
-            user_row, summary, is_weekly=is_weekly
+            user_row, summary, kind=kind
         )
         if res:
             await interaction.followup.send(

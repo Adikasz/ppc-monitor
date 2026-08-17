@@ -661,13 +661,18 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         return await self._owned_account_choices(interaction, current)
 
     # ------------------------------------------------------------------
-    # /my summary [type:daily|weekly]
+    # /my summary [type:daily|weekly|workweek]
     # ------------------------------------------------------------------
     @app_commands.command(name="summary", description="A saját összefoglalód (csak a te fiókjaid)")
-    @app_commands.describe(type="daily (tegnapi) vagy weekly (hétvégi) — alap: daily")
+    @app_commands.describe(
+        type="daily (tegnapi), weekly (hétvégi) vagy workweek (hétfő–péntek) — alap: daily"
+    )
     @app_commands.choices(type=[
         app_commands.Choice(name="daily — napi (tegnap)", value="daily"),
         app_commands.Choice(name="weekly — hétvégi", value="weekly"),
+        app_commands.Choice(
+            name="workweek — heti munkanapi (hétfő–péntek)", value="workweek"
+        ),
     ])
     async def summary(
         self,
@@ -680,19 +685,24 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         if owner is None:
             return
 
-        is_weekly = bool(type and type.value == "weekly")
-        kind = "Hétvégi" if is_weekly else "Napi"
-        if is_weekly:
-            summary = await summary_gen.generate_weekly_summary(owner["id"])
-        else:
-            summary = await summary_gen.generate_daily_summary(owner["id"])
+        # UGYANAZ a leképezés, mint a `/summary`-nál és az ütemezett jobnál
+        # (summary.resolve_summary_type) — a hatókör-szűkítés nem itt történik,
+        # hanem attól, hogy a generátor a HÍVÓ user id-jával fut: az
+        # `alerts_storage.get_alerts_for_user_in_range` az assignments alapján
+        # csak az ő kampányait adja vissza.
+        generate, kind, kind_label = summary_gen.resolve_summary_type(
+            type.value if type else None
+        )
+        summary = await generate(owner["id"])
 
-        res = await discord_router.send_summary_to_user(owner, summary, is_weekly=is_weekly)
+        res = await discord_router.send_summary_to_user(owner, summary, kind=kind)
         if res:
-            await interaction.followup.send(f"✅ {kind} összefoglaló elküldve a csatornádba.")
+            await interaction.followup.send(
+                f"✅ {kind_label} összefoglaló elküldve a csatornádba."
+            )
         else:
             await interaction.followup.send(
-                f"⚠️ A {kind.lower()} összefoglaló NEM ment ki — nincs feloldható csatorna."
+                f"⚠️ A {kind_label.lower()} összefoglaló NEM ment ki — nincs feloldható csatorna."
             )
 
     # ------------------------------------------------------------------
@@ -747,11 +757,14 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
                 "alert_count": summary["alert_count"],
             },
         )
-        await interaction.followup.send(
-            instant_summary.format_instant_summary_multi(
-                summary, owner_label=owner.get("display_name")
-            )
+        # A teljes problémalista (nem top 5) átlépheti a Discord 2000
+        # karakteres limitjét — a followup.send ilyenkor HTTP 400-zal
+        # elszállna, azaz az EGÉSZ összefoglaló elveszne.
+        content = instant_summary.format_instant_summary_multi(
+            summary, owner_label=owner.get("display_name")
         )
+        for part in discord_router.split_message(content):
+            await interaction.followup.send(part)
 
     # ------------------------------------------------------------------
     # Belső: a célzott kampányok (egy kampány vagy a fiók összes kampánya)
