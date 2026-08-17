@@ -41,6 +41,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.config import get_config
+from src.integrations.discord_router import issue_section_lines
 from src.integrations.google_ads import GoogleAdsClient
 from src.integrations.meta_ads import MetaAdsClient
 from src.monitoring.detector import detect_anomalies_for_campaign
@@ -51,7 +52,15 @@ log = get_logger(__name__)
 
 # Ugyanaz a rangsor, mint a napi összefoglalóban.
 _SEVERITY_RANK = {"critical": 0, "warning": 1, "insight": 2}
-_TOP_ISSUES_LIMIT = 5
+
+# NINCS "top N" vágás — ugyanaz az elvárás, mint a napi összefoglalónál:
+# MINDEN CRITICAL és WARNING legyen látható. Korábban fix top-5 volt, ami a
+# több fiókos `/my summary-now`-nál KÉTSZER is vágott: előbb fiókonként 5-re,
+# majd az összesítést megint 5-re — 10 fiók × 12 anomáliából 5 sor maradt.
+#
+# Ez csak végső biztonsági plafon (mint summary._MAX_ISSUE_LINES). Ha életbe
+# lép, NEM néma: az `issues_truncated` mezőt a formázó kiírja.
+_MAX_ISSUE_LINES = 200
 
 # /my summary-now: ennyi fiók lekérése futhat egyszerre. Egy OM-nek átlag
 # ~10 fiókja van — 5-ös konkurenciával ez ~2 hullámban fut le (kb. a
@@ -97,7 +106,9 @@ async def generate_instant_account_summary(
             "warning_count":     int,
             "alert_count":       int,
             "healthy_campaigns": int,
-            "top_issues":        [...],
+            "top_issues":        [...],— MINDEN anomália (nem top N), a
+                                       biztonsági plafonig
+            "issues_truncated":  int,  — a plafon miatt kimaradt sorok száma
             "spend_today":       float,— a fiók mai összköltése
             "fetched_at":        str,  — a lekérés időpontja (ISO)
             "day":               str,  — melyik napra kértük (ma)
@@ -175,7 +186,8 @@ async def generate_instant_account_summary(
             campaigns_with_alerts.add(campaign["id"])
             all_anomalies.append({**a, "_campaign_name": campaign.get("name")})
 
-    # 4) Top problémák — a napi összefoglalóval azonos szerkezetben
+    # 4) Problémalista — a napi összefoglalóval azonos szerkezetben, teljes
+    #    listával (csak a biztonsági plafon vág).
     ordered = sorted(
         all_anomalies,
         key=lambda a: _SEVERITY_RANK.get((a.get("severity") or "").lower(), 99),
@@ -192,17 +204,28 @@ async def generate_instant_account_summary(
             "severity": (a.get("severity") or "").lower(),
             "message": a.get("message") or a.get("metric") or "",
         }
-        for a in ordered[:_TOP_ISSUES_LIMIT]
+        for a in ordered[:_MAX_ISSUE_LINES]
     ]
+
+    issues_truncated = max(0, len(ordered) - len(top_issues))
+    if issues_truncated:
+        log.warning(
+            "Azonnali összefoglaló (%s): %d anomáliából csak %d fér a listába "
+            "(biztonsági plafon: %d)",
+            ext_account_id, len(ordered), len(top_issues), _MAX_ISSUE_LINES,
+        )
 
     return {
         "total_campaigns": len(campaigns),
         "campaigns_with_data": campaigns_with_data,
+        # A critical_count / warning_count MINDIG a teljes összesítés — nem a
+        # `top_issues` megjelenített sorainak száma.
         "critical_count": critical_count,
         "warning_count": warning_count,
         "alert_count": len(all_anomalies),
         "healthy_campaigns": max(0, len(campaigns) - len(campaigns_with_alerts)),
         "top_issues": top_issues,
+        "issues_truncated": issues_truncated,
         "spend_today": round(spend_today, 2),
         "fetched_at": now.isoformat(),
         "day": day,
@@ -212,12 +235,34 @@ async def generate_instant_account_summary(
     }
 
 
+def _single_issue_line(issue: dict[str, Any]) -> str:
+    """Problémasor EGY fiók összefoglalójában: `• Ügyfél — kampány — üzenet`.
+
+    Fiók/platform címke nélkül: az egyfiókos nézet fejléce már tartalmazza.
+    """
+    client = issue.get("client") or "?"
+    return f"• {client} — {issue.get('campaign', '?')} — {issue.get('message', '')}"
+
+
+def _multi_issue_line(issue: dict[str, Any]) -> str:
+    """Problémasor a több fiókos nézetben: `• Ügyfél [fiók] — kampány — üzenet`."""
+    client = issue.get("client") or "?"
+    account_label = issue.get("account_label")
+    tag = f" [{account_label}]" if account_label else ""
+    return f"• {client}{tag} — {issue.get('campaign', '?')} — {issue.get('message', '')}"
+
+
 def format_instant_summary(summary: dict[str, Any]) -> str:
     """Az azonnali összefoglaló Discord-szövege.
 
-    A napi összefoglaló formátumát követi (kritikus/warning szám, top
-    problémák, figyelt kampányok), de egyértelműen jelzi, hogy ÉLŐ, mai
-    adatról van szó, és hogy a nap még nem zárult le.
+    A napi összefoglaló formátumát követi (kritikus/warning szám, problémalista,
+    figyelt kampányok), de egyértelműen jelzi, hogy ÉLŐ, mai adatról van szó, és
+    hogy a nap még nem zárult le.
+
+    A problémalista NINCS top-N-re vágva, és a napi összefoglalóval AZONOS
+    logikával jelenik meg (`issue_section_lines`): rövid listánál lapos
+    felsorolás, 15 fölött súlyosság szerinti csoportosítás darabszámmal.
+    A 2000 karakteres Discord-limitet a hívó parancs kezeli `split_message`-dzsel.
     """
     total = summary.get("total_campaigns", 0)
     with_data = summary.get("campaigns_with_data", 0)
@@ -262,12 +307,9 @@ def format_instant_summary(summary: dict[str, Any]) -> str:
 
     if top_issues:
         lines.append("")
-        lines.append("**Top problémák MOST:**")
-        for issue in top_issues:
-            client = issue.get("client") or "?"
-            lines.append(
-                f"• {client} — {issue.get('campaign', '?')} — {issue.get('message', '')}"
-            )
+        lines.append("**Problémák MOST:**")
+        # A fiók és a platform már a fejlécben van — a soroknak nem kell újra.
+        lines.extend(issue_section_lines(top_issues, summary, line_fn=_single_issue_line))
 
     lines.append("")
     lines.append(
@@ -318,7 +360,9 @@ async def generate_instant_summary_for_accounts(
             "alert_count":     int,
             "spend_today":     float,
             "per_account":     [...],  — fiókonkénti bontás (csak a sikeresek)
-            "top_issues":      [...],  — összesített, súlyosság szerint rendezve
+            "top_issues":      [...],  — az ÖSSZES fiók MINDEN anomáliája
+                                         (nem top N), súlyosság szerint rendezve
+            "issues_truncated": int,   — a biztonsági plafon miatt kimaradt sorok
             "fetched_at":      str,
             "is_live":         True,
         }
@@ -383,6 +427,18 @@ async def generate_instant_summary_for_accounts(
     top_issues_all.sort(
         key=lambda i: _SEVERITY_RANK.get((i.get("severity") or "").lower(), 99)
     )
+    top_issues = top_issues_all[:_MAX_ISSUE_LINES]
+
+    # A kimaradt sorok az `alert_count`-hoz (a fiókok TELJES anomália-számához)
+    # képest értendők — így egyszerre fedi a fiókonkénti és az összesítés-szintű
+    # plafont, akkor is, ha mindkettő életbe lépett.
+    issues_truncated = max(0, alert_count - len(top_issues))
+    if issues_truncated:
+        log.warning(
+            "Azonnali (multi) összefoglaló: %d anomáliából csak %d fér a listába "
+            "(biztonsági plafon: %d)",
+            alert_count, len(top_issues), _MAX_ISSUE_LINES,
+        )
 
     return {
         "accounts_total": len(accounts),
@@ -403,7 +459,8 @@ async def generate_instant_summary_for_accounts(
         "alert_count": alert_count,
         "spend_today": round(spend_today, 2),
         "per_account": per_account,
-        "top_issues": top_issues_all[:_TOP_ISSUES_LIMIT],
+        "top_issues": top_issues,
+        "issues_truncated": issues_truncated,
         "fetched_at": now.isoformat(),
         "is_live": True,
     }
@@ -485,14 +542,9 @@ def format_instant_summary_multi(summary: dict[str, Any], *, owner_label: str | 
 
     if top_issues:
         lines.append("")
-        lines.append("**Top problémák MOST (összes fiókból):**")
-        for issue in top_issues:
-            client = issue.get("client") or "?"
-            account_label = issue.get("account_label")
-            tag = f" [{account_label}]" if account_label else ""
-            lines.append(
-                f"• {client}{tag} — {issue.get('campaign', '?')} — {issue.get('message', '')}"
-            )
+        lines.append("**Problémák MOST (összes fiókból):**")
+        # Több fiók keveredik → a sorban ott a fiók címkéje is.
+        lines.extend(issue_section_lines(top_issues, summary, line_fn=_multi_issue_line))
 
     lines.append("")
     lines.append(

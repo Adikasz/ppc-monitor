@@ -747,11 +747,14 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
                 "alert_count": summary["alert_count"],
             },
         )
-        await interaction.followup.send(
-            instant_summary.format_instant_summary_multi(
-                summary, owner_label=owner.get("display_name")
-            )
+        # A teljes problémalista (nem top 5) átlépheti a Discord 2000
+        # karakteres limitjét — a followup.send ilyenkor HTTP 400-zal
+        # elszállna, azaz az EGÉSZ összefoglaló elveszne.
+        content = instant_summary.format_instant_summary_multi(
+            summary, owner_label=owner.get("display_name")
         )
+        for part in discord_router.split_message(content):
+            await interaction.followup.send(part)
 
     # ------------------------------------------------------------------
     # Belső: a célzott kampányok (egy kampány vagy a fiók összes kampánya)

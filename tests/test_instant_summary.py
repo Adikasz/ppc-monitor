@@ -210,8 +210,111 @@ def test_format_anomaliakkal_es_figyelmeztetessel():
     ))
     assert "Kritikus: 2" in text
     assert "Figyelmeztetés: 3" in text
-    assert "Top problémák MOST:" in text
+    assert "Problémák MOST:" in text
     assert "ROAS 1.0" in text
     # A felhasznalonak tudnia kell, hogy ez reszleges nap es nem rogzitett alert.
     assert "nap még nem zárult le" in text
     assert "Riasztás nem került rögzítésre" in text
+
+
+# ---------------------------------------------------------------------------
+# Teljes problémalista (NINCS top-5 vágás) — a napi összefoglalóval azonos elv
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def wired_many(monkeypatch):
+    """Egy fiók sok anomáliával — a listázási limit vizsgálatához."""
+    n_campaigns = 40
+    campaigns = [_campaign(i, str(i)) for i in range(1, n_campaigns + 1)]
+    insights = [
+        {"external_campaign_id": str(i), "spend": 10.0, "roas": 1.0}
+        for i in range(1, n_campaigns + 1)
+    ]
+
+    async def _fake_pull(platform, ext, day):
+        return list(insights)
+
+    async def _fake_detect(campaign_id, insight):
+        # Minden kampány ad egy anomáliát: felváltva critical / warning.
+        severity = "critical" if campaign_id % 2 else "warning"
+        return [{
+            "campaign_id": campaign_id, "severity": severity,
+            "metric": "roas_drop", "message": f"ROAS gond #{campaign_id}",
+        }]
+
+    monkeypatch.setattr(isum, "_batch_pull", _fake_pull)
+    monkeypatch.setattr(isum, "detect_anomalies_for_campaign", _fake_detect)
+    monkeypatch.setattr(
+        isum.campaigns_storage, "get_campaigns_by_ad_account", lambda _id: campaigns
+    )
+    return n_campaigns
+
+
+@pytest.mark.asyncio
+async def test_minden_anomalia_bekerul_a_listaba_nem_csak_top5(wired_many):
+    """A fő regresszió: korábban fix top-5 volt, 40 anomáliából 35 kimaradt."""
+    s = await isum.generate_instant_account_summary(_ACCOUNT, client_name="GTX")
+    assert len(s["top_issues"]) == wired_many == 40
+    assert s["issues_truncated"] == 0
+    assert s["alert_count"] == 40
+    assert s["critical_count"] + s["warning_count"] == 40
+
+
+@pytest.mark.asyncio
+async def test_biztonsagi_plafon_jelzi_a_kimaradt_sorokat(monkeypatch, wired_many):
+    monkeypatch.setattr(isum, "_MAX_ISSUE_LINES", 25)
+    s = await isum.generate_instant_account_summary(_ACCOUNT, client_name="GTX")
+
+    assert len(s["top_issues"]) == 25
+    assert s["issues_truncated"] == 15
+    # Az összesített szám a TELJES halmaz, nem a kilistázott soroké.
+    assert s["alert_count"] == 40
+
+
+def test_format_hosszu_lista_csoportositva_jelenik_meg():
+    issues = (
+        [{"client": "GTX", "campaign": f"C{i}", "platform": "meta",
+          "account_label": "GTX reklama", "severity": "critical", "message": "ROAS 0.5"}
+         for i in range(12)]
+        + [{"client": "GTX", "campaign": f"W{i}", "platform": "meta",
+            "account_label": "GTX reklama", "severity": "warning", "message": "CTR -20%"}
+           for i in range(8)]
+    )
+    text = isum.format_instant_summary(_base_summary(
+        critical_count=12, warning_count=8, alert_count=20,
+        healthy_campaigns=5, top_issues=issues,
+    ))
+
+    assert "🔴 **KRITIKUS: 12 db**" in text
+    assert "🟡 **FIGYELMEZTETÉS: 8 db**" in text
+    assert text.index("KRITIKUS: 12 db") < text.index("FIGYELMEZTETÉS: 8 db")
+    for i in range(12):
+        assert f"C{i}" in text
+    for i in range(8):
+        assert f"W{i}" in text
+
+
+def test_format_rovid_lista_lapos_marad():
+    issues = [{"client": "GTX", "campaign": f"C{i}", "platform": "meta",
+               "account_label": "GTX reklama", "severity": "critical", "message": "ROAS 0.5"}
+              for i in range(4)]
+    text = isum.format_instant_summary(_base_summary(
+        critical_count=4, alert_count=4, healthy_campaigns=1, top_issues=issues,
+    ))
+
+    assert "KRITIKUS: 4 db" not in text
+    for i in range(4):
+        assert f"C{i}" in text
+
+
+def test_format_soraiban_nincs_redundans_fiokcimke():
+    """A fiók és a platform már a fejlécben szerepel — a sorokban ne ismétlődjön."""
+    text = isum.format_instant_summary(_base_summary(
+        critical_count=1, alert_count=1, healthy_campaigns=4,
+        top_issues=[{
+            "client": "GTX", "campaign": "Prospecting", "platform": "meta",
+            "account_label": "GTX reklama", "severity": "critical",
+            "message": "ROAS 0.5",
+        }],
+    ))
+    assert "• GTX — Prospecting — ROAS 0.5" in text

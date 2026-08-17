@@ -183,6 +183,135 @@ def test_format_multi_problemas_fiokok_bontasa():
     assert "ROAS 0.5" in text
 
 
+# ---------------------------------------------------------------------------
+# Teljes problémalista (NINCS top-5 vágás, se fiókonként, se összesítve)
+# ---------------------------------------------------------------------------
+
+def _account_result(aid: int, n_critical: int, n_warning: int) -> dict:
+    """Egy fiók eredménye n_critical + n_warning anomáliával."""
+    issues = (
+        [{"severity": "critical", "campaign": f"A{aid}-C{i}",
+          "client": f"Ugyfel{aid}", "account_label": f"Fiok{aid}"}
+         for i in range(n_critical)]
+        + [{"severity": "warning", "campaign": f"A{aid}-W{i}",
+            "client": f"Ugyfel{aid}", "account_label": f"Fiok{aid}"}
+           for i in range(n_warning)]
+    )
+    return {
+        "total_campaigns": 10, "campaigns_with_data": 10,
+        "critical_count": n_critical, "warning_count": n_warning,
+        "healthy_campaigns": 0, "alert_count": n_critical + n_warning,
+        "spend_today": 10.0, "top_issues": issues,
+        "issues_truncated": 0,
+        "account_label": f"Fiok{aid}", "platform": "meta",
+    }
+
+
+@pytest.mark.asyncio
+async def test_nincs_ketszeres_vagas_fiokonkent_es_osszesitesnel(monkeypatch):
+    """A fő regresszió: a top-5 KÉTSZER vágott — előbb fiókonként, majd az
+    összesítésnél. 6 fiók × 12 anomáliából korábban 5 sor maradt."""
+    accounts = [_account(i, f"act_{i}") for i in range(1, 7)]
+    results = {i: _account_result(i, 7, 5) for i in range(1, 7)}
+
+    async def _fake_single(acct, *, client_name=None):
+        return results[acct["id"]]
+
+    monkeypatch.setattr(isum, "generate_instant_account_summary", _fake_single)
+
+    s = await isum.generate_instant_summary_for_accounts(accounts)
+
+    assert s["alert_count"] == 72                # 6 × 12
+    assert len(s["top_issues"]) == 72            # mind kilistázva
+    assert s["issues_truncated"] == 0
+    assert s["critical_count"] == 42
+    assert s["warning_count"] == 30
+    # Súlyosság szerint rendezve: minden critical előbb, mint bármely warning.
+    severities = [i["severity"] for i in s["top_issues"]]
+    assert severities == ["critical"] * 42 + ["warning"] * 30
+
+
+@pytest.mark.asyncio
+async def test_osszesitett_plafon_a_teljes_anomalia_szamhoz_kepest_szamol(monkeypatch):
+    """Az `issues_truncated` a fiókonkénti ÉS az összesítés-szintű vágást is fedi."""
+    monkeypatch.setattr(isum, "_MAX_ISSUE_LINES", 10)
+    accounts = [_account(i, f"act_{i}") for i in range(1, 4)]
+    results = {i: _account_result(i, 5, 5) for i in range(1, 4)}
+
+    async def _fake_single(acct, *, client_name=None):
+        return results[acct["id"]]
+
+    monkeypatch.setattr(isum, "generate_instant_account_summary", _fake_single)
+
+    s = await isum.generate_instant_summary_for_accounts(accounts)
+
+    assert s["alert_count"] == 30                # 3 × 10 — a teljes igazság
+    assert len(s["top_issues"]) == 10            # ennyi fér ki
+    assert s["issues_truncated"] == 20
+
+
+def test_format_multi_hosszu_lista_csoportositva():
+    issues = (
+        [{"client": "GTX Kft", "campaign": f"C{i}", "severity": "critical",
+          "message": "ROAS 0.5", "account_label": "GTX"} for i in range(12)]
+        + [{"client": "JOY Kft", "campaign": f"W{i}", "severity": "warning",
+            "message": "CTR -20%", "account_label": "JOY"} for i in range(8)]
+    )
+    text = isum.format_instant_summary_multi(_base_multi(
+        accounts_total=2, accounts_ok=2,
+        critical_count=12, warning_count=8, alert_count=20,
+        top_issues=issues,
+    ))
+
+    assert "🔴 **KRITIKUS: 12 db**" in text
+    assert "🟡 **FIGYELMEZTETÉS: 8 db**" in text
+    # A fiók címkéje a sorokban is ott van (több fiók keveredik).
+    assert "• GTX Kft [GTX] — C0 — ROAS 0.5" in text
+    for i in range(12):
+        assert f"C{i}" in text
+    for i in range(8):
+        assert f"W{i}" in text
+
+
+def test_format_multi_jelzi_a_kimaradt_sorokat():
+    issues = [{"client": "GTX Kft", "campaign": f"C{i}", "severity": "critical",
+               "message": "ROAS 0.5", "account_label": "GTX"} for i in range(20)]
+    text = isum.format_instant_summary_multi(_base_multi(
+        critical_count=45, warning_count=0, alert_count=45,
+        top_issues=issues, issues_truncated=25,
+    ))
+
+    # Az összesítő sor a TELJES szám, nem a kilistázott soroké.
+    assert "🔴 Kritikus: 45" in text
+    assert "🔴 **KRITIKUS: 45 db**" in text
+    assert "*… és még 25 további kritikus riasztás*" in text
+
+
+def test_multi_osszefoglalo_atlepi_a_discord_limitet_es_darabolhato():
+    """Végponttól végpontig: 120 anomália → több üzenet, egyik sem lépi túl a limitet."""
+    from src.integrations.discord_router import split_message
+
+    issues = [
+        {"client": f"Ugyfel{i % 8}", "campaign": f"Kampany-{i}",
+         "severity": "critical" if i % 2 else "warning",
+         "message": "ROAS 0.00 a cél 3.00 alatt", "account_label": f"Fiok{i % 8}"}
+        for i in range(120)
+    ]
+    text = isum.format_instant_summary_multi(_base_multi(
+        accounts_total=8, accounts_ok=8,
+        critical_count=60, warning_count=60, alert_count=120,
+        top_issues=issues,
+    ))
+    parts = split_message(text)
+
+    assert len(text) > 1900
+    assert all(len(p) <= 1900 for p in parts)
+    assert "\n".join(parts) == text
+    joined = "\n".join(parts)
+    for i in range(120):
+        assert f"Kampany-{i}" in joined
+
+
 def test_format_multi_meg_nincs_mai_adat():
     text = isum.format_instant_summary_multi(_base_multi(campaigns_with_data=0))
     assert "Ma még egyik figyelt kampányra sincs adat" in text

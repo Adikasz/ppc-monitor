@@ -20,6 +20,7 @@ Hibatűrés:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 
 import discord
@@ -283,6 +284,8 @@ def _issue_line(issue: dict[str, Any]) -> str:
 def _grouped_issue_lines(
     top_issues: list[dict[str, Any]],
     summary: dict[str, Any],
+    *,
+    line_fn: Callable[[dict[str, Any]], str],
 ) -> tuple[list[str], int]:
     """Súlyosság szerint csoportosított problémalista, csoportonkénti darabszámmal.
 
@@ -324,7 +327,7 @@ def _grouped_issue_lines(
 
         lines.append("")
         lines.append(f"{emoji} **{label}: {total_for_group} db**")
-        lines.extend(_issue_line(issue) for issue in issues)
+        lines.extend(line_fn(issue) for issue in issues)
 
         hidden = total_for_group - len(issues)
         if hidden > 0:
@@ -332,6 +335,40 @@ def _grouped_issue_lines(
             lines.append(f"*… és még {hidden} további {hidden_noun}*")
 
     return lines, accounted_hidden
+
+
+def issue_section_lines(
+    top_issues: list[dict[str, Any]],
+    summary: dict[str, Any],
+    *,
+    line_fn: Callable[[dict[str, Any]], str] = _issue_line,
+) -> list[str]:
+    """A problémalista sorai — a napi és az azonnali összefoglaló KÖZÖS logikája.
+
+    Rövid listánál (≤ `_FLAT_ISSUE_LIST_MAX`) lapos felsorolás, efölött
+    súlyosság szerinti csoportosítás darabszámmal. A végén — ha a summary-réteg
+    biztonsági plafonja levágott sorokat (`issues_truncated`) — jelzi a
+    maradékot; amit a csoport-fejlécek már jeleztek, azt nem számolja újra.
+
+    A `line_fn` teszi hívhatóvá többféle összefoglalóból: minden nézetnek más a
+    sor-formátuma (a napiban benne a platform, az azonnaliban a fiók már a
+    fejlécben szerepel), a csoportosítás és a csonkítás-jelzés viszont közös.
+    """
+    if not top_issues:
+        return []
+
+    accounted_hidden = 0
+    if len(top_issues) <= _FLAT_ISSUE_LIST_MAX:
+        lines = [line_fn(issue) for issue in top_issues]
+    else:
+        lines, accounted_hidden = _grouped_issue_lines(
+            top_issues, summary, line_fn=line_fn
+        )
+
+    remaining_hidden = (summary.get("issues_truncated") or 0) - accounted_hidden
+    if remaining_hidden > 0:
+        lines.append(f"*… és még {remaining_hidden} további riasztás*")
+    return lines
 
 
 def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
@@ -383,19 +420,7 @@ def _format_summary(summary: dict[str, Any], is_weekly: bool) -> str:
     if top_issues:
         lines.append("")
         lines.append(issues_title)
-        accounted_hidden = 0
-        if len(top_issues) <= _FLAT_ISSUE_LIST_MAX:
-            lines.extend(_issue_line(issue) for issue in top_issues)
-        else:
-            group_lines, accounted_hidden = _grouped_issue_lines(top_issues, summary)
-            lines.extend(group_lines)
-
-        # A summary-réteg biztonsági plafonja (lásd summary._MAX_ISSUE_LINES):
-        # sose csonkítsunk csendben. Amit a csoport-fejlécek már jeleztek, azt
-        # itt nem számoljuk újra.
-        remaining_hidden = (summary.get("issues_truncated") or 0) - accounted_hidden
-        if remaining_hidden > 0:
-            lines.append(f"*… és még {remaining_hidden} további riasztás*")
+        lines.extend(issue_section_lines(top_issues, summary))
 
     lines.append("")
     lines.append(f"**Kampányok figyelve:** {total}  |  **{alerts_label}:** {alert_count}")

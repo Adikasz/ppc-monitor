@@ -38,6 +38,7 @@ from discord.ext import commands
 
 from src.config import get_config
 from src.integrations import account_catalog
+from src.integrations.discord_router import split_message
 from src.monitoring.instant_summary import (
     format_instant_summary,
     generate_instant_account_summary,
@@ -1476,7 +1477,11 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
                 "alerts": summary["alert_count"],
             },
         )
-        await interaction.followup.send(format_instant_summary(summary))
+        # A teljes problémalista (nem top 5) átlépheti a Discord 2000
+        # karakteres limitjét — darabolás nélkül a followup.send HTTP 400-zal
+        # elszállna, azaz az EGÉSZ összefoglaló elveszne.
+        for part in split_message(format_instant_summary(summary)):
+            await interaction.followup.send(part)
 
     @summary_now.autocomplete("account")
     async def summary_now_account_autocomplete(
