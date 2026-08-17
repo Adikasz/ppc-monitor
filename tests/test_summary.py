@@ -542,6 +542,44 @@ async def test_workweek_job_sends_the_workweek_kind_to_every_user():
     assert sent == [(1, "workweek"), (2, "workweek")]
 
 
+# ---------------------------------------------------------------------------
+# `/summary type:` — a manuális parancs (péntekig való várakozás nélküli teszt)
+# ---------------------------------------------------------------------------
+
+def test_summary_command_offers_the_workweek_type():
+    from src.bot.commands import alerts as alerts_cmd
+
+    params = {p.name: p for p in alerts_cmd.SummaryCog.summary.parameters}
+    ertekek = [c.value for c in params["type"].choices]
+    assert ertekek == ["daily", "weekly", "workweek"]
+
+
+def test_summary_command_type_table_maps_to_the_right_generator_and_kind():
+    """A `type` értéke és a formázó `kind`-ja nem mindenhol azonos: a
+    felhasználói "weekly" a hétvégi ("weekend") formátumra megy."""
+    from src.bot.commands import alerts as alerts_cmd
+
+    tabla = alerts_cmd._SUMMARY_TYPES
+    assert set(tabla) == {"daily", "weekly", "workweek"}
+
+    assert tabla["daily"][:2] == (s.generate_daily_summary, "daily")
+    assert tabla["weekly"][:2] == (s.generate_weekly_summary, "weekend")
+    assert tabla["workweek"][:2] == (s.generate_workweek_summary, "workweek")
+
+
+def test_summary_command_uses_the_same_generators_as_the_scheduler():
+    """A kézzel kért összefoglaló bitre az legyen, amit a scheduler küldene —
+    különben a workweek "tesztelése" mást bizonyítana, mint ami pénteken megy ki.
+    """
+    from src.bot.commands import alerts as alerts_cmd
+    from src.monitoring import scheduler as sched
+
+    parancs = {kind: gen for gen, kind, _ in alerts_cmd._SUMMARY_TYPES.values()}
+    utemezett = {kind: gen for kind, (gen, _) in sched._SUMMARY_KINDS.items()}
+
+    assert parancs == utemezett
+
+
 def test_daily_summary_covers_yesterday_end_to_end():
     """Végponttól végpontig: a `_build_summary_sync` a kapott ablakkal dolgozik,
     és a tegnap 23:50-es alert megjelenik a listában."""
