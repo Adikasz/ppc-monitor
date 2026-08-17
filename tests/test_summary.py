@@ -11,6 +11,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 import pytest
+from discord import app_commands
 
 from src.integrations.discord_router import _format_summary, split_message
 from src.monitoring import summary as s
@@ -532,8 +533,8 @@ async def test_workweek_job_sends_the_workweek_kind_to_every_user():
 
     with mock.patch.object(sched.users_storage, "list_users", return_value=users), \
          mock.patch.dict(
-             sched._SUMMARY_KINDS,
-             {"workweek": (_fake_generate, "heti munkanapi")},
+             sched.SUMMARY_KINDS,
+             {"workweek": (_fake_generate, "Heti munkanapi")},
          ), \
          mock.patch.object(sched, "send_summary_to_user", new=_fake_send):
         await sched.workweek_summary_job()
@@ -543,41 +544,114 @@ async def test_workweek_job_sends_the_workweek_kind_to_every_user():
 
 
 # ---------------------------------------------------------------------------
-# `/summary type:` — a manuális parancs (péntekig való várakozás nélküli teszt)
+# `/summary` és `/my summary` — a manuális parancsok
+# (a workweek péntekig való várakozás nélkül is tesztelhető)
 # ---------------------------------------------------------------------------
 
-def test_summary_command_offers_the_workweek_type():
+def _type_choices(command) -> list[str]:
+    """Egy app command `type:` paraméterének választható értékei."""
+    params = {p.name: p for p in command.parameters}
+    return [c.value for c in params["type"].choices]
+
+
+def test_both_summary_commands_offer_the_workweek_type():
     from src.bot.commands import alerts as alerts_cmd
+    from src.bot.commands import my_commands as my_cmd
 
-    params = {p.name: p for p in alerts_cmd.SummaryCog.summary.parameters}
-    ertekek = [c.value for c in params["type"].choices]
-    assert ertekek == ["daily", "weekly", "workweek"]
+    assert _type_choices(alerts_cmd.SummaryCog.summary) == ["daily", "weekly", "workweek"]
+    assert _type_choices(my_cmd.MyCommandsCog.summary) == ["daily", "weekly", "workweek"]
 
 
-def test_summary_command_type_table_maps_to_the_right_generator_and_kind():
+def test_command_choices_match_the_supported_types():
+    """A Discord `choices` és a leképezés-tábla ne csússzon szét: minden
+    felkínált érték feloldható legyen."""
+    from src.bot.commands import alerts as alerts_cmd
+    from src.bot.commands import my_commands as my_cmd
+
+    for command in (alerts_cmd.SummaryCog.summary, my_cmd.MyCommandsCog.summary):
+        assert set(_type_choices(command)) == set(s.SUMMARY_TYPE_TO_KIND)
+
+
+def test_resolve_summary_type_maps_to_the_right_generator_and_kind():
     """A `type` értéke és a formázó `kind`-ja nem mindenhol azonos: a
     felhasználói "weekly" a hétvégi ("weekend") formátumra megy."""
-    from src.bot.commands import alerts as alerts_cmd
+    assert s.resolve_summary_type("daily")[:2] == (s.generate_daily_summary, "daily")
+    assert s.resolve_summary_type("weekly")[:2] == (s.generate_weekly_summary, "weekend")
+    assert s.resolve_summary_type("workweek")[:2] == (
+        s.generate_workweek_summary, "workweek",
+    )
 
-    tabla = alerts_cmd._SUMMARY_TYPES
-    assert set(tabla) == {"daily", "weekly", "workweek"}
-
-    assert tabla["daily"][:2] == (s.generate_daily_summary, "daily")
-    assert tabla["weekly"][:2] == (s.generate_weekly_summary, "weekend")
-    assert tabla["workweek"][:2] == (s.generate_workweek_summary, "workweek")
+    # Hiányzó/ismeretlen érték → napi (védőháló, a choices amúgy is korlátoz).
+    assert s.resolve_summary_type(None)[:2] == (s.generate_daily_summary, "daily")
+    assert s.resolve_summary_type("nincs-ilyen")[:2] == (s.generate_daily_summary, "daily")
 
 
-def test_summary_command_uses_the_same_generators_as_the_scheduler():
-    """A kézzel kért összefoglaló bitre az legyen, amit a scheduler küldene —
-    különben a workweek "tesztelése" mást bizonyítana, mint ami pénteken megy ki.
+def test_both_commands_and_the_scheduler_share_one_generator_table():
+    """A `/summary`, a `/my summary` és az ütemezett job UGYANAZT a generátort
+    hívja fajtánként — különben a kézi "tesztelés" mást bizonyítana, mint ami
+    pénteken ténylegesen kimegy.
+
+    A `scheduler.SUMMARY_KINDS` és a parancsok feloldása is a
+    `summary.SUMMARY_KINDS` egyetlen forrásából jön, ezt rögzítjük itt.
     """
-    from src.bot.commands import alerts as alerts_cmd
     from src.monitoring import scheduler as sched
 
-    parancs = {kind: gen for gen, kind, _ in alerts_cmd._SUMMARY_TYPES.values()}
-    utemezett = {kind: gen for kind, (gen, _) in sched._SUMMARY_KINDS.items()}
+    # A scheduler ugyanazt a táblaobjektumot használja (nem másolatot).
+    assert sched.SUMMARY_KINDS is s.SUMMARY_KINDS
 
-    assert parancs == utemezett
+    # A parancsok `type:` értékei ugyanoda oldódnak fel, mint a job `kind`-jai.
+    parancs_szerint = {
+        kind: gen
+        for gen, kind, _ in (
+            s.resolve_summary_type(t) for t in s.SUMMARY_TYPE_TO_KIND
+        )
+    }
+    utemezett = {kind: gen for kind, (gen, _) in s.SUMMARY_KINDS.items()}
+    assert parancs_szerint == utemezett
+
+
+@pytest.mark.asyncio
+async def test_my_summary_workweek_calls_the_same_generator_as_the_scheduler_job():
+    """A `/my summary type:workweek` a munkanapi generátort hívja a HÍVÓ user
+    id-jával, és `kind="workweek"`-kel küld — ugyanaz, mint a `/summary
+    type:workweek` és a pénteki job, csak az OM saját kampányaira szűkítve
+    (a szűkítést a generátor user_id paramétere adja, nem külön logika).
+    """
+    from src.bot.commands import my_commands as my_cmd
+
+    hivott: list[tuple] = []
+    kuldott: list[tuple] = []
+
+    async def _fake_generate(uid):
+        hivott.append(("generate", uid))
+        return {"alert_count": 0, "total_campaigns": 0, "critical_count": 0,
+                "warning_count": 0, "healthy_campaigns": 0, "top_issues": []}
+
+    async def _fake_send(user, summary, *, is_weekly=False, kind=None):
+        kuldott.append((user["id"], kind))
+        return {"channel_id": 1, "message_id": 1}
+
+    interaction = mock.Mock()
+    interaction.response.defer = mock.AsyncMock()
+    interaction.followup.send = mock.AsyncMock()
+
+    cog = my_cmd.MyCommandsCog.__new__(my_cmd.MyCommandsCog)
+    valasz = app_commands.Choice(name="workweek", value="workweek")
+
+    with mock.patch.object(
+        my_cmd.MyCommandsCog, "_owner_or_reject",
+        new=mock.AsyncMock(return_value={"id": 42}),
+    ), mock.patch.dict(
+        s.SUMMARY_KINDS, {"workweek": (_fake_generate, "Heti munkanapi")},
+    ), mock.patch.object(
+        my_cmd.discord_router, "send_summary_to_user", new=_fake_send,
+    ):
+        await my_cmd.MyCommandsCog.summary.callback(cog, interaction, type=valasz)
+
+    # A HÍVÓ user id-jával futott (ez szűkíti a saját fiókokra), és a
+    # munkanapi formátummal ment ki.
+    assert hivott == [("generate", 42)]
+    assert kuldott == [(42, "workweek")]
 
 
 def test_daily_summary_covers_yesterday_end_to_end():

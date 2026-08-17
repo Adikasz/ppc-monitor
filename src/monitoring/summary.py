@@ -257,3 +257,43 @@ async def generate_workweek_summary(user_id: int) -> dict[str, Any]:
         summary["critical_count"], summary["warning_count"],
     )
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Az összefoglaló-fajták EGYETLEN forrása
+#
+# Ezt használja MINDHÁROM hívó — az ütemezett jobok (scheduler), a `/summary`
+# és a `/my summary` —, így egyik sem duplikálja a leképezést, és a kézzel kért
+# összefoglaló bitre az, amit a scheduler küldene.
+# ---------------------------------------------------------------------------
+
+# kind → (generátor, emberi címke). A `kind` megy tovább a formázóig
+# (discord_router._format_summary: fejléc, lista-cím, alert-címke).
+SUMMARY_KINDS: dict[str, tuple[Any, str]] = {
+    "daily": (generate_daily_summary, "Napi"),
+    "weekend": (generate_weekly_summary, "Hétvégi"),
+    "workweek": (generate_workweek_summary, "Heti munkanapi"),
+}
+
+# A Discord-parancsok `type:` értéke → `kind`.
+#
+# A kettő SZÁNDÉKOSAN nem mindenhol azonos: a felhasználói "weekly" érték
+# megmarad (meglévő szokás, ne törjön a megszokott parancs), de belül
+# "weekend"-re képződik — a "workweek" a hétfő–pénteki változat.
+SUMMARY_TYPE_TO_KIND: dict[str, str] = {
+    "daily": "daily",
+    "weekly": "weekend",
+    "workweek": "workweek",
+}
+
+
+def resolve_summary_type(type_value: str | None) -> tuple[Any, str, str]:
+    """A parancs `type:` értéke → (generátor, formázó-`kind`, emberi címke).
+
+    Ismeretlen vagy hiányzó érték esetén a napi összefoglalóra esik vissza —
+    a Discord `choices` amúgy is korlátozza a lehetséges értékeket, ez csak
+    védőháló (pl. régi kliensből érkező hívásra).
+    """
+    kind = SUMMARY_TYPE_TO_KIND.get(type_value or "daily", "daily")
+    generate, label = SUMMARY_KINDS[kind]
+    return generate, kind, label

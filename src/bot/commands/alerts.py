@@ -312,23 +312,6 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
         return await self._campaign_choices_global(current)
 
 
-# A `/summary type:` értéke → (generátor, formázó-`kind`, emberi címke).
-#
-# A `type` értéke és a formázó `kind`-ja SZÁNDÉKOSAN nem mindenhol azonos: a
-# "weekly" felhasználói érték megmarad (meglévő szokás), de a formázó felé
-# "weekend" megy — a "workweek" a hétfő–pénteki változat.
-#
-# Ugyanazokat a generátorokat hívja, mint az ütemezett jobok
-# (scheduler._SUMMARY_KINDS), így a manuálisan kért összefoglaló bitre azonos
-# azzal, amit a scheduler küldene — a workweek péntekig való várakozás nélkül
-# is tesztelhető.
-_SUMMARY_TYPES: dict[str, tuple] = {
-    "daily": (summary_gen.generate_daily_summary, "daily", "Napi"),
-    "weekly": (summary_gen.generate_weekly_summary, "weekend", "Hétvégi"),
-    "workweek": (summary_gen.generate_workweek_summary, "workweek", "Heti munkanapi"),
-}
-
-
 class SummaryCog(commands.Cog):
     """A `/summary` parancs — manuális napi/hétvégi/heti munkanapi összefoglaló.
 
@@ -367,7 +350,11 @@ class SummaryCog(commands.Cog):
     ) -> None:
         await interaction.response.defer(ephemeral=True)
 
-        generate, kind, kind_label = _SUMMARY_TYPES[type.value if type else "daily"]
+        # A leképezés (type → generátor/kind/címke) a summary modulban él —
+        # ugyanazt hívja a `/my summary` és az ütemezett job is.
+        generate, kind, kind_label = summary_gen.resolve_summary_type(
+            type.value if type else None
+        )
         scope_value = scope.value if scope else "me"
 
         # --- scope: all (minden aktív user) — csak admin csatornában ---

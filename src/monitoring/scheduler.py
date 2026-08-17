@@ -33,11 +33,7 @@ from src.monitoring.ai_insights import generate_ai_insight
 from src.monitoring.detector import detect_anomalies_for_campaign
 from src.monitoring.insight_engine import detect_insights_for_campaign
 from src.monitoring.router import route_alert
-from src.monitoring.summary import (
-    generate_daily_summary,
-    generate_weekly_summary,
-    generate_workweek_summary,
-)
+from src.monitoring.summary import SUMMARY_KINDS
 from src.monitoring.token_monitor import token_health_check
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import campaigns as campaigns_storage
@@ -233,20 +229,15 @@ async def hourly_monitoring() -> None:
 # Napi / heti összefoglaló jobok (13. lépés)
 # ---------------------------------------------------------------------------
 
-# Az összefoglaló-fajták: (generátor, emberi címke a loghoz).
-# A `kind` megy tovább a formázóig (fejléc/lista-cím), lásd
-# `discord_router._format_summary`.
-_SUMMARY_KINDS = {
-    "daily": (generate_daily_summary, "napi"),
-    "weekend": (generate_weekly_summary, "hétvégi"),
-    "workweek": (generate_workweek_summary, "heti munkanapi"),
-}
-
-
 async def _send_summaries(*, is_weekly: bool = False, kind: str | None = None) -> None:
-    """Minden aktív usernek összefoglaló kiküldése (daily / weekend / workweek)."""
+    """Minden aktív usernek összefoglaló kiküldése (daily / weekend / workweek).
+
+    A generátor a `summary.SUMMARY_KINDS` EGYETLEN forrásból jön — ugyanaz,
+    amit a `/summary` és a `/my summary` is hív.
+    """
     kind = kind or ("weekend" if is_weekly else "daily")
-    generate, label = _SUMMARY_KINDS[kind]
+    generate, label = SUMMARY_KINDS[kind]
+    label = label.lower()
 
     try:
         users = await asyncio.to_thread(users_storage.list_users, active_only=True)
