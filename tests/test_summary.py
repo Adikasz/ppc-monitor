@@ -200,15 +200,16 @@ def test_daily_window_boundaries_are_inclusive_start_exclusive_end():
 # ---------------------------------------------------------------------------
 # A heti MUNKANAPI ablak (hétfő 00:00 → szombat 00:00)
 #
-# A job péntek 16:00-kor fut (scheduler.py: cron hour=16, day_of_week="fri") —
+# A job péntek 17:05-kor fut (scheduler.py: cron hour=17, minute=5,
+# day_of_week="fri") — közvetlenül a csendes idő kezdete (17:00) után —
 # a hét utolsó összefoglalója, a pénteki napi összefoglaló MELLÉ, külön
 # üzenetben. Ugyanaz az elvárás, mint a `daily_range`-nél: fix naptári ablak,
 # nem gördülő "utolsó 5×24 óra".
 # ---------------------------------------------------------------------------
 
 def test_workweek_range_is_monday_midnight_to_saturday_midnight():
-    """Péntek 16:00-s futás → hétfő 00:00 → szombat 00:00 (5 teljes nap)."""
-    frm, to = s.workweek_range(datetime(2026, 8, 21, 16, 0, tzinfo=TZ))  # péntek
+    """Péntek 17:05-ös futás → hétfő 00:00 → szombat 00:00 (5 teljes nap)."""
+    frm, to = s.workweek_range(datetime(2026, 8, 21, 17, 5, tzinfo=TZ))  # péntek
 
     assert frm.isoformat() == "2026-08-17T00:00:00+02:00"  # hétfő
     assert to.isoformat() == "2026-08-22T00:00:00+02:00"   # szombat
@@ -220,15 +221,17 @@ def test_workweek_range_is_monday_midnight_to_saturday_midnight():
 def test_workweek_range_is_not_a_rolling_5_day_window():
     """Ugyanazon a pénteken bármikor futtatva UGYANAZ az ablak.
 
-    Ha "az utolsó 5×24 óra" logika futna, a 16:00-s és a reggeli lekérés
-    ablaka eltérne.
+    Ha "az utolsó 5×24 óra" logika futna, a 17:05-ös és a reggeli lekérés
+    ablaka eltérne. (A korábbi 16:00-s ütemezés is szerepel: az ütemezés
+    átmozgatása NEM változtathat az ablakon.)
     """
-    delutan = s.workweek_range(datetime(2026, 8, 21, 16, 0, tzinfo=TZ))
+    utemezett = s.workweek_range(datetime(2026, 8, 21, 17, 5, tzinfo=TZ))
+    regi_utemezes = s.workweek_range(datetime(2026, 8, 21, 16, 0, tzinfo=TZ))
     reggel = s.workweek_range(datetime(2026, 8, 21, 9, 5, tzinfo=TZ))
     ejfel_utan = s.workweek_range(datetime(2026, 8, 21, 0, 0, 1, tzinfo=TZ))
     keso = s.workweek_range(datetime(2026, 8, 21, 23, 59, 59, tzinfo=TZ))
 
-    assert delutan == reggel == ejfel_utan == keso
+    assert utemezett == regi_utemezes == reggel == ejfel_utan == keso
 
 
 def test_workweek_range_anchors_to_the_current_week_on_any_weekday():
@@ -246,14 +249,14 @@ def test_workweek_range_covers_five_calendar_days_across_dst():
     nyári időszámításban vannak, a hetet záró szombat 00:00 is.
     """
     # Az óraátállítás hetét záró péntek: 2026-03-27 (még téli idő).
-    frm, to = s.workweek_range(datetime(2026, 3, 27, 16, 0, tzinfo=TZ))
+    frm, to = s.workweek_range(datetime(2026, 3, 27, 17, 5, tzinfo=TZ))
     assert frm.isoformat() == "2026-03-23T00:00:00+01:00"
     assert to.isoformat() == "2026-03-28T00:00:00+01:00"
     assert (to.astimezone(UTC) - frm.astimezone(UTC)) == timedelta(days=5)
 
     # Az őszi átállítás (2026-10-25, vasárnap) UTÁNI hét: hétfőtől szombatig
     # végig téli idő, de az átállítás a hét ELŐTT volt → sima 5 nap.
-    frm, to = s.workweek_range(datetime(2026, 10, 30, 16, 0, tzinfo=TZ))
+    frm, to = s.workweek_range(datetime(2026, 10, 30, 17, 5, tzinfo=TZ))
     assert frm.isoformat() == "2026-10-26T00:00:00+01:00"
     assert to.isoformat() == "2026-10-31T00:00:00+01:00"
     assert (to.astimezone(UTC) - frm.astimezone(UTC)) == timedelta(days=5)
@@ -266,19 +269,20 @@ def _in_workweek_window(detected_at: datetime, now: datetime) -> bool:
 
 def test_workweek_window_boundaries_are_inclusive_start_exclusive_end():
     """A hétfő eleje benne, a szombat eleje már nem — és a péntek TELJESEN benne."""
-    pentek_1600 = datetime(2026, 8, 21, 16, 0, tzinfo=TZ)
+    pentek_1705 = datetime(2026, 8, 21, 17, 5, tzinfo=TZ)
     cases = [
         # (időpont,                                            benne van?)
         (datetime(2026, 8, 16, 23, 59, 59, 999999, tzinfo=TZ), False),  # előző vasárnap vége
         (datetime(2026, 8, 17, 0, 0, 0, tzinfo=TZ), True),              # hétfő 00:00 — alsó határ
         (datetime(2026, 8, 17, 23, 50, tzinfo=TZ), True),               # hétfő este
         (datetime(2026, 8, 19, 12, 0, tzinfo=TZ), True),                # szerda dél
-        (datetime(2026, 8, 21, 15, 59, 59, tzinfo=TZ), True),           # péntek, a futás előtt
+        (datetime(2026, 8, 21, 16, 30, tzinfo=TZ), True),               # péntek, az UTOLSÓ aktív óra
+        (datetime(2026, 8, 21, 17, 4, 59, tzinfo=TZ), True),            # péntek, közvetlenül a futás előtt
         (datetime(2026, 8, 21, 23, 59, 59, 999999, tzinfo=TZ), True),   # péntek utolsó pillanata
         (datetime(2026, 8, 22, 0, 0, 0, tzinfo=TZ), False),             # szombat 00:00 — felső határ
     ]
     for detected_at, expected in cases:
-        assert _in_workweek_window(detected_at, pentek_1600) is expected, detected_at
+        assert _in_workweek_window(detected_at, pentek_1705) is expected, detected_at
 
 
 def test_workweek_query_filter_is_gte_monday_and_lt_saturday():
@@ -308,7 +312,7 @@ def test_workweek_query_filter_is_gte_monday_and_lt_saturday():
         def execute(self):
             return mock.Mock(data=[])
 
-    frm, to = s.workweek_range(datetime(2026, 8, 21, 16, 0, tzinfo=TZ))
+    frm, to = s.workweek_range(datetime(2026, 8, 21, 17, 5, tzinfo=TZ))
     with mock.patch.object(
         alerts_storage, "get_supabase",
         return_value=mock.Mock(table=lambda _t: _Query()),
@@ -326,7 +330,7 @@ def test_workweek_summary_covers_monday_to_friday_end_to_end():
     """Végponttól végpontig: a hét mind az 5 munkanapja benne, az előző hét nem."""
     import contextlib
 
-    frm, to = s.workweek_range(datetime(2026, 8, 21, 16, 0, tzinfo=TZ))
+    frm, to = s.workweek_range(datetime(2026, 8, 21, 17, 5, tzinfo=TZ))
     osszes = [
         _alert(1, "critical", "Elozo-vasarnap", "m", "2026-08-16T23:50:00+02:00"),
         _alert(2, "critical", "Hetfo", "m", "2026-08-17T00:00:00+02:00"),
@@ -354,8 +358,8 @@ def test_workweek_summary_covers_monday_to_friday_end_to_end():
 def test_workweek_window_does_not_overlap_the_weekend_window():
     """A munkanapi ablak szombat 00:00-kor zár, a hétvégi péntek 22:00-kor nyit —
     az átfedés tudatos: a péntek esti riasztás mindkettőben szerepel, de a
-    munkanapi összefoglaló 16:00-kor megy ki, tehát akkor még nem is létezik."""
-    pentek = datetime(2026, 8, 21, 16, 0, tzinfo=TZ)
+    munkanapi összefoglaló 17:05-kor megy ki, tehát akkor még nem is létezik."""
+    pentek = datetime(2026, 8, 21, 17, 5, tzinfo=TZ)
     munkanapi_to = s.workweek_range(pentek)[1]
     hetvege_from = s.weekend_range(datetime(2026, 8, 24, 9, 0, tzinfo=TZ))[0]  # köv. hétfő
 
@@ -474,14 +478,22 @@ def _registered_jobs():
     return jobs
 
 
-def test_workweek_job_runs_on_friday_at_16():
-    jobs = _registered_jobs()
+def test_workweek_job_runs_on_friday_at_1705():
+    """Péntek 17:05 — a munkanap vége, üzleti döntés (lásd a scheduler kommentjét).
+
+    FIGYELEM: ez NEM esik egybe a csendes idő kezdetével — a `.env.example`
+    szerint `QUIET_HOURS_START=18`, tehát a 17:05–18:00 sáv még aktív. Az ebben
+    a sávban keletkező riasztásokról valós időben megy értesítés, de a heti
+    munkanapi összefoglalóba már nem kerülnek bele. Ez tudatosan vállalt.
+    """
     from src.monitoring import scheduler as sched
+
+    jobs = _registered_jobs()
 
     assert "workweek_summary" in jobs
     func, kw = jobs["workweek_summary"]
     assert func is sched.workweek_summary_job
-    assert (kw["hour"], kw["minute"], kw["day_of_week"]) == (16, 0, "fri")
+    assert (kw["hour"], kw["minute"], kw["day_of_week"]) == (17, 5, "fri")
 
 
 def test_workweek_job_does_not_replace_the_friday_daily_summary():

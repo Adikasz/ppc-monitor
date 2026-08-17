@@ -109,17 +109,18 @@ def workweek_range(now: datetime | None = None) -> tuple[datetime, datetime]:
 
     NEM gördülő "utolsó 5×24 óra": a `now`-ból CSAK a naptári napot vesszük
     (a `weekday()` adja, hányadik napon állunk), az időt nullázzuk. A péntek
-    16:00-s ütemezett futás és egy kézi, délelőtti lekérés tehát PONTOSAN
+    17:05-ös ütemezett futás és egy kézi, délelőtti lekérés tehát PONTOSAN
     ugyanazt az ablakot adja.
 
     Óraátállításkor is a teljes naptári napokat fedi: a `timedelta` itt
     fali-óra aritmetika (hétfő 00:00 + 5 nap = szombat 00:00), nem "120 óra".
 
-    FIGYELEM: az ütemezett job péntek 16:00-kor fut, amikor a péntek még nem
-    telt el teljesen. Az ablak felső határa szándékosan mégis szombat 00:00 —
-    így a szombat 00:00-ig keletkező riasztások mind beleesnek, és az ablak
-    nem függ a futás órájától. A 16:00 utáni pénteki riasztások értelemszerűen
-    már nem szerepelhetnek a 16:00-kor kiküldött üzenetben.
+    FIGYELEM: az ütemezett job péntek 17:05-kor fut (a munkanap végén), amikor
+    a péntek még nem telt el teljesen. Az ablak felső határa szándékosan mégis
+    szombat 00:00 — így a szombat 00:00-ig keletkező riasztások mind beleesnek,
+    és az ablak nem függ a futás órájától. A 17:05 után keletkező pénteki
+    riasztások értelemszerűen már nem szerepelhetnek a 17:05-kor kiküldött
+    üzenetben (lásd a scheduler kommentjét a vállalt résről).
     """
     tz = _tz()
     now = now.astimezone(tz) if now else datetime.now(tz)

@@ -513,19 +513,29 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
     )
 
-    # Heti MUNKANAPI összefoglaló: PÉNTEK 16:00 — a hét utolsó összefoglalója,
+    # Heti MUNKANAPI összefoglaló: PÉNTEK 17:05 — a hét utolsó összefoglalója,
     # a teljes hétfő 00:00 → szombat 00:00 ablakról. A pénteki napi
     # összefoglalót (09:00, a csütörtöki napról) NEM váltja ki: külön üzenet.
     #
-    # Miért 16:00 és nem reggel? Reggel a péntek még alig kezdődött el, így a
-    # "hétfő–péntek" kép csonka lenne. A munkanap végén viszont a péntek is
-    # benne van. (Az ablak felső határa ettől függetlenül fix szombat 00:00 —
-    # lásd summary.workweek_range: a futás órája nem befolyásolja.)
+    # Miért 17:05? A munkanap vége — üzleti döntés, hogy a jelentés a nap
+    # lezárásakor érkezzen. Reggel azért nem jó, mert akkor a péntek még alig
+    # kezdődött el, így a "hétfő–péntek" kép csonka lenne.
+    #
+    # FIGYELEM — ez NEM esik egybe a csendes idő kezdetével: a .env.example
+    # szerint QUIET_HOURS_START=18, tehát a 17:05–18:00 sáv MÉG AKTÍV. Az ott
+    # keletkező riasztásokról valós időben megy értesítés (a router még nem
+    # némít), de ebbe a heti összefoglalóba már nem kerülnek bele, és a hétfői
+    # hétvégi összefoglaló is csak péntek 22:00-tól számol. Tudatosan vállalt
+    # rés; ha meg kell szüntetni, a job 18:05-re állítása fedi le.
+    #
+    # (Az ablak felső határa ettől függetlenül fix szombat 00:00 — lásd
+    # summary.workweek_range: a futás órája nem befolyásolja az ablakot, csak
+    # azt, hogy annak meddig tartó részéről LÉTEZIK már adat.)
     _scheduler.add_job(
         workweek_summary_job,
         trigger="cron",
-        hour=16,
-        minute=0,
+        hour=17,
+        minute=5,
         day_of_week="fri",
         id="workweek_summary",
         replace_existing=True,
@@ -584,7 +594,7 @@ def start_scheduler() -> AsyncIOScheduler:
     log.info(
         "Monitoring scheduler indítva (óránkénti ciklus + napi összefoglaló 09:00 "
         "+ hétvégi összefoglaló hétfő 09:00 + heti munkanapi összefoglaló péntek "
-        "16:00 + napi insight scan 08:00, tz=%s)",
+        "17:05 + napi insight scan 08:00, tz=%s)",
         timezone,
     )
     return _scheduler
