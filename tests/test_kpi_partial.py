@@ -42,7 +42,10 @@ def test_only_roas_configured_only_roas_evaluated():
         "cpc": 999_999,
         "cpl": 999_999,
         "ctr": 0.0001,          # ha min_ctr lenne, ctr_drop
-        "impressions": 1,       # ha min_impressions lenne, impressions_drop
+        # Bőven a `_MIN_IMPRESSIONS_FOR_RATIOS` küszöb fölött, hogy az
+        # arány-metrikák egyáltalán kiértékelődjenek — itt a KPI-öröklést
+        # vizsgáljuk, nem az adatmennyiség-kaput (arra külön teszt van).
+        "impressions": 5_000,
         "spend": 999_999,       # ha monthly_budget lenne, budget_depleted
         "frequency": 99.0,      # ha max_frequency lenne, frequency_spike
         "conversions": 1,

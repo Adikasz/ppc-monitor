@@ -77,6 +77,18 @@ _DEFAULT_CRITICAL_PCT = 40.0
 # Büdzsé-figyelmeztetés aránya (90%); a 100% már CRITICAL
 _BUDGET_WARNING_RATIO = 0.9
 
+# Minimum aznapi megjelenés, ami alatt az ARÁNY-alapú metrikákat nem értékeljük.
+#
+# A nap elején (pl. a 02:00-s ciklusban) még alig van adat: 0 megjelenés mellett
+# a CTR és a ROAS is 0.00, ami messze a cél alatt van → a detektor CRITICAL-nak
+# látná. Ez nem teljesítmény-probléma, hanem adathiány.
+#
+# A csapda nem is a hamis riasztás önmagában, hanem hogy a napi dedup (lásd
+# `storage.alerts.insert_alert`: kulcs = kampány_metrika_nap) miatt EGÉSZ NAPRA
+# elnyomná a később keletkező VALÓDI riasztást ugyanarra a kampány+metrika
+# párra — a nap végi összefoglalóban a félrevezető 0.00 maradna.
+_MIN_IMPRESSIONS_FOR_RATIOS = 100
+
 # A campaign_kpis aktív sor + client_kpis közül „mergelt" mezők (öröklés).
 _KPI_FIELDS = (
     "target_roas", "target_roi", "target_ctr",
@@ -222,31 +234,53 @@ def _evaluate_rules(
             f"{int(days_no_conv)} nap óta nincs konverzió (küszöb: {threshold_days} nap)",
         ))
 
-    # 3) "Magasabb a jobb" metrikák (ROAS, CTR, ROI)
-    for obs_key, target_key, metric, label, scale, decimals, unit in (
-        ("roas", "target_roas", "roas_drop", "ROAS", 1.0, 2, ""),
-        ("ctr", "target_ctr", "ctr_low", "CTR", 100.0, 2, "%"),
-        ("roi", "target_roi", "roi_low", "ROI", 1.0, 2, ""),
-    ):
-        anomaly = _higher_is_better(
-            campaign_id, insights, eff, obs_key, target_key, metric, label,
-            scale, decimals, unit, warning_pct, critical_pct, only_critical,
+    # Van-e elég aznapi adat ahhoz, hogy az ARÁNY-alapú metrikák (CTR, ROAS,
+    # CPA, CPM, frequency …) értelmesek legyenek? Lásd `_MIN_IMPRESSIONS_FOR_RATIOS`.
+    #
+    # Az abszolút, nem arány-alapú szabályokra NEM vonatkozik: az `ads_stopped`
+    # (0 megjelenés + van költés) épp erről az esetről szól, a `no_conversion`
+    # napokban mér, a büdzsé-szabályok havi összeghez viszonyítanak, az
+    # `impressions_drop` pedig magát a darabszámot nézi — ezeket egy
+    # megjelenés-küszöb elnémítaná, pedig pont ilyenkor a leghasznosabbak.
+    has_enough_data = (
+        impressions is not None and impressions >= _MIN_IMPRESSIONS_FOR_RATIOS
+    )
+    if not has_enough_data:
+        log.debug(
+            "Detektor (kampány #%s): arány-metrikák kihagyva — %s megjelenés "
+            "a %d-es küszöb alatt (még nincs értelmezhető aznapi adat)",
+            campaign_id,
+            "nincs" if impressions is None else int(impressions),
+            _MIN_IMPRESSIONS_FOR_RATIOS,
         )
-        if anomaly:
-            out.append(anomaly)
+
+    # 3) "Magasabb a jobb" metrikák (ROAS, CTR, ROI)
+    if has_enough_data:
+        for obs_key, target_key, metric, label, scale, decimals, unit in (
+            ("roas", "target_roas", "roas_drop", "ROAS", 1.0, 2, ""),
+            ("ctr", "target_ctr", "ctr_low", "CTR", 100.0, 2, "%"),
+            ("roi", "target_roi", "roi_low", "ROI", 1.0, 2, ""),
+        ):
+            anomaly = _higher_is_better(
+                campaign_id, insights, eff, obs_key, target_key, metric, label,
+                scale, decimals, unit, warning_pct, critical_pct, only_critical,
+            )
+            if anomaly:
+                out.append(anomaly)
 
     # 4) "Alacsonyabb a jobb" metrikák (CPA, CPL, CPC) — forint
-    for obs_key, target_key, metric, label in (
-        ("cpa", "max_cpa", "cpa_spike", "CPA"),
-        ("cpl", "max_cpl", "cpl_high", "CPL"),
-        ("cpc", "max_cpc", "cpc_high", "CPC"),
-    ):
-        anomaly = _lower_is_better(
-            campaign_id, insights, eff, obs_key, target_key, metric, label,
-            warning_pct, critical_pct, only_critical,
-        )
-        if anomaly:
-            out.append(anomaly)
+    if has_enough_data:
+        for obs_key, target_key, metric, label in (
+            ("cpa", "max_cpa", "cpa_spike", "CPA"),
+            ("cpl", "max_cpl", "cpl_high", "CPL"),
+            ("cpc", "max_cpc", "cpc_high", "CPC"),
+        ):
+            anomaly = _lower_is_better(
+                campaign_id, insights, eff, obs_key, target_key, metric, label,
+                warning_pct, critical_pct, only_critical,
+            )
+            if anomaly:
+                out.append(anomaly)
 
     # 5) Büdzsé (fix 90% / 100% küszöb)
     if spend is not None and monthly_budget is not None and monthly_budget > 0:
@@ -272,7 +306,7 @@ def _evaluate_rules(
     frequency = _num(insights, "frequency")
 
     min_ctr = _num(eff, "min_ctr")
-    if ctr_pct is not None and min_ctr is not None and min_ctr > 0 and ctr_pct < min_ctr:
+    if has_enough_data and ctr_pct is not None and min_ctr is not None and min_ctr > 0 and ctr_pct < min_ctr:
         pct_diff = (ctr_pct - min_ctr) / min_ctr * 100
         sev = _sev_for(pct_diff, warning_pct, critical_pct, drop=True, only_critical=only_critical)
         if sev:
@@ -282,7 +316,7 @@ def _evaluate_rules(
             ))
 
     max_cpm = _num(eff, "max_cpm")
-    if cpm is not None and max_cpm is not None and max_cpm > 0 and cpm > max_cpm:
+    if has_enough_data and cpm is not None and max_cpm is not None and max_cpm > 0 and cpm > max_cpm:
         pct_diff = (cpm - max_cpm) / max_cpm * 100
         sev = _sev_for(pct_diff, warning_pct, critical_pct, drop=False, only_critical=only_critical)
         if sev:
@@ -292,7 +326,10 @@ def _evaluate_rules(
             ))
 
     max_frequency = _num(eff, "max_frequency")
-    if frequency is not None and max_frequency is not None and max_frequency > 0 and frequency > max_frequency:
+    if (
+        has_enough_data and frequency is not None
+        and max_frequency is not None and max_frequency > 0 and frequency > max_frequency
+    ):
         pct_diff = (frequency - max_frequency) / max_frequency * 100
         sev = _sev_for(pct_diff, warning_pct, critical_pct, drop=False, only_critical=only_critical)
         if sev:
