@@ -99,18 +99,33 @@ def weekend_range(now: datetime | None = None) -> tuple[datetime, datetime]:
 
 
 def workweek_range(now: datetime | None = None) -> tuple[datetime, datetime]:
-    """A HÉT MUNKANAPJAI: hétfő 00:00 → szombat 00:00 a konfigurált időzónában.
+    """A HÉT ELTELT MUNKANAPJAI: hétfő 00:00 → (legfeljebb) szombat 00:00.
 
-    Vagyis a hétfő–péntek öt teljes naptári nap. A `daily_range` mintáját
-    követi, a határok ugyanúgy fél-nyitottak:
-        detected_at >= hétfő 00:00  ÉS  detected_at < szombat 00:00
-    Így a péntek 23:59:59.999999-kor keletkezett riasztás még benne van, a
-    szombat 00:00:00-kor keletkezett viszont már nem.
+    A `daily_range` mintáját követi, a határok ugyanúgy fél-nyitottak:
+        detected_at >= hétfő 00:00  ÉS  detected_at < felső határ
+    Így a felső határ előtti utolsó pillanatban keletkezett riasztás még benne
+    van, a határon keletkezett viszont már nem.
+
+    A felső határ a két érték közül a KORÁBBI:
+        - szombat 00:00 — a teljes hétfő–pénteki munkahét vége, ÉS
+        - a mai nap vége (holnap 00:00) — ameddig egyáltalán van adat.
+
+    Miért: az ütemezett job pénteken fut, ott a kettő azonos (péntek + 1 nap =
+    szombat), tehát az ÜTEMEZETT FUTÁS ABLAKA VÁLTOZATLAN — mindig a teljes
+    hétfő–péntek. Ha viszont valaki a `/summary type:workweek` paranccsal
+    KÉZZEL kéri le mondjuk szerdán, akkor a hét még nem zárult le: ilyenkor az
+    ablak hétfő 00:00 → csütörtök 00:00, azaz pontosan a ténylegesen eltelt
+    napok. Így a fejléc (`discord_router._workweek_period_label`) a valódi
+    ablakból tudja levezetni, hogy részleges adatot mutat-e — nincs két külön
+    igazságforrás.
+
+    Hétvégén (szombat/vasárnap) a szombat 00:00 a korábbi, tehát a lezárult hét
+    teljes munkanapi ablakát kapjuk vissza.
 
     NEM gördülő "utolsó 5×24 óra": a `now`-ból CSAK a naptári napot vesszük
-    (a `weekday()` adja, hányadik napon állunk), az időt nullázzuk. A péntek
-    17:05-ös ütemezett futás és egy kézi, délelőtti lekérés tehát PONTOSAN
-    ugyanazt az ablakot adja.
+    (a `weekday()` adja, hányadik napon állunk), az időt nullázzuk. Ugyanazon a
+    napon a délelőtti és a délutáni lekérés tehát PONTOSAN ugyanazt az ablakot
+    adja.
 
     Óraátállításkor is a teljes naptári napokat fedi: a `timedelta` itt
     fali-óra aritmetika (hétfő 00:00 + 5 nap = szombat 00:00), nem "120 óra".
@@ -126,7 +141,8 @@ def workweek_range(now: datetime | None = None) -> tuple[datetime, datetime]:
     now = now.astimezone(tz) if now else datetime.now(tz)
     today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
     monday0 = today0 - timedelta(days=now.weekday())   # weekday(): hétfő=0
-    return monday0, monday0 + timedelta(days=5)        # szombat 00:00
+    saturday0 = monday0 + timedelta(days=5)
+    return monday0, min(saturday0, today0 + timedelta(days=1))
 
 
 def _multi_account_label(
