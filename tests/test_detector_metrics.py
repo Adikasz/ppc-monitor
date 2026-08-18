@@ -141,19 +141,149 @@ def test_enough_impressions_still_alert_normally():
     assert "ctr_drop" in metrikak
 
 
-def test_boundary_exactly_at_the_threshold_is_enough():
-    """A küszöb INKLUZÍV: pontosan annyi megjelenés már elég."""
-    kozos = {"ctr": 0.001, "roas": 0.5, "spend": 5_000.0}
-    kapun_belul = detector._evaluate_rules(
+# ---------------------------------------------------------------------------
+# A HÁROM KÜLÖN KAPU
+#
+# Az éles adat mutatta meg, hogy egyetlen megjelenés-küszöb nem elég:
+#   - CTR-nél 100 megjelenés kevés (0.99^100 = 36,6% esély a véletlen 0
+#     kattintásra egy egészséges, 1%-os kampányon)
+#   - ROAS/CPA-nál a megjelenés ROSSZ MÉRCE: reggel 6-kor 300 megjelenés
+#     mellett is természetes, hogy a konverziók még nem estek be
+# ---------------------------------------------------------------------------
+
+def test_ctr_gate_needs_far_more_impressions_than_the_generic_one():
+    """A CTR-kapu szigorúbb — különben a véletlen 0 kattintás CRITICAL lenne."""
+    assert detector._MIN_IMPRESSIONS_FOR_CTR > detector._MIN_IMPRESSIONS_FOR_RATIOS
+
+
+def test_ctr_not_evaluated_below_its_own_threshold():
+    """Az élesben látott eset: pár száz megjelenés, 0 kattintás → NEM riasztás.
+
+    300 megjelenésnél egy egészséges 1%-os kampányon is ~5% az esélye a csupa
+    véletlen 0 kattintásnak — ebből nem lehet CRITICAL-t csinálni.
+    """
+    out = detector._evaluate_rules(
+        1,
+        {"impressions": 300, "ctr": 0.0, "spend": 50_000.0, "conversions": 10},
+        _eff(min_ctr=1.0, target_ctr=1.0),
+        False,
+    )
+    assert _metrics(out, "ctr_drop") == []
+    assert _metrics(out, "ctr_low") == []
+
+
+def test_ctr_gate_boundary_is_inclusive():
+    """A CTR-küszöb INKLUZÍV: pontosan annyi megjelenés már elég."""
+    kozos = {"ctr": 0.001, "spend": 50_000.0, "conversions": 10}
+    belul = detector._evaluate_rules(
+        1, {**kozos, "impressions": detector._MIN_IMPRESSIONS_FOR_CTR},
+        _eff(min_ctr=1.0), False,
+    )
+    kivul = detector._evaluate_rules(
+        1, {**kozos, "impressions": detector._MIN_IMPRESSIONS_FOR_CTR - 1},
+        _eff(min_ctr=1.0), False,
+    )
+    assert _metrics(belul, "ctr_drop") != []
+    assert _metrics(kivul, "ctr_drop") == []
+
+
+def test_roas_is_gated_by_spend_not_by_impressions():
+    """A pontosan az élesben látott 06:00-s eset: sok megjelenés, alig költés.
+
+    A ROAS 0.00 itt nem teljesítmény-gond, hanem az, hogy a konverziók még nem
+    estek be. Megjelenésből akármennyi lehet — a kapu a KÖLTÉST nézi.
+    """
+    sok_megjelenes_keves_koltes = {
+        "impressions": 50_000, "roas": 0.0, "spend": 900.0, "conversions": 0,
+    }
+    out = detector._evaluate_rules(
+        1, sok_megjelenes_keves_koltes, _eff(target_roas=5.0, max_cpa=4_000.0), False,
+    )
+    assert _metrics(out, "roas_drop") == []
+
+    # Ugyanaz a kampány a nap folyamán, egy konverziónyi költés fölött → riaszt.
+    kesobb = {**sok_megjelenes_keves_koltes, "spend": 4_000.0}
+    out = detector._evaluate_rules(
+        1, kesobb, _eff(target_roas=5.0, max_cpa=4_000.0), False,
+    )
+    assert _metrics(out, "roas_drop") != []
+
+
+def test_conversion_gate_self_calibrates_from_the_campaign_kpi():
+    """A küszöb a kampány SAJÁT max_cpa-ja — nem egy globális szám.
+
+    Két kampány, ugyanaz a költés: amelyiknek drágább a konverziója, annál még
+    nem várható eredmény, tehát nem riasztunk.
+    """
+    insights = {"impressions": 50_000, "roas": 0.0, "spend": 5_000.0, "conversions": 0}
+
+    olcso_konverzio = detector._evaluate_rules(
+        1, insights, _eff(target_roas=5.0, max_cpa=2_000.0), False,
+    )
+    draga_konverzio = detector._evaluate_rules(
+        1, insights, _eff(target_roas=5.0, max_cpa=20_000.0), False,
+    )
+
+    assert _metrics(olcso_konverzio, "roas_drop") != []   # 5000 Ft > 2000 Ft
+    assert _metrics(draga_konverzio, "roas_drop") == []   # 5000 Ft < 20 000 Ft
+
+
+def test_conversion_gate_uses_cpl_when_there_is_no_cpa():
+    """Lead-gen kampányon a max_cpl adja a konverzió költség-skáláját."""
+    insights = {"impressions": 50_000, "roas": 0.0, "spend": 3_000.0, "conversions": 0}
+    out = detector._evaluate_rules(
+        1, insights, _eff(target_roas=5.0, max_cpl=10_000.0), False,
+    )
+    assert _metrics(out, "roas_drop") == []
+
+
+def test_conversion_gate_falls_back_to_the_default_without_kpi():
+    """KPI nélküli kampányon is véd — csak fix összeggel, nem önhangolón."""
+    kozos = {"impressions": 50_000, "roas": 0.0, "conversions": 0}
+    kevés = detector._evaluate_rules(
+        1, {**kozos, "spend": detector._DEFAULT_CONVERSION_COST - 1},
+        _eff(target_roas=5.0), False,
+    )
+    elég = detector._evaluate_rules(
+        1, {**kozos, "spend": detector._DEFAULT_CONVERSION_COST},
+        _eff(target_roas=5.0), False,
+    )
+    assert _metrics(kevés, "roas_drop") == []
+    assert _metrics(elég, "roas_drop") != []
+
+
+def test_cpa_is_gated_by_spend_too():
+    """A CPA is konverzió-alapú: egy konverziónyi költés alatt nem ítélünk."""
+    kozos = {"impressions": 50_000, "cpa": 9_000.0, "conversions": 1}
+    korán = detector._evaluate_rules(
+        1, {**kozos, "spend": 1_000.0}, _eff(max_cpa=4_000.0), False,
+    )
+    később = detector._evaluate_rules(
+        1, {**kozos, "spend": 9_000.0}, _eff(max_cpa=4_000.0), False,
+    )
+    assert _metrics(korán, "cpa_spike") == []
+    assert _metrics(később, "cpa_spike") != []
+
+
+def test_impression_based_metrics_keep_the_generic_threshold():
+    """A CPM és a frequency közvetlenül megjelenésből számol — ott a 100 marad,
+    és NEM függ a költés-kaputól (itt a költés messze a konverzió-ár alatt van).
+    """
+    # A CPM-et a detektor maga számolja (spend / impressions * 1000), ezért a
+    # költést adjuk meg: 500 Ft / 100 megjelenés → 5 000 Ft-os CPM, a 2 000-es
+    # max fölött. Ugyanez az 500 Ft messze a 4 000 Ft-os konverzió-ár alatt van,
+    # tehát a költés-kapu ZÁRVA — mégis riasztania kell.
+    kozos = {"frequency": 9.0, "spend": 500.0, "conversions": 0}
+    belul = detector._evaluate_rules(
         1, {**kozos, "impressions": detector._MIN_IMPRESSIONS_FOR_RATIOS},
-        _eff(target_roas=5.0), False,
+        _eff(max_cpm=2_000.0, max_frequency=3.0, max_cpa=4_000.0), False,
     )
-    kapun_kivul = detector._evaluate_rules(
+    kivul = detector._evaluate_rules(
         1, {**kozos, "impressions": detector._MIN_IMPRESSIONS_FOR_RATIOS - 1},
-        _eff(target_roas=5.0), False,
+        _eff(max_cpm=2_000.0, max_frequency=3.0, max_cpa=4_000.0), False,
     )
-    assert _metrics(kapun_belul, "roas_drop") != []
-    assert _metrics(kapun_kivul, "roas_drop") == []
+    assert {a["metric"] for a in belul} == {"cpm_spike", "frequency_spike"}
+    assert kivul == []
 
 
 def test_ads_stopped_still_fires_without_impressions():
