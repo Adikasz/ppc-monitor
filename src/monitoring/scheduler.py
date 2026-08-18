@@ -315,7 +315,11 @@ def _resolve_client_for_account(ad_account_id: int | None) -> dict[str, Any] | N
     return clients_storage.get_client(account.get("client_id"))
 
 
-async def daily_insight_scan(*, limit: int | None = None) -> None:
+async def daily_insight_scan(
+    *,
+    limit: int | None = None,
+    client_id: int | None = None,
+) -> dict[str, int]:
     """Napi INSIGHT scan (08:00, hétköznap) — szabály-alapú + AI javaslatok.
 
     Csak 'mature' lifecycle-ú kampányokat néz (a tanulási fázis nem kap insightot).
@@ -328,33 +332,71 @@ async def daily_insight_scan(*, limit: int | None = None) -> None:
 
     A routing tiszteli a csendes időt (nincs bypass): a scan 08:00-kor (a quiet
     hours VÉGÉN, hétköznap) fut, így az insight munkaidőben megy ki, nem éjjel.
+    A manuális futtatás (`/insight scan-now`) SEM bypassolja — így a teszt
+    hűen azt mutatja, amit az ütemezett futás produkálna. A `quiet_hours`
+    számláló teszi láthatóvá, ha emiatt nem ment ki semmi.
 
-    `limit`: legfeljebb ennyi mature kampányt dolgoz fel (teszt/manuális futtatás).
+    Paraméterek:
+        limit     — legfeljebb ennyi mature kampányt dolgoz fel (teszt/manuális)
+        client_id — csak ennek az ügyfélnek a kampányai (gyorsabb teszteléshez)
+
+    Visszatérés — a `/insight scan-now` ebből építi a válaszát, és ebből készül
+    a záró log sor is. MINDIG teljes kulcskészlettel tér vissza, a korai
+    kilépési ágakon is, hogy a hívónak ne kelljen `.get()`-elnie:
+
+        {"total": int,             # a scan által vizsgált mature kampányok
+         "insights": int,          # beszúrt (nem deduplikált) insight
+         "skipped_no_history": int,
+         "failed": int,
+         "routed": int,            # ténylegesen kiment Discordra
+         "quiet_hours": int}       # csendes idő miatt elnyomva
     """
     log.info("Napi insight scan indítva…")
+    stats = {
+        "total": 0, "insights": 0, "skipped_no_history": 0,
+        "failed": 0, "routed": 0, "quiet_hours": 0,
+    }
 
     try:
         campaigns = await asyncio.to_thread(campaigns_storage.get_active_campaigns)
     except Exception:
         log.exception("Insight scan: a kampánylista lekérése sikertelen — kihagyva")
-        return
+        return stats
 
     by_account = campaigns_storage.group_campaigns_by_account(campaigns)
     mature = [
         c for c in campaigns
         if (c.get("lifecycle_state") or "").lower() == _INSIGHT_LIFECYCLE
     ]
+
+    # Ügyfél-szűkítés: a kampány sorban NINCS client_id (a get_active_campaigns
+    # csak az ad_accounts alap-mezőit ágyazza be), ezért a kliens FIÓKJAIN
+    # keresztül szűrünk.
+    if client_id is not None:
+        account_ids = {
+            a["id"] for a in await asyncio.to_thread(
+                ad_accounts_storage.get_ad_accounts_for_client,
+                client_id, active_only=False,
+            )
+            if a.get("id") is not None
+        }
+        mature = [c for c in mature if c.get("ad_account_id") in account_ids]
+
     if limit is not None:
         mature = mature[:limit]
 
+    stats["total"] = len(mature)
+
     if not mature:
-        log.info("Insight scan: nincs 'mature' kampány — kihagyva")
-        return
+        log.info(
+            "Insight scan: nincs 'mature' kampány%s — kihagyva",
+            f" (ügyfél #{client_id})" if client_id is not None else "",
+        )
+        return stats
 
     client_cache: dict[int, dict[str, Any] | None] = {}
     roas_cache: dict[int, dict[int, float | None]] = {}
 
-    insight_count = 0
     for campaign in mature:
         cid = campaign.get("id")
         acct_id = campaign.get("ad_account_id")
@@ -363,7 +405,15 @@ async def daily_insight_scan(*, limit: int | None = None) -> None:
                 insights_history_storage.get_insights_history, cid, 7
             )
             if len(history) < _INSIGHT_MIN_HISTORY_ROWS:
-                continue  # nincs elég adat
+                # Korábban ez NÉMÁN ugrott — így egy üres scan
+                # megkülönböztethetetlen volt egy elhasalt scantől.
+                stats["skipped_no_history"] += 1
+                log.debug(
+                    "Insight scan: kampány #%s kihagyva — %d history sor a %d-es "
+                    "minimum alatt",
+                    cid, len(history), _INSIGHT_MIN_HISTORY_ROWS,
+                )
+                continue
 
             kpi = await asyncio.to_thread(insights_history_storage.get_merged_kpis, cid)
 
@@ -407,24 +457,35 @@ async def daily_insight_scan(*, limit: int | None = None) -> None:
                     ins.get("observed_value"), ins.get("threshold_value"), ins["message"],
                 )
                 if alert_row:
-                    insight_count += 1
+                    stats["insights"] += 1
                     try:
                         # NEM bypassoljuk a csendes időt: az insight is csak
                         # munkaidőben (08:00–17:00, hétköznap) menjen ki. A scan
                         # 08:00-kor fut, így nem nyomódik el.
-                        await route_alert(alert_row)
-                    except Exception as exc:  # noqa: BLE001
-                        log.error(
-                            "Insight routing hiba (alert #%s): %s",
-                            alert_row.get("id"), exc,
+                        routing = await route_alert(alert_row)
+                        if routing.get("routed"):
+                            stats["routed"] += 1
+                        elif routing.get("reason") == "quiet_hours":
+                            stats["quiet_hours"] += 1
+                    except Exception:
+                        # `exception` (nem `error`): traceback nélkül nem
+                        # derül ki, MI hasalt el — a hiányzó stack trace miatt
+                        # maradt sokáig rejtve a `timedelta` NameError is.
+                        log.exception(
+                            "Insight routing hiba (alert #%s)", alert_row.get("id"),
                         )
-        except Exception as exc:  # noqa: BLE001 — egy kampány hibája ne állítsa le a scant
-            log.error("Insight scan: kampány #%s hiba: %s", cid, exc)
+        except Exception:  # noqa: BLE001 — egy kampány hibája ne állítsa le a scant
+            stats["failed"] += 1
+            log.exception("Insight scan: kampány #%s hiba", cid)
 
     log.info(
-        "Insight scan kész: %d mature kampány vizsgálva, %d insight",
-        len(mature), insight_count,
+        "Insight scan kész: %d insight generálva, %d kampány kihagyva (kevés adat), "
+        "%d kampány hibázott, %d kampány vizsgálva összesen "
+        "(kiküldve: %d, csendes idő miatt elnyomva: %d)",
+        stats["insights"], stats["skipped_no_history"], stats["failed"],
+        stats["total"], stats["routed"], stats["quiet_hours"],
     )
+    return stats
 
 
 # ---------------------------------------------------------------------------
