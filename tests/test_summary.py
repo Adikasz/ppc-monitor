@@ -237,10 +237,57 @@ def test_workweek_range_is_not_a_rolling_5_day_window():
 
 def test_workweek_range_anchors_to_the_current_week_on_any_weekday():
     """A hét BÁRMELY napján ugyanannak a hétnek a hétfőjétől számol."""
-    vart = ("2026-08-17T00:00:00+02:00", "2026-08-22T00:00:00+02:00")
     for nap in range(17, 24):  # hétfő (17.) … vasárnap (23.)
+        frm, _ = s.workweek_range(datetime(2026, 8, nap, 12, 0, tzinfo=TZ))
+        assert frm.isoformat() == "2026-08-17T00:00:00+02:00", nap
+
+
+def test_workweek_range_is_the_full_week_from_friday_onwards():
+    """Péntektől vasárnapig a TELJES hétfő–péntek ablak.
+
+    Ez az ütemezett job esete (péntek 17:05) — a felső határ levágása nem
+    érintheti, különben a heti jelentés elveszítené a pénteki napot.
+    """
+    for nap in (21, 22, 23):  # péntek, szombat, vasárnap
         frm, to = s.workweek_range(datetime(2026, 8, nap, 12, 0, tzinfo=TZ))
-        assert (frm.isoformat(), to.isoformat()) == vart, nap
+        assert (frm.isoformat(), to.isoformat()) == (
+            "2026-08-17T00:00:00+02:00", "2026-08-22T00:00:00+02:00",
+        ), nap
+
+
+def test_workweek_range_stops_at_the_end_of_today_before_friday():
+    """Hétfő–csütörtökön a hét még tart: az ablak csak az ELTELT napokat fedi.
+
+    Így a kézi `/summary type:workweek` nem állít semmit olyan napokról, amikről
+    még nincs adat — és a fejléc ebből a határból tudja levezetni, hogy
+    részleges összefoglalót mutat (`discord_router._workweek_period_label`).
+    """
+    vart = {
+        17: "2026-08-18T00:00:00+02:00",  # hétfőn   → kedd 00:00
+        18: "2026-08-19T00:00:00+02:00",  # kedden   → szerda 00:00
+        19: "2026-08-20T00:00:00+02:00",  # szerdán  → csütörtök 00:00
+        20: "2026-08-21T00:00:00+02:00",  # csütörtökön → péntek 00:00
+    }
+    for nap, to_iso in vart.items():
+        frm, to = s.workweek_range(datetime(2026, 8, nap, 12, 0, tzinfo=TZ))
+        assert frm.isoformat() == "2026-08-17T00:00:00+02:00", nap
+        assert to.isoformat() == to_iso, nap
+
+
+def test_workweek_range_mid_week_still_covers_whole_calendar_days():
+    """A levágott felső határ is éjfélre esik — nem a lekérés percére.
+
+    Ugyanazon a szerdán reggel és este lekérve UGYANAZ az ablak; a kedd
+    23:59:59.999999-kor keletkezett riasztás pedig benne van.
+    """
+    reggel = s.workweek_range(datetime(2026, 8, 19, 8, 0, tzinfo=TZ))
+    este = s.workweek_range(datetime(2026, 8, 19, 22, 30, tzinfo=TZ))
+    assert reggel == este
+
+    frm, to = reggel
+    assert (to.hour, to.minute, to.second, to.microsecond) == (0, 0, 0, 0)
+    assert frm <= datetime(2026, 8, 18, 23, 59, 59, 999999, tzinfo=TZ) < to
+    assert not (frm <= datetime(2026, 8, 20, 0, 0, 0, tzinfo=TZ) < to)
 
 
 def test_workweek_range_covers_five_calendar_days_across_dst():
@@ -440,6 +487,80 @@ def test_workweek_format_no_alerts_branch():
     )
     assert out.startswith("✅ **Heti összefoglaló — munkanapok (hétfő–péntek)**")
     assert "A héten nem volt anomália" in out
+    assert "2026-08-17 → 2026-08-21" in out
+
+
+def test_workweek_format_header_flags_a_partial_week():
+    """Hét közben kézzel lekérve a fejléc az UTOLSÓ MEGLÉVŐ napig szól.
+
+    Szerdán a `workweek_range` felső határa csütörtök 00:00 → a fejléc
+    "hétfő–szerda", és kimondja, hogy a hét még nem zárult le. Enélkül a
+    részleges adat teljes hetinek látszana.
+    """
+    out = _format_summary(
+        _workweek_summary(to="2026-08-20T00:00:00+02:00"),  # szerdai lekérés
+        kind="workweek",
+    )
+
+    assert "📊 **Heti összefoglaló — munkanapok (hétfő–szerda, részleges — " \
+           "a hét még nem zárult le)**" in out
+    assert "2026-08-17 → 2026-08-19" in out   # hétfő → szerda
+    assert "hétfő–péntek" not in out
+
+
+def test_workweek_format_partial_label_follows_the_actual_window():
+    """Minden hét közbeni nap a saját napnevét kapja — a fejléc az ablakot követi."""
+    vart = {
+        "2026-08-18T00:00:00+02:00": "hétfő–hétfő",       # hétfői lekérés
+        "2026-08-19T00:00:00+02:00": "hétfő–kedd",
+        "2026-08-20T00:00:00+02:00": "hétfő–szerda",
+        "2026-08-21T00:00:00+02:00": "hétfő–csütörtök",
+        "2026-08-22T00:00:00+02:00": "hétfő–péntek",      # teljes hét (pénteken)
+    }
+    for to_iso, label in vart.items():
+        out = _format_summary(_workweek_summary(to=to_iso), kind="workweek")
+        assert f"munkanapok ({label}" in out, to_iso
+        # A "részleges" jelzés PONTOSAN a nem teljes heteken jelenjen meg.
+        assert ("részleges" in out) is (label != "hétfő–péntek"), to_iso
+
+
+def test_workweek_format_partial_no_alerts_branch_does_not_claim_the_whole_week():
+    """Anomália nélkül sem állíthatjuk, hogy "a héten" nem volt gond, ha a hét tart."""
+    out = _format_summary(
+        _workweek_summary(
+            to="2026-08-20T00:00:00+02:00",
+            critical_count=0, warning_count=0, alert_count=0, top_issues=[],
+        ),
+        kind="workweek",
+    )
+
+    assert out.startswith("✅ **Heti összefoglaló — munkanapok (hétfő–szerda, részleges")
+    assert "Eddig a héten nem volt anomália" in out
+    assert "A héten nem volt anomália" not in out
+
+
+def test_workweek_format_falls_back_to_the_full_week_on_a_broken_upper_bound():
+    """Hiányzó/hibás felső határnál NEM bélyegzünk részlegesnek egy teljes hetet."""
+    for rossz in (None, "", "nem-datum"):
+        out = _format_summary(_workweek_summary(to=rossz), kind="workweek")
+        assert "munkanapok (hétfő–péntek)" in out, rossz
+        assert "részleges" not in out, rossz
+
+
+def test_scheduled_friday_run_still_reports_the_full_week_end_to_end():
+    """A pénteki job ablaka → fejléc: a lánc egésze a TELJES hetet adja.
+
+    Ez a regresszió-védelem a felső határ levágására: ha az a pénteki futásra
+    is lecsapna, itt "részleges" jelenne meg.
+    """
+    frm, to = s.workweek_range(datetime(2026, 8, 21, 17, 5, tzinfo=TZ))  # péntek
+    out = _format_summary(
+        _workweek_summary(**{"from": frm.isoformat(), "to": to.isoformat()}),
+        kind="workweek",
+    )
+
+    assert "munkanapok (hétfő–péntek)" in out
+    assert "részleges" not in out
     assert "2026-08-17 → 2026-08-21" in out
 
 

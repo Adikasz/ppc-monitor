@@ -269,6 +269,53 @@ def _inclusive_end_date_label(iso: str | None) -> str:
         return str(iso)[:10]
 
 
+# A hét napjai magyarul, `datetime.weekday()` sorrendjében (hétfő = 0).
+_WEEKDAY_NAMES_HU = (
+    "hétfő", "kedd", "szerda", "csütörtök", "péntek", "szombat", "vasárnap",
+)
+
+
+def _workweek_last_day(iso_to: str | None) -> datetime | None:
+    """A munkanapi ablak utolsó BENNE lévő napja az EXKLUZÍV felső határból."""
+    if not iso_to:
+        return None
+    try:
+        return datetime.fromisoformat(iso_to) - timedelta(days=1)
+    except ValueError:
+        return None
+
+
+def _workweek_period_label(iso_to: str | None) -> str:
+    """A munkanapi időszak emberi címkéje a TÉNYLEGES ablak felső határából.
+
+    Lezárult hét → "hétfő–péntek". Ha viszont a hét még tart (valaki kézzel
+    kérte le mondjuk szerdán), akkor az ablak is csak csütörtök 00:00-ig ér
+    (lásd `monitoring.summary.workweek_range`), és a fejléc ezt őszintén
+    tükrözi: "hétfő–szerda, részleges — a hét még nem zárult le".
+
+    Az egyetlen forrás maga az ablak, nem egy külön flag: így a fejléc nem
+    tud eltérni attól, amit ténylegesen lekérdeztünk.
+
+    Hiányzó/hibás felső határnál a teljes hetet írjuk ki — ez az ütemezett
+    futás esete, és így egy formázási hiba nem tesz "részleges" bélyeget egy
+    valójában teljes összefoglalóra.
+    """
+    last_day = _workweek_last_day(iso_to)
+    # weekday(): hétfő=0 … péntek=4. Péntek vagy később → teljes munkahét.
+    if last_day is None or last_day.weekday() >= 4:
+        return "hétfő–péntek"
+    return (
+        f"hétfő–{_WEEKDAY_NAMES_HU[last_day.weekday()]}, "
+        "részleges — a hét még nem zárult le"
+    )
+
+
+def _workweek_is_partial(iso_to: str | None) -> bool:
+    """Igaz, ha a munkanapi ablak a péntek vége ELŐTT zárul (még tart a hét)."""
+    last_day = _workweek_last_day(iso_to)
+    return last_day is not None and last_day.weekday() < 4
+
+
 def _local_detected_at(issue: dict[str, Any]) -> datetime | None:
     """Az anomália észlelési ideje a KONFIGURÁLT időzónában. None, ha nincs/hibás.
 
@@ -473,13 +520,25 @@ def _format_summary(
     # egy hétfő–péntek összefoglalóra.
     workweek_to_label = _inclusive_end_date_label(summary.get("to"))
 
+    # A munkanapi időszak címkéje a tényleges ablakból; kézi, hét közbeni
+    # lekérésnél jelzi, hogy még nem zárult le a hét (pl. "hétfő–szerda").
+    workweek_period = _workweek_period_label(summary.get("to"))
+    workweek_partial = _workweek_is_partial(summary.get("to"))
+
     # Nincs anomália → rövid, pozitív üzenet.
     if alert_count == 0:
         if kind == "workweek":
+            # Részleges ablaknál nem állíthatjuk, hogy "a héten" nem volt gond —
+            # a hét hátralévő napjairól még nincs adatunk.
+            no_issue = (
+                "Eddig a héten nem volt anomália."
+                if workweek_partial
+                else "A héten nem volt anomália."
+            )
             return (
-                f"✅ **Heti összefoglaló — munkanapok (hétfő–péntek)** — "
+                f"✅ **Heti összefoglaló — munkanapok ({workweek_period})** — "
                 f"{from_label} → {workweek_to_label}\n"
-                f"A héten nem volt anomália. Minden kampány rendben. 🎉"
+                f"{no_issue} Minden kampány rendben. 🎉"
             )
         if kind == "weekend":
             return (
@@ -493,7 +552,7 @@ def _format_summary(
 
     if kind == "workweek":
         header = (
-            f"📊 **Heti összefoglaló — munkanapok (hétfő–péntek)** — "
+            f"📊 **Heti összefoglaló — munkanapok ({workweek_period})** — "
             f"{from_label} → {workweek_to_label}"
         )
         issues_title = "**Problémák a héten:**"
