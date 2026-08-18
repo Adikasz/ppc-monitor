@@ -77,17 +77,47 @@ _DEFAULT_CRITICAL_PCT = 40.0
 # Büdzsé-figyelmeztetés aránya (90%); a 100% már CRITICAL
 _BUDGET_WARNING_RATIO = 0.9
 
-# Minimum aznapi megjelenés, ami alatt az ARÁNY-alapú metrikákat nem értékeljük.
+# ---------------------------------------------------------------------------
+# Adatmennyiség-kapuk: mikor van elég aznapi adat egy metrika értelmezéséhez
 #
-# A nap elején (pl. a 02:00-s ciklusban) még alig van adat: 0 megjelenés mellett
-# a CTR és a ROAS is 0.00, ami messze a cél alatt van → a detektor CRITICAL-nak
+# A nap elején (a 02:00-s ciklusban) még alig van adat: 0 megjelenés mellett a
+# CTR és a ROAS is 0.00, ami messze a cél alatt van → a detektor CRITICAL-nak
 # látná. Ez nem teljesítmény-probléma, hanem adathiány.
 #
 # A csapda nem is a hamis riasztás önmagában, hanem hogy a napi dedup (lásd
 # `storage.alerts.insert_alert`: kulcs = kampány_metrika_nap) miatt EGÉSZ NAPRA
-# elnyomná a később keletkező VALÓDI riasztást ugyanarra a kampány+metrika
-# párra — a nap végi összefoglalóban a félrevezető 0.00 maradna.
+# az első mérés marad az összefoglalóban.
+#
+# FONTOS: nem minden metrikának a megjelenés a helyes mércéje — három külön
+# kapu van, mert háromféle mennyiség teszi értelmessé az adott arányt.
+# ---------------------------------------------------------------------------
+
+# CTR-alapú szabályok (ctr_low, ctr_drop).
+#
+# 100 megjelenésnél egy TÖKÉLETESEN egészséges, 1%-os CTR-ű kampánynál is
+# 36,6% az esélye, hogy csupa véletlenből NULLA kattintás legyen (0.99^100) —
+# innen jött a hajnali "CTR 0.00%" áradás. 1000 megjelenésnél ugyanez az esély
+# már 0,004% (0.99^1000), tehát a nulla kattintás valóban jelent valamit.
+_MIN_IMPRESSIONS_FOR_CTR = 1000
+
+# Közvetlenül megjelenésből számoló metrikák (cpm_spike, frequency_spike),
+# illetve a kattintás-alapú cpc_high. Ezek nem konverzióra várnak, így kisebb
+# mintán is értelmezhetők.
 _MIN_IMPRESSIONS_FOR_RATIOS = 100
+
+# Konverzió-alapú metrikák (roas_drop, roi_low, cpa_spike, cpl_high).
+#
+# Ezekre a MEGJELENÉS ROSSZ MÉRCE: reggel 6-kor egy kampánynak lehet 300
+# megjelenése úgy, hogy a konverziók értelemszerűen még nem estek be →
+# ROAS = 0.00, pedig semmi baj nincs. A helyes kérdés nem az, hogy "látta-e
+# elég ember", hanem hogy "elköltöttünk-e már annyit, amennyiből egy
+# konverziót VÁRHATNÁNK".
+#
+# A küszöb ezért ÖNHANGOLÓ: a kampány saját max_cpa / max_cpl KPI-ja mondja
+# meg, mennyibe kerül nála egy konverzió. Amíg ennyit sem költött aznap, a
+# nulla konverzió VÁRHATÓ, nem probléma. Ha egyik KPI sincs beállítva, erre a
+# fix összegre esik vissza.
+_DEFAULT_CONVERSION_COST = 5000.0  # Ft
 
 # A campaign_kpis aktív sor + client_kpis közül „mergelt" mezők (öröklés).
 _KPI_FIELDS = (
@@ -196,6 +226,25 @@ def _merge_kpis(
 # Szabály-kiértékelés (PURE — nincs DB hívás, így önállóan tesztelhető)
 # ---------------------------------------------------------------------------
 
+def _conversion_cost_scale(eff: dict[str, Any]) -> float:
+    """Mennyibe kerül a kampánynál EGY konverzió, a saját KPI-ja szerint (Ft).
+
+    Ez a konverzió-alapú metrikák (ROAS / ROI / CPA / CPL) adat-kapujának
+    mércéje: amíg az aznapi költés ennyit sem ér el, a nulla konverzió VÁRHATÓ,
+    nem probléma — ilyenkor a ROAS 0.00 nem teljesítmény-jelzés.
+
+    A `max_cpa` az elsődleges (e-commerce), a `max_cpl` a másodlagos (lead-gen).
+    Ha egyik sincs beállítva, a `_DEFAULT_CONVERSION_COST` fix összegre esünk
+    vissza — így a kapu KPI nélküli kampányon is véd, csak nem önhangolón.
+    """
+    for key in ("max_cpa", "max_cpl"):
+        value = _num(eff, key)
+        if value is not None and value > 0:
+            return float(value)
+    return _DEFAULT_CONVERSION_COST
+
+
+
 def _evaluate_rules(
     campaign_id: int,
     insights: dict[str, Any],
@@ -234,53 +283,63 @@ def _evaluate_rules(
             f"{int(days_no_conv)} nap óta nincs konverzió (küszöb: {threshold_days} nap)",
         ))
 
-    # Van-e elég aznapi adat ahhoz, hogy az ARÁNY-alapú metrikák (CTR, ROAS,
-    # CPA, CPM, frequency …) értelmesek legyenek? Lásd `_MIN_IMPRESSIONS_FOR_RATIOS`.
+    # Van-e elég aznapi adat az egyes metrika-CSALÁDOK értelmezéséhez?
+    # Háromféle mennyiség tesz értelmessé háromféle arányt — lásd a modul
+    # tetején a küszöb-konstansokat.
     #
-    # Az abszolút, nem arány-alapú szabályokra NEM vonatkozik: az `ads_stopped`
-    # (0 megjelenés + van költés) épp erről az esetről szól, a `no_conversion`
-    # napokban mér, a büdzsé-szabályok havi összeghez viszonyítanak, az
-    # `impressions_drop` pedig magát a darabszámot nézi — ezeket egy
-    # megjelenés-küszöb elnémítaná, pedig pont ilyenkor a leghasznosabbak.
-    has_enough_data = (
-        impressions is not None and impressions >= _MIN_IMPRESSIONS_FOR_RATIOS
-    )
-    if not has_enough_data:
+    # Az abszolút, nem arány-alapú szabályokra EGYIK kapu sem vonatkozik: az
+    # `ads_stopped` (0 megjelenés + van költés) épp erről az esetről szól, a
+    # `no_conversion` napokban mér, a büdzsé-szabályok havi összeghez
+    # viszonyítanak, az `impressions_drop` pedig magát a darabszámot nézi —
+    # ezeket egy adatmennyiség-kapu elnémítaná, pedig pont ilyenkor a
+    # leghasznosabbak.
+    conversion_cost = _conversion_cost_scale(eff)
+    gates = {
+        "ctr": impressions is not None and impressions >= _MIN_IMPRESSIONS_FOR_CTR,
+        "impressions": impressions is not None and impressions >= _MIN_IMPRESSIONS_FOR_RATIOS,
+        "conversion": spend is not None and spend >= conversion_cost,
+    }
+    if not all(gates.values()):
         log.debug(
-            "Detektor (kampány #%s): arány-metrikák kihagyva — %s megjelenés "
-            "a %d-es küszöb alatt (még nincs értelmezhető aznapi adat)",
-            campaign_id,
+            "Detektor (kampány #%s): kapuk — ctr=%s impressions=%s conversion=%s "
+            "(megjelenés=%s, költés=%s, konverzió-költség=%s)",
+            campaign_id, gates["ctr"], gates["impressions"], gates["conversion"],
             "nincs" if impressions is None else int(impressions),
-            _MIN_IMPRESSIONS_FOR_RATIOS,
+            "nincs" if spend is None else spend,
+            conversion_cost,
         )
 
-    # 3) "Magasabb a jobb" metrikák (ROAS, CTR, ROI)
-    if has_enough_data:
-        for obs_key, target_key, metric, label, scale, decimals, unit in (
-            ("roas", "target_roas", "roas_drop", "ROAS", 1.0, 2, ""),
-            ("ctr", "target_ctr", "ctr_low", "CTR", 100.0, 2, "%"),
-            ("roi", "target_roi", "roi_low", "ROI", 1.0, 2, ""),
-        ):
-            anomaly = _higher_is_better(
-                campaign_id, insights, eff, obs_key, target_key, metric, label,
-                scale, decimals, unit, warning_pct, critical_pct, only_critical,
-            )
-            if anomaly:
-                out.append(anomaly)
+    # 3) "Magasabb a jobb" metrikák (ROAS, CTR, ROI) — soronként saját kapuval
+    for obs_key, target_key, metric, label, scale, decimals, unit, gate in (
+        ("roas", "target_roas", "roas_drop", "ROAS", 1.0, 2, "", "conversion"),
+        ("ctr", "target_ctr", "ctr_low", "CTR", 100.0, 2, "%", "ctr"),
+        ("roi", "target_roi", "roi_low", "ROI", 1.0, 2, "", "conversion"),
+    ):
+        if not gates[gate]:
+            continue
+        anomaly = _higher_is_better(
+            campaign_id, insights, eff, obs_key, target_key, metric, label,
+            scale, decimals, unit, warning_pct, critical_pct, only_critical,
+        )
+        if anomaly:
+            out.append(anomaly)
 
     # 4) "Alacsonyabb a jobb" metrikák (CPA, CPL, CPC) — forint
-    if has_enough_data:
-        for obs_key, target_key, metric, label in (
-            ("cpa", "max_cpa", "cpa_spike", "CPA"),
-            ("cpl", "max_cpl", "cpl_high", "CPL"),
-            ("cpc", "max_cpc", "cpc_high", "CPC"),
-        ):
-            anomaly = _lower_is_better(
-                campaign_id, insights, eff, obs_key, target_key, metric, label,
-                warning_pct, critical_pct, only_critical,
-            )
-            if anomaly:
-                out.append(anomaly)
+    #    A CPA/CPL konverzió-alapú; a CPC a kattintásból jön, ott a
+    #    megjelenés-kapu a megfelelő.
+    for obs_key, target_key, metric, label, gate in (
+        ("cpa", "max_cpa", "cpa_spike", "CPA", "conversion"),
+        ("cpl", "max_cpl", "cpl_high", "CPL", "conversion"),
+        ("cpc", "max_cpc", "cpc_high", "CPC", "impressions"),
+    ):
+        if not gates[gate]:
+            continue
+        anomaly = _lower_is_better(
+            campaign_id, insights, eff, obs_key, target_key, metric, label,
+            warning_pct, critical_pct, only_critical,
+        )
+        if anomaly:
+            out.append(anomaly)
 
     # 5) Büdzsé (fix 90% / 100% küszöb)
     if spend is not None and monthly_budget is not None and monthly_budget > 0:
@@ -306,7 +365,7 @@ def _evaluate_rules(
     frequency = _num(insights, "frequency")
 
     min_ctr = _num(eff, "min_ctr")
-    if has_enough_data and ctr_pct is not None and min_ctr is not None and min_ctr > 0 and ctr_pct < min_ctr:
+    if gates["ctr"] and ctr_pct is not None and min_ctr is not None and min_ctr > 0 and ctr_pct < min_ctr:
         pct_diff = (ctr_pct - min_ctr) / min_ctr * 100
         sev = _sev_for(pct_diff, warning_pct, critical_pct, drop=True, only_critical=only_critical)
         if sev:
@@ -316,7 +375,7 @@ def _evaluate_rules(
             ))
 
     max_cpm = _num(eff, "max_cpm")
-    if has_enough_data and cpm is not None and max_cpm is not None and max_cpm > 0 and cpm > max_cpm:
+    if gates["impressions"] and cpm is not None and max_cpm is not None and max_cpm > 0 and cpm > max_cpm:
         pct_diff = (cpm - max_cpm) / max_cpm * 100
         sev = _sev_for(pct_diff, warning_pct, critical_pct, drop=False, only_critical=only_critical)
         if sev:
@@ -327,7 +386,7 @@ def _evaluate_rules(
 
     max_frequency = _num(eff, "max_frequency")
     if (
-        has_enough_data and frequency is not None
+        gates["impressions"] and frequency is not None
         and max_frequency is not None and max_frequency > 0 and frequency > max_frequency
     ):
         pct_diff = (frequency - max_frequency) / max_frequency * 100

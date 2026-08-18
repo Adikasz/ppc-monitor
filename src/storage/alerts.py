@@ -16,7 +16,7 @@ Függvények:
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from src.storage.supabase_client import get_supabase
@@ -39,13 +39,30 @@ def insert_alert(
 
     Deduplikáció:
         A `dedup_key = "{campaign_id}_{metric}_{ma}"` kulcsra naponta egyetlen
-        riasztás kerül be. Ha a mai napra ezzel a kulccsal MÁR létezik sor
-        (bármilyen státuszban), nem szúrunk be újat.
+        SOR létezik. Ha a mai napra ezzel a kulccsal már van sor (bármilyen
+        státuszban), nem szúrunk be újat — különben az óránkénti ciklus a már
+        kiküldött riasztást is újraküldené ugyanaznap.
 
-        Megjegyzés: a specifikáció a 'pending' státuszú duplikátumot említi, de
-        a kulcs eleve tartalmazza a dátumot, ezért bármely státuszú találatra
-        skippelünk — különben az óránkénti ciklus a már 'sent' riasztást is
-        újraküldené ugyanaznap. (Cél: "ne duplikálj".)
+    Frissítés duplikátum esetén (a Discord-üzenet NEM megy ki újra):
+        A meglévő sort a FRISS méréssel felülírjuk. Enélkül a nap első
+        mérése ragadt volna bent egész napra: a 02:00-kor mért "CPA 13 620 Ft"
+        maradt az összefoglalóban akkor is, ha 15:00-ra 5 732 Ft-ra állt be —
+        pedig az utóbbi a nap valós képe.
+
+        Amit felülírunk: severity, observed_value, threshold_value, message és
+        `detected_at`. A `detected_at` frissítése szándékos: az összefoglaló
+        soronként kiírja az észlelés idejét, és az ott látható SZÁMHOZ tartozó
+        időpontnak kell szerepelnie — különben az üzenet egy 15:00-s értéket
+        02:00-s időbélyeggel mutatna.
+
+        Amit NEM nyúlunk: `status`, `sent_at`, `discord_message_id` és a
+        routing mezői — a riasztás naponta EGYSZER megy ki, a frissítés csak a
+        tárolt értéket pontosítja.
+
+        KORLÁT: ha a kampány időközben RENDBE JÖN, a detektor már nem ad
+        anomáliát, tehát nincs mit frissíteni — a sor a nap végéig a legutolsó
+        rossz értéken marad. Ezt nem a dedup, hanem az adatmennyiség-kapuk
+        (detector) hivatottak megelőzni, illetve egy külön alert-feloldás.
 
     Paraméterek:
         campaign_id     — érintett kampány DB ID-ja
@@ -56,8 +73,10 @@ def insert_alert(
         message         — emberi olvasható üzenet
 
     Visszatérés:
-        a beszúrt alert sor (dict) — új riasztás esetén (a router ezt kapja)
-        None                        — már létezett ma ugyanerre (dedup)
+        a beszúrt alert sor (dict) — új riasztás esetén (a router ezt kapja,
+                                     és ilyenkor MEGY KI a Discord-üzenet)
+        None                        — ma már volt ilyen; a sort frissítettük,
+                                     de új üzenet nem megy ki
     """
     dedup_key = f"{campaign_id}_{metric}_{date.today().isoformat()}"
     sb = get_supabase()
@@ -71,7 +90,14 @@ def insert_alert(
         .execute()
     )
     if existing.data:
-        log.debug("Alert dedup — ma már létezik: %s", dedup_key)
+        _refresh_alert_measurement(
+            existing.data[0]["id"],
+            severity=severity,
+            observed_value=observed_value,
+            threshold_value=threshold_value,
+            message=message,
+        )
+        log.debug("Alert dedup — ma már létezik, érték frissítve: %s", dedup_key)
         return None
 
     payload = {
@@ -91,6 +117,35 @@ def insert_alert(
         dedup_key, severity, metric, campaign_id,
     )
     return row
+
+
+def _refresh_alert_measurement(
+    alert_id: int,
+    *,
+    severity: str,
+    observed_value: float | None,
+    threshold_value: float | None,
+    message: str,
+) -> None:
+    """A már meglévő napi riasztás felülírása a friss méréssel.
+
+    Csak a MÉRÉST írja felül (érték, küszöb, szöveg, súlyosság, időbélyeg) — a
+    kiküldés-státuszt (`status`, `sent_at`, `discord_message_id`) szándékosan
+    nem, mert a riasztás naponta egyszer megy ki. Lásd `insert_alert`.
+
+    Nem dob: egy sikertelen frissítés miatt nem eshet ki a monitoring ciklus —
+    ilyenkor a korábbi (pontatlanabb) érték marad, ami rosszabb, de nem végzetes.
+    """
+    try:
+        get_supabase().table(_TABLE).update({
+            "severity": severity,
+            "observed_value": observed_value,
+            "threshold_value": threshold_value,
+            "message": message,
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", alert_id).execute()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Alert frissítés sikertelen (id=%s): %s", alert_id, exc)
 
 
 def recent_insight_metrics(campaign_id: int, *, days: int = 7) -> set[str]:
