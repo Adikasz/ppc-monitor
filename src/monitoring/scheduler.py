@@ -35,6 +35,7 @@ from src.monitoring.insight_engine import detect_insights_for_campaign
 from src.monitoring.router import route_alert
 from src.monitoring.summary import SUMMARY_KINDS
 from src.monitoring.token_monitor import token_health_check
+from src.monitoring.weekly_action_report import generate_weekly_action_reports
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import campaigns as campaigns_storage
 from src.storage import clients as clients_storage
@@ -489,6 +490,22 @@ async def daily_insight_scan(
 
 
 # ---------------------------------------------------------------------------
+# Heti riport-összefoglaló & akciójavaslat — hétfő 08:00
+# ---------------------------------------------------------------------------
+
+async def weekly_action_report_job() -> dict[str, Any]:
+    """Heti riport minden jogosult ügyfélre (ClickUp Doc + Claude elemzés).
+
+    SZÁNDÉKOSAN egysoros delegálás: a tényleges logika a
+    `weekly_action_report.generate_weekly_action_reports`-ban él, és a
+    `/report weekly-now` parancs UGYANEZT hívja. Ha itt bármi „csak a cronhoz"
+    tartozó extra logika lenne, a kézi teszt megint mást futtatna, mint az éles
+    ütemezés — pontosan az a hiba, ami az insight scan-nél hetekig rejtve maradt.
+    """
+    return await generate_weekly_action_reports()
+
+
+# ---------------------------------------------------------------------------
 # Auto-resume (25. lépés) — lejárt szüneteltetésű kampányok visszaállítása
 # ---------------------------------------------------------------------------
 
@@ -628,6 +645,31 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
     )
 
+    # Heti riport: HÉTFŐ 08:00 — az ELŐZŐ teljes hét (hétfő–vasárnap) ügyfél-
+    # szintű összesítése, Claude elemzéssel, ClickUp Docba.
+    #
+    # Miért 08:00 hétfőn: a hét első munkaórája, így a riport ott van, mielőtt
+    # az OM-ek nekiállnának a hétnek. Ugyanebben a percben fut a heti
+    # token-ellenőrzés és a napi insight scan is — mindhárom az event loopban,
+    # egymástól függetlenül; egyik sem blokkolja a másikat, mert mindegyik
+    # `asyncio.to_thread`-be teszi a szinkron DB/HTTP hívásait.
+    #
+    # Az ablakot NEM a futás órája határozza meg (lásd
+    # `weekly_action_report.previous_week_range`): egy késleltetett vagy kézzel
+    # indított futás is pontosan ugyanarra a lezárult hétre számol.
+    _scheduler.add_job(
+        weekly_action_report_job,
+        trigger="cron",
+        hour=8,
+        minute=0,
+        day_of_week="mon",
+        id="weekly_action_report",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Auto-resume: MINDEN NAP 06:00 — a lejárt szüneteltetésű kampányok (25. lépés
     # /client pause) visszaállítása mature-re.
     _scheduler.add_job(
@@ -646,7 +688,7 @@ def start_scheduler() -> AsyncIOScheduler:
     log.info(
         "Monitoring scheduler indítva (óránkénti ciklus + napi összefoglaló 09:00 "
         "+ hétvégi összefoglaló hétfő 09:00 + heti munkanapi összefoglaló péntek "
-        "17:05 + napi insight scan 08:00, tz=%s)",
+        "17:05 + napi insight scan 08:00 + heti riport hétfő 08:00, tz=%s)",
         timezone,
     )
     return _scheduler
