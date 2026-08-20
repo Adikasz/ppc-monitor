@@ -68,6 +68,10 @@ class Config:
     # ---- Anthropic ----
     anthropic_api_key: str
     claude_model: str
+    # A heti riport elemzéséhez használt (nagyobb) modell. Külön mező, mert a
+    # `claude_model` az olcsó, rövid kampány-javaslatokra van hangolva
+    # (ai_insights), a heti vezetői összefoglaló viszont Sonnet-et kér.
+    claude_sonnet_model: str
 
     # ---- Meta Ads ----
     meta_app_id: str
@@ -87,6 +91,11 @@ class Config:
     clickup_team_id: str
     clickup_default_list_id: str
     clickup_anomalies_list_id: str          # "Anomalies" lista — CRITICAL taskokhoz
+    # A heti riport Doc-ok célhelye (Docs API v3). Elég az EGYIKET beállítani;
+    # ha mindkettő megvan, a Folder nyer. Ha egyik sincs, a heti riport
+    # warninggal kihagyja a Doc-létrehozást (lásd integrations/clickup.py).
+    clickup_weekly_report_space_id: str
+    clickup_weekly_report_folder_id: str
 
     # ---- Email (SMTP) ----
     # Opcionális — ha nincs beállítva, a CRITICAL ügyfél-email warninggal kimarad.
@@ -123,6 +132,7 @@ class Config:
             # Opcionális fejlesztés közben (mock adatok mellett)
             anthropic_api_key=_optional("ANTHROPIC_API_KEY"),
             claude_model=_optional("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
+            claude_sonnet_model=_optional("CLAUDE_SONNET_MODEL", "claude-sonnet-5"),
 
             meta_app_id=_optional("META_APP_ID"),
             meta_app_secret=_optional("META_APP_SECRET"),
@@ -138,6 +148,8 @@ class Config:
             clickup_team_id=_optional("CLICKUP_TEAM_ID"),
             clickup_default_list_id=_optional("CLICKUP_DEFAULT_LIST_ID"),
             clickup_anomalies_list_id=_optional("CLICKUP_ANOMALIES_LIST_ID"),
+            clickup_weekly_report_space_id=_optional("CLICKUP_WEEKLY_REPORT_SPACE_ID"),
+            clickup_weekly_report_folder_id=_optional("CLICKUP_WEEKLY_REPORT_FOLDER_ID"),
 
             smtp_host=_optional("SMTP_HOST"),
             smtp_port=_int("SMTP_PORT", 587),

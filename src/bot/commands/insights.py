@@ -24,7 +24,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from src.config import get_config
+from src.bot.commands._common import (
+    admin_channel_id as _admin_channel_id,  # noqa: F401 — konzisztens felület
+    is_admin_channel as _is_admin_channel,
+    reply_or_channel,
+    resolve_client as _resolve_client,
+)
 from src.monitoring import scheduler as scheduler_mod
 from src.storage import audit
 from src.storage import clients as clients_storage
@@ -36,41 +41,6 @@ log = get_logger(__name__)
 # perceket vehet igénybe, a Discord interakciós token viszont 15 percig él —
 # ezért a hosszú futás végén a válasz a csatornába megy, ha a followup lejárt.
 _INTERACTION_TOKEN_SECONDS = 15 * 60
-
-
-def _admin_channel_id() -> int | None:
-    raw = get_config().discord_admin_channel_id
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        log.warning("DISCORD_ADMIN_CHANNEL_ID nem szám: %r — auth check kikapcsol", raw)
-        return None
-
-
-def _is_admin_channel(interaction: discord.Interaction) -> bool:
-    """True, ha az interakció az admin csatornában történt (vagy nincs konfigurálva)."""
-    admin = _admin_channel_id()
-    if admin is None:
-        return True
-    return interaction.channel_id == admin
-
-
-def _resolve_client(value: str) -> dict | None:
-    """Ügyfél feloldása név VAGY numerikus ID alapján (ugyanaz, mint a /client-nél).
-
-    Ha a bemenet csak számjegy, előbb ID-ként próbáljuk; ha nincs ilyen ID,
-    névként is megkíséreljük.
-    """
-    val = (value or "").strip()
-    if not val:
-        return None
-    if val.isdigit():
-        row = clients_storage.get_client(int(val))
-        if row is not None:
-            return row
-    return clients_storage.get_client_by_name(val)
 
 
 def _format_report(stats: dict[str, int], *, scope: str, elapsed_s: float) -> str:
@@ -231,28 +201,7 @@ class InsightsCog(commands.GroupCog, group_name="insight"):
     # ------------------------------------------------------------------
 
     async def _reply(self, interaction: discord.Interaction, content: str) -> None:
-        """Válasz a followupon; ha az interakciós token lejárt, a csatornába.
-
-        Egy teljes scan túlfuthat a Discord 15 perces interakciós ablakán —
-        ilyenkor a `followup.send` 401/404-gyel elszáll, és az admin semmit nem
-        látna a több perces várakozás után.
-        """
-        try:
-            await interaction.followup.send(content)
-            return
-        except discord.HTTPException as exc:
-            log.warning(
-                "Insight scan válasz: a followup elszállt (%s) — csatornába küldjük", exc,
-            )
-
-        channel = interaction.channel
-        if channel is None:
-            log.error("Insight scan válasz: nincs csatorna a fallbackhez — elveszett")
-            return
-        try:
-            await channel.send(f"<@{interaction.user.id}>\n{content}")
-        except Exception:  # noqa: BLE001
-            log.exception("Insight scan válasz: a csatornába küldés is elszállt")
+        await reply_or_channel(interaction, content, logger=log, what="Insight scan")
 
 
 async def setup(bot: commands.Bot) -> None:

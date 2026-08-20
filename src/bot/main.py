@@ -37,6 +37,7 @@ _EXTENSIONS: tuple[str, ...] = (
     "src.bot.commands.campaigns",
     "src.bot.commands.alerts",
     "src.bot.commands.insights",
+    "src.bot.commands.reports",
     "src.bot.commands.users",
     "src.bot.commands.my_commands",
 )

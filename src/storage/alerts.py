@@ -265,6 +265,72 @@ def get_alerts_for_user_in_range(
     return res.data or []
 
 
+def get_alert_counts_for_campaigns(
+    campaign_ids: list[int],
+    from_dt: datetime,
+    to_dt: datetime,
+) -> list[dict[str, Any]]:
+    """CRITICAL/WARNING riasztások darabszáma severity+metric bontásban egy ablakban.
+
+    A heti riport ebből ad kontextust a Claude promptnak ("mi ment félre ezen a
+    héten"), ezért a nyers sorok helyett csak a bontás kell.
+
+    Az ablak fél-nyitott (`.gte()` / `.lt()`) — ugyanaz a konvenció, mint a
+    `get_alerts_for_user_in_range`-nél, és az időbélyeg itt is `detected_at`
+    (NEM `created_at`).
+
+    Az `insight` súlyosságú sorokat KIHAGYJA: azok javaslatok, nem problémák —
+    a heti riport szempontjából félrevezető lenne riasztásként számolni őket.
+
+    Két szinten kötegel, mint a `weekly_metrics.get_insight_rows_for_campaigns`:
+    `in_()` ID-koszorú 200-asával (URL-hossz), kötegen belül `range()` lapozás
+    (PostgREST 1000-es sorlimit).
+
+    Visszatérés: [{"severity": "critical", "metric": "cpa_spike", "count": 3}, …]
+    darabszám szerint csökkenő sorrendben. Üres lista, ha nem volt riasztás.
+    """
+    if not campaign_ids:
+        return []
+
+    sb = get_supabase()
+    tally: dict[tuple[str, str], int] = {}
+    ids = list(campaign_ids)
+
+    for i in range(0, len(ids), 200):
+        chunk = ids[i:i + 200]
+        start = 0
+        while True:
+            rows = (
+                sb.table(_TABLE)
+                .select("severity, metric, id")
+                .in_("campaign_id", chunk)
+                .in_("severity", ["critical", "warning"])
+                .gte("detected_at", from_dt.isoformat())
+                .lt("detected_at", to_dt.isoformat())
+                .order("id", desc=False)
+                .range(start, start + 999)
+                .execute()
+                .data
+                or []
+            )
+            for row in rows:
+                key = (
+                    (row.get("severity") or "?").lower(),
+                    row.get("metric") or "?",
+                )
+                tally[key] = tally.get(key, 0) + 1
+            if len(rows) < 1000:
+                break
+            start += 1000
+
+    return [
+        {"severity": severity, "metric": metric, "count": count}
+        for (severity, metric), count in sorted(
+            tally.items(), key=lambda item: (-item[1], item[0])
+        )
+    ]
+
+
 def mark_alert_emailed(alert_id: int) -> None:
     """Az alert ügyfél-email kiküldésének időbélyege (email-dedup, 0007 migration)."""
     get_supabase().table(_TABLE).update(
