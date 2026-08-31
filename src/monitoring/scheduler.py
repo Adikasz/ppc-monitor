@@ -37,6 +37,7 @@ from src.monitoring.summary import SUMMARY_KINDS
 from src.monitoring.token_monitor import token_health_check
 from src.monitoring.weekly_action_report import generate_weekly_action_reports
 from src.storage import ad_accounts as ad_accounts_storage
+from src.storage import alerts as alerts_storage
 from src.storage import campaigns as campaigns_storage
 from src.storage import clients as clients_storage
 from src.storage import insights_history as insights_history_storage
@@ -230,6 +231,39 @@ async def hourly_monitoring() -> None:
 # Napi / heti összefoglaló jobok (13. lépés)
 # ---------------------------------------------------------------------------
 
+def _warn_on_shared_channels(users: list[dict[str, Any]], label: str) -> None:
+    """Figyelmeztet, ha több AKTÍV user ugyanarra az alert-csatornára van állítva.
+
+    Miért kell: az összefoglaló USERENKÉNT megy ki, a userek kampánykészlete
+    viszont különbözik. Ha két user `alerts_channel_id`-ja megegyezik, abba az
+    EGY csatornába két összefoglaló érkezik minden reggel — az olvasó számára
+    ez "dupla értesítés", pedig a kód userenként pontosan egyet küld.
+
+    SZÁNDÉKOSAN csak logol, nem von össze és nem hagy ki: a két összefoglaló
+    tartalma NEM azonos (más kampányok tartoznak hozzájuk), így az egyik néma
+    eldobása adatvesztés lenne. A megoldás adat-szintű döntés (kapjon-e a
+    másik user saját csatornát), nem kódé — ez a sor teszi láthatóvá, hogy
+    egyáltalán dönteni kell róla.
+    """
+    csatornak: dict[str, list[str]] = {}
+    for user in users:
+        channel = user.get("alerts_channel_id")
+        if not channel:
+            continue
+        csatornak.setdefault(str(channel), []).append(
+            f"#{user.get('id')} {user.get('display_name') or '?'}"
+        )
+
+    for channel, owners in csatornak.items():
+        if len(owners) > 1:
+            log.warning(
+                "Összefoglaló (%s): a(z) %s csatornára %d user van állítva (%s) — "
+                "ez a csatorna ennyi külön összefoglalót fog kapni. Ha ez nem "
+                "szándékos, adj saját csatornát a `/user set-channel` paranccsal.",
+                label, channel, len(owners), ", ".join(owners),
+            )
+
+
 async def _send_summaries(*, is_weekly: bool = False, kind: str | None = None) -> None:
     """Minden aktív usernek összefoglaló kiküldése (daily / weekend / workweek).
 
@@ -246,6 +280,8 @@ async def _send_summaries(*, is_weekly: bool = False, kind: str | None = None) -
         log.exception("Összefoglaló (%s): a userlista lekérése sikertelen — kihagyva", label)
         return
 
+    _warn_on_shared_channels(users, label)
+
     sent = 0
     for user in users:
         uid = user.get("id")
@@ -261,19 +297,27 @@ async def _send_summaries(*, is_weekly: bool = False, kind: str | None = None) -
 
 
 async def daily_summary_job() -> None:
-    """Napi összefoglaló (kedd–péntek reggel; hétfőn a heti összefoglaló váltja)."""
+    """Napi összefoglaló (hétfő–péntek reggel 09:00).
+
+    Hétfőn a PÉNTEKI napot fedi (lásd `summary.daily_range`), és a hétvégi
+    összefoglaló MELLETT megy ki, nem helyette — két külön üzenet.
+    """
     log.info("Napi összefoglaló job indítva…")
     await _send_summaries(kind="daily")
 
 
 async def weekly_summary_job() -> None:
-    """Hétvégi összefoglaló (hétfő reggel) — a hétfői napi összefoglalót VÁLTJA."""
+    """Hétvégi összefoglaló (hétfő reggel) — a szombat–vasárnapi ablakról.
+
+    A hétfői napi összefoglalót NEM váltja ki: az a pénteki napot fedi, ez a
+    hétvégét. Ugyanabban a percben, két külön üzenetként megy ki mindkettő.
+    """
     log.info("Hétvégi összefoglaló job indítva…")
     await _send_summaries(kind="weekend")
 
 
 async def workweek_summary_job() -> None:
-    """Heti MUNKANAPI összefoglaló (péntek délután) — hétfő 00:00 → szombat 00:00.
+    """Heti MUNKANAPI összefoglaló (péntek 15:05) — hétfő 00:00 → szombat 00:00.
 
     A hét UTOLSÓ összefoglalója: a pénteki napi összefoglaló (reggel 09:00, a
     csütörtöki napról) mellé délután megy ki a teljes hétfő–pénteki kép.
@@ -329,13 +373,24 @@ async def daily_insight_scan(
       2. hatékony KPI (campaign→account→client→default),
       3. szabály-alapú insightok (peer = ugyanazon fiók kampányai, ROAS-szal),
       4. AI javaslat, ha a kliensnél insights_enabled=True,
-      5. alert beszúrás (dedup) + routing.
+      5. alert beszúrás (dedup) — Discord-küldés NÉLKÜL.
 
-    A routing tiszteli a csendes időt (nincs bypass): a scan 08:00-kor (a quiet
-    hours VÉGÉN, hétköznap) fut, így az insight munkaidőben megy ki, nem éjjel.
-    A manuális futtatás (`/insight scan-now`) SEM bypassolja — így a teszt
-    hűen azt mutatja, amit az ütemezett futás produkálna. A `quiet_hours`
-    számláló teszi láthatóvá, ha emiatt nem ment ki semmi.
+    A scan SZÁNDÉKOSAN NEM küld önálló Discord üzenetet (`route_alert`-et nem
+    hív). Korábban hívott, és emiatt az ügyfél reggelente KÉTSZER kapta ugyanazt
+    a tartalmat: egyszer a 08:00-s scan külön insight-üzeneteiként, majd újra a
+    09:00-s napi összefoglaló problémalistájában (`summary._build_summary_sync`
+    az `insight` severity-t is beleteszi a `top_issues`-ba). Az insight
+    JAVASLAT, nem riasztás — nem indokol külön pinget.
+
+    Az insight tehát PONTOSAN EGY csatornán jut el az OM-hez: a napi
+    összefoglalóban, ami a saját `alerts_channel_id`-jára megy, és csak az ő
+    kampányairól szól. Admin fallback így fogalmilag nem is érintheti.
+
+    IDŐZÍTÉS: a 08:00-kor mentett insight a KÖVETKEZŐ napi összefoglalóban
+    jelenik meg (az ablak a lezárult naptári napot fedi — lásd `daily_range`).
+    Pénteken keletkezőt még aznap 15:05-kor a heti munkanapi összefoglaló is
+    hozza (hétfő 00:00 → szombat 00:00), a hétfői napi összefoglaló pedig a
+    pénteki napot fedi. Vagyis egyetlen insight sem vész el.
 
     Paraméterek:
         limit     — legfeljebb ennyi mature kampányt dolgoz fel (teszt/manuális)
@@ -349,13 +404,13 @@ async def daily_insight_scan(
          "insights": int,          # beszúrt (nem deduplikált) insight
          "skipped_no_history": int,
          "failed": int,
-         "routed": int,            # ténylegesen kiment Discordra
-         "quiet_hours": int}       # csendes idő miatt elnyomva
+         "summarized": int}        # 'summarized' státuszra állítva (kiküldés
+                                   # az összefoglalón keresztül)
     """
     log.info("Napi insight scan indítva…")
     stats = {
         "total": 0, "insights": 0, "skipped_no_history": 0,
-        "failed": 0, "routed": 0, "quiet_hours": 0,
+        "failed": 0, "summarized": 0,
     }
 
     try:
@@ -450,7 +505,11 @@ async def daily_insight_scan(
                         "message": f"🤖 AI javaslat: {ai}",
                     })
 
-            # 3) beszúrás + routing (ugyanaz a csővezeték, mint az anomáliáknál)
+            # 3) beszúrás — DE NEM küldés. Az insight a napi/heti
+            #    összefoglalóban jut el az OM-hez (lásd a docstringet); a
+            #    'summarized' státusz jelzi, hogy a sor tudatosan nem ment ki
+            #    külön üzenetként (séma: 'pending'|'sent'|'suppressed'|
+            #    'summarized' — 0001 migration).
             for ins in insights:
                 alert_row = await asyncio.to_thread(
                     insert_alert,
@@ -460,20 +519,19 @@ async def daily_insight_scan(
                 if alert_row:
                     stats["insights"] += 1
                     try:
-                        # NEM bypassoljuk a csendes időt: az insight is csak
-                        # munkaidőben (08:00–17:00, hétköznap) menjen ki. A scan
-                        # 08:00-kor fut, így nem nyomódik el.
-                        routing = await route_alert(alert_row)
-                        if routing.get("routed"):
-                            stats["routed"] += 1
-                        elif routing.get("reason") == "quiet_hours":
-                            stats["quiet_hours"] += 1
+                        await asyncio.to_thread(
+                            alerts_storage.mark_alert_summarized, alert_row["id"]
+                        )
+                        stats["summarized"] += 1
                     except Exception:
-                        # `exception` (nem `error`): traceback nélkül nem
-                        # derül ki, MI hasalt el — a hiányzó stack trace miatt
-                        # maradt sokáig rejtve a `timedelta` NameError is.
+                        # `exception` (nem `error`): traceback nélkül nem derül
+                        # ki, MI hasalt el — a hiányzó stack trace miatt maradt
+                        # sokáig rejtve a `timedelta` NameError is. A státusz
+                        # elmaradása nem végzetes: az összefoglaló időalapon
+                        # szűr, nem státusz alapján.
                         log.exception(
-                            "Insight routing hiba (alert #%s)", alert_row.get("id"),
+                            "Insight státusz-jelölés hiba (alert #%s)",
+                            alert_row.get("id"),
                         )
         except Exception:  # noqa: BLE001 — egy kampány hibája ne állítsa le a scant
             stats["failed"] += 1
@@ -482,9 +540,9 @@ async def daily_insight_scan(
     log.info(
         "Insight scan kész: %d insight generálva, %d kampány kihagyva (kevés adat), "
         "%d kampány hibázott, %d kampány vizsgálva összesen "
-        "(kiküldve: %d, csendes idő miatt elnyomva: %d)",
+        "(összefoglalóra jelölve: %d — a scan nem küld önálló Discord üzenetet)",
         stats["insights"], stats["skipped_no_history"], stats["failed"],
-        stats["total"], stats["routed"], stats["quiet_hours"],
+        stats["total"], stats["summarized"],
     )
     return stats
 
@@ -553,14 +611,22 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
     )
 
-    # Napi összefoglaló: KEDD–PÉNTEK 09:00. Hétfőn SZÁNDÉKOSAN nem fut, mert a
-    # heti (hétvégi) összefoglaló váltja — így senki nem kap két üzenetet hétfőn.
+    # Napi összefoglaló: HÉTFŐ–PÉNTEK 09:00.
+    #
+    # Hétfőn is fut, de az ablaka a PÉNTEKI napot fedi (lásd
+    # `summary.daily_range` hétfői kivétele) — enélkül a péntek napi képe soha
+    # nem került volna napi összefoglalóba: kedden a hétfőt kapjuk, hétfőn
+    # pedig korábban egyáltalán nem futott ez a job.
+    #
+    # Így hétfő 09:00-kor KÉT KÜLÖN üzenet megy ki (ez és a `weekly_summary`
+    # ugyanabban a percben): a pénteki napi + a hétvégi összefoglaló.
+    # Szándékosan nincsenek összevonva — két külön időszak, két külön riport.
     _scheduler.add_job(
         daily_summary_job,
         trigger="cron",
         hour=9,
         minute=0,
-        day_of_week="tue-fri",
+        day_of_week="mon-fri",
         id="daily_summary",
         replace_existing=True,
         misfire_grace_time=3600,
@@ -569,6 +635,8 @@ def start_scheduler() -> AsyncIOScheduler:
     )
 
     # Hétvégi összefoglaló: HÉTFŐ 09:00 (péntek 22:00 → hétfő 08:00 ablak).
+    # VÁLTOZATLAN. A `daily_summary` mellett fut ugyanebben a percben — a kettő
+    # két KÜLÖN üzenet, két külön időszakról (péntek, illetve szombat–vasárnap).
     _scheduler.add_job(
         weekly_summary_job,
         trigger="cron",
@@ -582,20 +650,23 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
     )
 
-    # Heti MUNKANAPI összefoglaló: PÉNTEK 17:05 — a hét utolsó összefoglalója,
+    # Heti MUNKANAPI összefoglaló: PÉNTEK 15:05 — a hét utolsó összefoglalója,
     # a teljes hétfő 00:00 → szombat 00:00 ablakról. A pénteki napi
     # összefoglalót (09:00, a csütörtöki napról) NEM váltja ki: külön üzenet.
     #
-    # Miért 17:05? A munkanap vége — üzleti döntés, hogy a jelentés a nap
-    # lezárásakor érkezzen. Reggel azért nem jó, mert akkor a péntek még alig
-    # kezdődött el, így a "hétfő–péntek" kép csonka lenne.
+    # Miért 15:05 (és nem a korábbi 17:05)? Explicit ügyfélkérés: az OM-ek a
+    # péntek délutánt már a jelentéssel a kezükben akarják zárni. A :05 perc a
+    # korábbi döntést örökli — az óránkénti monitoring ciklus :00-kor fut, így
+    # a 15:00-s mérés eredménye még beleér a jelentésbe.
     #
-    # FIGYELEM — ez NEM esik egybe a csendes idő kezdetével: a .env.example
-    # szerint QUIET_HOURS_START=18, tehát a 17:05–18:00 sáv MÉG AKTÍV. Az ott
-    # keletkező riasztásokról valós időben megy értesítés (a router még nem
-    # némít), de ebbe a heti összefoglalóba már nem kerülnek bele, és a hétfői
-    # hétvégi összefoglaló is csak péntek 22:00-tól számol. Tudatosan vállalt
-    # rés; ha meg kell szüntetni, a job 18:05-re állítása fedi le.
+    # FIGYELEM — VÁLLALT RÉS, ugyanaz a fajta, mint a korábbi 17:05-nél, csak
+    # tágabb: a 15:05–18:00 sávban (QUIET_HOURS_START=18, .env.example)
+    # keletkező pénteki riasztások NEM kerülnek bele ebbe a heti jelentésbe,
+    # mert a job korábban fut le, mint hogy megtörténnének. Valós idejű
+    # riasztásként az OM-ek ezeket továbbra is MEGKAPJÁK (a router még nem
+    # némít), és a hétfői napi összefoglaló is lefedi a teljes pénteket
+    # (péntek 00:00 → szombat 00:00) — csak ebben a heti kimutatásban nem
+    # fognak szerepelni. Ha meg kell szüntetni, a job 18:05-re állítása fedi le.
     #
     # (Az ablak felső határa ettől függetlenül fix szombat 00:00 — lásd
     # summary.workweek_range: a futás órája nem befolyásolja az ablakot, csak
@@ -603,7 +674,7 @@ def start_scheduler() -> AsyncIOScheduler:
     _scheduler.add_job(
         workweek_summary_job,
         trigger="cron",
-        hour=17,
+        hour=15,
         minute=5,
         day_of_week="fri",
         id="workweek_summary",
@@ -628,10 +699,16 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
     )
 
-    # Napi INSIGHT scan: HÉTKÖZNAP 08:00 (18. lépés). Reggel, a csendes idő VÉGÉN
-    # fut, hogy a friss javaslatok ott legyenek az OM csatornáiban, de NE éjjel
-    # (02:00) pingeljenek — az insight is tiszteli a quiet hours-t (a scan nem
-    # bypassolja). Hétvégén nem fut (akkor nincs aktív kampánykezelés).
+    # Napi INSIGHT scan: HÉTKÖZNAP 08:00 (18. lépés). A scan CSAK generál és
+    # ELMENT — Discord üzenetet NEM küld (lásd `daily_insight_scan`
+    # docstringje): az insightok a 09:00-s napi összefoglaló problémalistájában
+    # mennek ki, egyetlen üzenetben. Korábban a scan is küldött, ezért kapták az
+    # OM-ek reggelente kétszer ugyanazt a tartalmat.
+    #
+    # Miért marad mégis 08:00? Így az összefoglaló előtti órában lefut, és a
+    # friss adat a lehető legkorábban a DB-ben van; a csendes idő pedig már nem
+    # tud belezavarni, mert nincs mit elnyomni. Hétvégén nem fut (akkor nincs
+    # aktív kampánykezelés).
     _scheduler.add_job(
         daily_insight_scan,
         trigger="cron",
@@ -686,9 +763,10 @@ def start_scheduler() -> AsyncIOScheduler:
 
     _scheduler.start()
     log.info(
-        "Monitoring scheduler indítva (óránkénti ciklus + napi összefoglaló 09:00 "
-        "+ hétvégi összefoglaló hétfő 09:00 + heti munkanapi összefoglaló péntek "
-        "17:05 + napi insight scan 08:00 + heti riport hétfő 08:00, tz=%s)",
+        "Monitoring scheduler indítva (óránkénti ciklus + napi összefoglaló "
+        "hétfő–péntek 09:00 (hétfőn a pénteki napról) + hétvégi összefoglaló "
+        "hétfő 09:00 + heti munkanapi összefoglaló péntek 15:05 + napi insight "
+        "scan 08:00 + heti riport hétfő 08:00, tz=%s)",
         timezone,
     )
     return _scheduler

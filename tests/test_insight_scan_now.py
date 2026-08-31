@@ -67,6 +67,9 @@ def _patch_scan(stack, *, campaigns, history_rows=5, insights=None, boom_on=()):
     stack.enter_context(mock.patch.object(
         sched, "insert_alert", side_effect=lambda *a, **k: {"id": 1, "campaign_id": a[0]},
     ))
+    stack.enter_context(mock.patch.object(
+        sched.alerts_storage, "mark_alert_summarized",
+    ))
     routed = mock.AsyncMock(return_value={"routed": True})
     stack.enter_context(mock.patch.object(sched, "route_alert", new=routed))
     return routed
@@ -137,22 +140,63 @@ async def test_scan_counts_failed_campaigns_and_keeps_going():
     assert stats["insights"] == 2, "a hiba után is folytatódnia kell"
 
 
-@pytest.mark.asyncio
-async def test_scan_counts_quiet_hours_suppression_separately():
-    """A csendes idő miatt elnyomott insight NEM "sikeres kiküldés".
+# ---------------------------------------------------------------------------
+# A scan NEM küld önálló Discord üzenetet (dupla reggeli értesítés javítása)
+#
+# Az ügyfél reggelente KÉTSZER kapta ugyanazt: 08:00-kor a scan külön
+# insight-üzeneteiként, majd 09:00-kor a napi összefoglaló problémalistájában
+# (a `summary._build_summary_sync` az `insight` severity-t is beleteszi).
+# A scan azóta csak generál és ELMENT — a kiküldés az összefoglalón megy.
+# ---------------------------------------------------------------------------
 
-    Ez teszi láthatóvá a most felfedezett latens csapdát: rossz
-    QUIET_HOURS_END mellett a 08:00-s scan minden insightja elnyomódik.
+@pytest.mark.asyncio
+async def test_scan_never_sends_a_discord_message_on_its_own():
+    """A scan EGYETLEN `route_alert` hívást sem tesz — ez a dupla értesítés oka volt."""
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        routed = _patch_scan(
+            stack, campaigns=[_campaign(1), _campaign(2)], insights=_insight,
+        )
+        stats = await sched.daily_insight_scan()
+
+    assert routed.await_count == 0, "a scan nem küldhet önálló Discord üzenetet"
+    assert stats["insights"] == 2, "az insightok ettől még elkészülnek…"
+    assert stats["summarized"] == 2, "…és el is mentődnek az összefoglalóhoz"
+
+
+@pytest.mark.asyncio
+async def test_scan_marks_saved_insights_as_summarized():
+    """Az adatmentés MEGMARAD: minden insight bekerül a DB-be `summarized`-ként.
+
+    A 'summarized' státusz jelentése a séma szerint "bekerült egy
+    összefoglalóba" (0001 migration) — pontosan ez történik vele.
     """
     import contextlib
     with contextlib.ExitStack() as stack:
-        routed = _patch_scan(stack, campaigns=[_campaign(1)], insights=_insight)
-        routed.return_value = {"routed": False, "reason": "quiet_hours"}
+        _patch_scan(stack, campaigns=[_campaign(7)], insights=_insight)
+        jelolo = sched.alerts_storage.mark_alert_summarized
         stats = await sched.daily_insight_scan()
 
     assert stats["insights"] == 1
-    assert stats["routed"] == 0
-    assert stats["quiet_hours"] == 1
+    jelolo.assert_called_once_with(1)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_status_mark_does_not_lose_the_insight():
+    """Ha a státusz-jelölés elhasal, az insight akkor is elmentve marad.
+
+    Az összefoglaló IDŐALAPON szűr (`get_alerts_for_user_in_range`), nem
+    státusz alapján — a jelölés csak a DB-beli állapot pontosítása.
+    """
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        _patch_scan(stack, campaigns=[_campaign(1)], insights=_insight)
+        sched.alerts_storage.mark_alert_summarized.side_effect = RuntimeError("boom")
+        stats = await sched.daily_insight_scan()
+
+    assert stats["insights"] == 1, "a beszúrás megtörtént"
+    assert stats["summarized"] == 0, "a jelölés nem sikerült — és ez látszik is"
+    assert stats["failed"] == 0, "de a kampány feldolgozása nem bukott el"
 
 
 @pytest.mark.asyncio
@@ -196,7 +240,7 @@ async def test_scan_returns_full_stats_even_when_there_is_nothing_to_do():
 
     assert stats["total"] == 0
     assert set(stats) == {
-        "total", "insights", "skipped_no_history", "failed", "routed", "quiet_hours",
+        "total", "insights", "skipped_no_history", "failed", "summarized",
     }
 
 
@@ -270,7 +314,7 @@ async def test_command_calls_the_same_function_as_the_cron_job():
     async def _fake_scan(*, client_id=None, limit=None):
         hivas["args"] = (client_id, limit)
         return {"total": 3, "insights": 2, "skipped_no_history": 1,
-                "failed": 0, "routed": 2, "quiet_hours": 0}
+                "failed": 0, "summarized": 2}
 
     with mock.patch.object(insight_cmd, "_is_admin_channel", return_value=True), \
          mock.patch.object(insight_cmd.scheduler_mod, "daily_insight_scan", new=_fake_scan), \
@@ -291,7 +335,7 @@ async def test_command_with_client_scopes_the_scan():
     async def _fake_scan(*, client_id=None, limit=None):
         hivas["client_id"] = client_id
         return {"total": 1, "insights": 1, "skipped_no_history": 0,
-                "failed": 0, "routed": 1, "quiet_hours": 0}
+                "failed": 0, "summarized": 1}
 
     with mock.patch.object(insight_cmd, "_is_admin_channel", return_value=True), \
          mock.patch.object(insight_cmd, "_resolve_client",
@@ -351,28 +395,31 @@ def test_report_names_every_reason_a_campaign_was_left_out():
     """A válasz megmondja, MIÉRT nem lett insight — ez a parancs fő haszna."""
     out = insight_cmd._format_report(
         {"total": 10, "insights": 2, "skipped_no_history": 5,
-         "failed": 3, "routed": 1, "quiet_hours": 1},
+         "failed": 3, "summarized": 2},
         scope="Stopvill", elapsed_s=1.2,
     )
     assert "10" in out and "mature kampány vizsgálva" in out
     assert "2" in out and "insight generálva" in out
     assert "kevés historikus adat" in out
     assert "hibázott" in out
-    assert "csendes idő" in out
+    # A válasz megmondja, hogy a scan NEM küld önálló üzenetet — enélkül az
+    # admin azt hinné, hogy az insightok azonnal kimentek a csatornákra.
+    assert "összefoglaló" in out
+    assert "csendes idő" not in out, "a scan nem küld, tehát nincs mit elnyomni"
 
 
 def test_report_explains_a_zero_result_instead_of_just_showing_zero():
     """Nulla insightnál nem elég a 0 — meg kell mondani, mit jelent."""
     csak_adathiany = insight_cmd._format_report(
         {"total": 4, "insights": 0, "skipped_no_history": 4,
-         "failed": 0, "routed": 0, "quiet_hours": 0},
+         "failed": 0, "summarized": 0},
         scope="X", elapsed_s=0.5,
     )
     assert "campaign_insights" in csak_adathiany
 
     motor_futott = insight_cmd._format_report(
         {"total": 4, "insights": 0, "skipped_no_history": 0,
-         "failed": 0, "routed": 0, "quiet_hours": 0},
+         "failed": 0, "summarized": 0},
         scope="X", elapsed_s=0.5,
     )
     assert "egyetlen szabály sem tüzelt" in motor_futott
@@ -381,7 +428,7 @@ def test_report_explains_a_zero_result_instead_of_just_showing_zero():
 def test_report_handles_no_mature_campaigns():
     out = insight_cmd._format_report(
         {"total": 0, "insights": 0, "skipped_no_history": 0,
-         "failed": 0, "routed": 0, "quiet_hours": 0},
+         "failed": 0, "summarized": 0},
         scope="X", elapsed_s=0.1,
     )
     assert "mature" in out

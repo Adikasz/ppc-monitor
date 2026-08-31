@@ -282,3 +282,82 @@ async def test_route_alert_bypass_lifecycle_sends_paused():
 
     send.assert_awaited_once()
     assert result["routed"] is True
+
+
+# ---------------------------------------------------------------------------
+# INSIGHT routing — kizárólag a hozzárendelt OM saját csatornájára
+#
+# Ügyfél-elvárás: az AI insight (severity='insight') CSAK az adott
+# kampányhoz/fiókhoz rendelt OM saját #alerts csatornájára mehet. A
+# CRITICAL/WARNING admin fallbackje (nincs assignee / nincs személyes csatorna
+# → admin csatorna) insightra NEM alkalmazandó: az admin csatorna nem címzettje
+# egy kampány-optimalizálási javaslatnak.
+#
+# (A napi menetben ez ma védelem mélységben van — a napi insight scan nem is
+# hívja a routert, az insightok az összefoglalóban mennek ki. Ezek a tesztek a
+# közvetlen router-hívásokat rögzítik.)
+# ---------------------------------------------------------------------------
+
+async def test_insight_goes_only_to_the_assignees_own_channel():
+    """Insight + assignee saját csatornával → pontosan az ő csatornája, semmi más."""
+    with contextlib.ExitStack() as stack:
+        send = _patch_router(stack, recipients=[_recipient("david", "111")])
+        result = await router.route_alert(_alert("insight", metric="scaling_opportunity"))
+
+    assert result["routed"] is True
+    send.assert_awaited_once()
+    assert send.await_args.args[0] == "111"
+    assert send.await_args.args[0] != "admin999"
+
+
+async def test_insight_is_not_sent_to_admin_when_there_is_no_assignee():
+    """Nincs assignee → az insight KIMARAD, nem landol az admin csatornán."""
+    with contextlib.ExitStack() as stack:
+        send = _patch_router(stack, recipients=[])
+        result = await router.route_alert(_alert("insight"))
+
+    send.assert_not_awaited()
+    assert result["routed"] is False
+    assert result["reason"] == "insight_no_assignee"
+
+
+async def test_insight_is_skipped_when_the_assignee_has_no_channel():
+    """Az assignee-nek nincs beállítva csatornája → az insight kimarad.
+
+    CRITICAL/WARNING esetén ilyenkor admin fallback megy (lásd
+    `test_route_alert_admin_fallback_no_channel`) — insightnál szándékosan nem.
+    """
+    with contextlib.ExitStack() as stack:
+        send = _patch_router(stack, recipients=[_recipient("david", None)])
+        result = await router.route_alert(_alert("insight"))
+
+    send.assert_not_awaited()
+    assert result["routed"] is False
+
+
+async def test_insight_still_reaches_the_assignees_who_do_have_a_channel():
+    """Vegyes eset: akinek van csatornája, megkapja; a másik miatt nincs admin-ág."""
+    with contextlib.ExitStack() as stack:
+        send = _patch_router(stack, recipients=[
+            _recipient("david", "111"),
+            _recipient("mate", None, role="supporter"),
+        ])
+        result = await router.route_alert(_alert("insight"))
+
+    assert result["routed"] is True
+    assert send.await_count == 1, "csak a csatornával rendelkező OM kap üzenetet"
+    assert send.await_args.args[0] == "111"
+
+
+async def test_critical_keeps_the_admin_fallback():
+    """A kapu CSAK az insightra szól — a CRITICAL fallbackje változatlan.
+
+    Egy hozzárendelés nélküli kampány kritikus hibája nem veszhet el némán.
+    """
+    with contextlib.ExitStack() as stack:
+        send = _patch_router(stack, recipients=[])
+        result = await router.route_alert(_alert("critical"))
+
+    send.assert_awaited_once()
+    assert send.await_args.args[0] == "admin999"
+    assert result["routed"] is True

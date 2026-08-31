@@ -347,6 +347,30 @@ def mark_alert_suppressed(alert_id: int) -> None:
     get_supabase().table(_TABLE).update({"status": "suppressed"}).eq("id", alert_id).execute()
 
 
+def mark_alert_summarized(alert_id: int) -> None:
+    """Az alert megjelölése "csak összefoglalóban megy ki"-ként.
+
+    A napi insight scan használja: az insight JAVASLAT, nem riasztás, ezért
+    NEM kap külön Discord üzenetet — a napi/heti összefoglaló problémalistájába
+    kerül bele (lásd `scheduler.daily_insight_scan`). Korábban a scan önállóan
+    is kiküldte, így az OM-ek reggelente kétszer kapták ugyanazt.
+
+    A 'summarized' státusz a séma óta létezik (0001 migration:
+    'pending'|'sent'|'suppressed'|'summarized'), eddig kihasználatlanul — a
+    jelentése pontosan ez: "bekerült egy összefoglalóba".
+
+    Nem dob: az összefoglaló IDŐALAPON szűr (`get_alerts_for_user_in_range`),
+    nem státusz alapján, tehát egy sikertelen jelölés nem tünteti el az
+    insightot — csak a DB-beli státusz marad pontatlan.
+    """
+    try:
+        get_supabase().table(_TABLE).update(
+            {"status": "summarized"}
+        ).eq("id", alert_id).execute()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Alert 'summarized' jelölés sikertelen (id=%s): %s", alert_id, exc)
+
+
 def get_latest_alert_for_campaigns(campaign_ids: list[int]) -> dict[str, Any] | None:
     """A legutóbbi alert (detected_at szerint) a megadott kampányokra. None ha nincs.
 

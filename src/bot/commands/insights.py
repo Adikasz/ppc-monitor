@@ -9,11 +9,10 @@ Miért kell: az insight scan naponta EGYSZER, 08:00-kor fut (scheduler cron),
 parancs UGYANAZT a függvényt hívja, amit a cron job — nem egy párhuzamos
 másolatot —, így amit itt látsz, az pontosan az, amit reggel kapnál.
 
-SZÁNDÉKOSAN NEM bypassolja a csendes időt. Ha bypassolna, egy este lefuttatott
-teszt sikeresnek látszana, miközben a 08:00-s éles futás némán elhalna. Ehelyett
-a válasz KÜLÖN kiírja, hány insightot nyomott el a csendes idő — így a
-konfigurációs hiba (pl. QUIET_HOURS_END=9 mellett a 08:00-s scan minden
-insightja elnyomódik) azonnal látszik, ahelyett hogy „0 insight"-ként jelenne meg.
+A scan (ütemezetten és innen is) CSAK generál és elment — Discord üzenetet nem
+küld. Az insightok a napi/heti összefoglalóban jutnak el az OM-ekhez, egyetlen
+üzenetben (lásd `scheduler.daily_insight_scan`). Ezért ez a parancs sem küld
+semmit a csatornákra: a válasza a scan számlálói, nem a kiküldött üzenetek.
 """
 from __future__ import annotations
 
@@ -53,8 +52,7 @@ def _format_report(stats: dict[str, int], *, scope: str, elapsed_s: float) -> st
     insights = stats.get("insights", 0)
     skipped = stats.get("skipped_no_history", 0)
     failed = stats.get("failed", 0)
-    routed = stats.get("routed", 0)
-    quiet = stats.get("quiet_hours", 0)
+    summarized = stats.get("summarized", 0)
 
     if total == 0:
         return (
@@ -71,12 +69,11 @@ def _format_report(stats: dict[str, int], *, scope: str, elapsed_s: float) -> st
         f"💡 **{insights}** insight generálva",
     ]
 
-    if routed or quiet:
-        sorok.append(f"📤 ebből kiküldve: **{routed}**")
-    if quiet:
+    if summarized:
         sorok.append(
-            f"🔇 csendes idő miatt elnyomva: **{quiet}** — "
-            f"*ezek a DB-be bekerültek `suppressed` státusszal, de nem mentek ki*"
+            f"📥 **{summarized}** elmentve a napi összefoglalóhoz — "
+            f"*a scan nem küld önálló üzenetet, az insightok a reggeli "
+            f"összefoglalóban mennek ki*"
         )
     if skipped:
         sorok.append(

@@ -17,9 +17,22 @@ route_alert(alert) lépései:
         - Ha egy assignee-nek NINCS beállítva csatornája → admin fallback
           (DISCORD_ADMIN_CHANNEL_ID) + figyelmeztetés.
         - Ha a kampánynak NINCS assignee-je → admin fallback + figyelmeztetés.
+        - KIVÉTEL: INSIGHT severity-re NINCS admin fallback (lásd
+          `_NO_ADMIN_FALLBACK_SEVERITY`) — az insight kizárólag a hozzárendelt
+          OM saját csatornájára mehet, sehova máshova.
         - CRITICAL esetén emellett ClickUp task is készül.
        (Email = 10b. lépés, most kimarad.)
     e) Az alert megjelölése elküldöttként (status='sent', sent_at, msg/task id)
+
+NINCS "megoldódott" / feloldó értesítés — SZÁNDÉKOSAN:
+    A rendszer CSAK akkor küld üzenetet, ha VAN probléma. Ha egy korábban
+    riasztott anomália elmúlik (a detektor már nem adja vissza), semmilyen
+    follow-up nem megy ki, és a korábbi riasztást sem "vonjuk vissza". Ez
+    ügyfél-döntés: a feloldó üzenetek megdupláznák a csatorna-forgalmat, és a
+    valódi problémák beleolvadnának a zajba. Ha ilyen igény felmerül, az
+    ÚJ funkció — ne "javításként" kerüljön be.
+    (Kapcsolódó korlát: `storage.alerts.insert_alert` docstringje — a napi
+    dedup-sor a nap végéig a legutolsó rossz értéken marad.)
 
 Hibatűrés: a csatorna-hibák már a router_integrációkban elnyelődnek (None-t
 adnak), így a routing sosem állítja le a schedulert.
@@ -48,6 +61,23 @@ log = get_logger(__name__)
 # már kiszűri ezeket, de a routert közvetlenül hívó utak (pl. /alert test) így is
 # védve vannak.
 _SKIP_LIFECYCLE = {"paused", "ended"}
+
+# Ezekre a severity-kre NINCS admin fallback: ha nincs assignee, vagy az
+# assignee-nek nincs beállítva személyes csatornája, a riasztás egyszerűen
+# kimarad — NEM landol az admin csatornán.
+#
+# Miért csak az insightra: az insight JAVASLAT az adott kampányt kezelő OM-nek,
+# nem üzemzavar-jelzés. Az admin csatorna (és bárki más csatornája) fogalmilag
+# rossz cím neki — az ügyfél explicit elvárása, hogy insight KIZÁRÓLAG a
+# hozzárendelt OM saját #alerts csatornájára mehessen. A CRITICAL/WARNING
+# ezzel szemben tovább használja a fallbacket: egy hozzárendelés nélküli
+# kampány kritikus hibája nem veszhet el némán.
+#
+# (A napi menetben ez ma védelem mélységben van: a napi insight scan nem is
+# hívja a routert — az insightok az összefoglalóban mennek ki, ami eleve csak
+# a user saját csatornájára megy. Ez a kapu a közvetlen router-hívásokat —
+# pl. /alert test — és a jövőbeli útvonalakat védi.)
+_NO_ADMIN_FALLBACK_SEVERITY = {"insight"}
 
 
 async def route_alert(
@@ -162,6 +192,13 @@ async def route_alert(
                     campaign_label=campaign_label,
                     other_recipients=others or None,
                 )
+            elif severity in _NO_ADMIN_FALLBACK_SEVERITY:
+                log.info(
+                    "Routing: insight #%s kihagyva — @%s csatornája nincs "
+                    "beállítva, insight pedig nem megy admin csatornára",
+                    alert_id, recipient["discord_user_id"],
+                )
+                continue
             else:
                 log.info(
                     "Routing: alert #%s → admin fallback (@%s csatornája nincs beállítva)",
@@ -176,6 +213,13 @@ async def route_alert(
             if res:
                 channels.append("discord")
                 first_message_id = first_message_id or str(res["message_id"])
+    elif severity in _NO_ADMIN_FALLBACK_SEVERITY:
+        log.info(
+            "Routing: insight #%s kihagyva — nincs assignee, insight pedig "
+            "nem megy admin csatornára",
+            alert_id,
+        )
+        result["reason"] = "insight_no_assignee"
     else:
         log.info("Routing: alert #%s → admin fallback (nincs assignee)", alert_id)
         res = await discord_router.send_discord_alert(
@@ -220,10 +264,15 @@ async def route_alert(
             )
         result["routed"] = True
 
-    if not channels:
+    if not channels and not result.get("reason"):
         # Egyetlen csatornára sem ment ki — tipikusan a cél csatorna (személyes
         # vagy admin fallback) nem feloldható: nincs konfigurálva, rossz ID/URL,
         # vagy a bot nem éri el. Ezt jelezzük (a /alert test ezt mutatja).
+        #
+        # A `reason` ellenőrzése azért kell, mert az insight szándékos
+        # kihagyása (nincs assignee / nincs személyes csatorna) már beállított
+        # egy pontosabb okot — azt nem szabad "no_channel"-lel felülírni,
+        # különben egy TERVEZETT viselkedés config-hibának látszana.
         result["reason"] = "no_channel"
         log.warning(
             "Routing: alert #%s egyetlen csatornára sem ment ki "
