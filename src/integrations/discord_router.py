@@ -21,13 +21,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import discord
 
 from src.config import get_config
+from src.integrations import alert_content
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -115,6 +115,7 @@ async def send_discord_alert(
     other_recipients: list[str] | None = None,
     missing_channel_user: str | None = None,
     no_assignee: bool = False,
+    clickup_task_url: str | None = None,
 ) -> dict[str, Any] | None:
     """Egy riasztás kiküldése egy KONKRÉT Discord csatornára.
 
@@ -131,8 +132,14 @@ async def send_discord_alert(
                                nincs személyes csatornája; figyelmeztető sor +
                                ping kerül az üzenetbe
         no_assignee          — admin-fallback: a kampánynak nincs hozzárendeltje
+        clickup_task_url     — ha a riasztáshoz készült ClickUp task, annak a
+                               linkje egy külön sorban ("📋 ClickUp: …"). None
+                               esetén a sor egyszerűen elmarad — a riasztás
+                               ClickUp nélkül is teljes értékű.
 
-    Visszatérés: {"channel_id", "message_id"} siker esetén, különben None.
+    Visszatérés: {"channel_id", "message_id", "guild_id"} siker esetén, különben
+    None. A `guild_id` (None is lehet, pl. DM-nél) a Discord ugrólinkhez kell,
+    amit a router ír vissza a ClickUp taskra.
     """
     severity = (alert.get("severity") or "warning").lower()
     header_emoji, header_label = _severity_style(severity)
@@ -170,6 +177,11 @@ async def send_discord_alert(
     if severity == "critical":
         lines.append(f"`/campaign info campaign_id:{alert.get('campaign_id')}`")
 
+    # A ClickUp task linkje a záró elválasztó ELÉ kerül, hogy a "mit tegyek
+    # most" blokk (parancs-hint + task) együtt maradjon.
+    if clickup_task_url:
+        lines.append(alert_content.clickup_link_line(clickup_task_url))
+
     lines.append("─────────────")
     content = "\n".join(lines)
 
@@ -195,7 +207,14 @@ async def send_discord_alert(
                 "Discord alert kiküldve (severity=%s, csatorna=%s, msg=%s)",
                 severity, channel.id, msg.id,
             )
-            return {"channel_id": channel.id, "message_id": msg.id}
+            # A guild ID az ugrólinkhez kell. `getattr`-ral kérjük: DM-csatornán
+            # nincs `guild`, és a linket a hívó úgyis kihagyja, ha hiányzik.
+            guild = getattr(channel, "guild", None)
+            return {
+                "channel_id": channel.id,
+                "message_id": msg.id,
+                "guild_id": getattr(guild, "id", None),
+            }
         except discord.HTTPException as exc:
             if getattr(exc, "status", None) == 429 and attempt < 2:
                 wait = 2 ** attempt
@@ -319,33 +338,14 @@ def _workweek_is_partial(iso_to: str | None) -> bool:
 def _local_detected_at(issue: dict[str, Any]) -> datetime | None:
     """Az anomália észlelési ideje a KONFIGURÁLT időzónában. None, ha nincs/hibás.
 
-    A konverzió nem elhagyható: az `alerts.detected_at` `timestamptz`, amit a
-    PostgREST UTC-ben ad vissza — nyers string-vágással egy 10:32-es magyar
-    észlelés 08:32-ként jelenne meg.
+    A tényleges konverzió a közös `alert_content.local_detected_at`-ben lakik —
+    ugyanazt a szabályt használja a ClickUp task időbélyege is, hogy a két
+    kimeneten ne jelenhessen meg ugyanaz az észlelés két különböző időponttal.
 
-    Sosem dob: hibás/hiányzó időbélyeg miatt nem eshet szét az összefoglaló,
-    olyankor egyszerűen elmarad az időpont a sor végéről.
+    Az időzónát ITT olvassuk ki (`get_config`), nem a közös modulban: így a
+    Discord réteg konfigja továbbra is ebben a névtérben mockolható.
     """
-    raw = issue.get("detected_at")
-    if not raw:
-        return None
-
-    if isinstance(raw, datetime):
-        parsed = raw
-    else:
-        try:
-            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            return None
-
-    if parsed.tzinfo is None:
-        # A DB UTC-ben tárol — a tz nélküli érték ennek a konvenciónak felel meg.
-        parsed = parsed.replace(tzinfo=timezone.utc)
-
-    try:
-        return parsed.astimezone(ZoneInfo(get_config().timezone or "UTC"))
-    except (KeyError, ValueError):  # ismeretlen/hibás időzóna a configban
-        return parsed
+    return alert_content.local_detected_at(issue, get_config().timezone)
 
 
 def _detected_at_suffix(issue: dict[str, Any], *, with_date: bool) -> str:

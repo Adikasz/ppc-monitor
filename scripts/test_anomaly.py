@@ -29,6 +29,7 @@ import sys
 from datetime import date
 
 from src.config import get_config  # noqa: F401 — .env betöltése
+from src.integrations import clickup_router
 from src.monitoring.detector import detect_anomalies_for_campaign
 from src.monitoring.router import route_alert
 from src.monitoring.scheduler import _batch_pull
@@ -200,12 +201,17 @@ async def run_e2e(campaign: dict, *, keep_alert: bool) -> int:
         # 3) ClickUp
         if "clickup" in channels:
             print(f"{OK} ClickUp task létrehozva")
-        elif target["severity"] != "critical":
+        elif not clickup_router.is_task_severity(target["severity"]):
             print(f"{WARN} ClickUp skip (csak CRITICAL alerthez készül task)")
-        elif not get_config().clickup_api_token or not get_config().clickup_anomalies_list_id:
-            print(f"{WARN} ClickUp skip (nincs CLICKUP_API_TOKEN / LIST_ID még)")
+        elif not get_config().clickup_api_token:
+            print(f"{WARN} ClickUp skip (nincs CLICKUP_API_TOKEN még)")
         else:
-            print(f"{WARN} ClickUp task NEM jött létre (lásd a logot — token/jogosultság?)")
+            # A leggyakoribb ok: az OM-nek nincs `clickup_manager_mapping` sora
+            # (0014). A router ilyenkor warninggal Discord-only routingra vált.
+            print(
+                f"{WARN} ClickUp task NEM jött létre — van mappingje az OM-nek? "
+                f"Ellenőrzés: `/clickup status` (lásd a logot is)"
+            )
     finally:
         # Teszt-alert takarítás (a sajátunkat, ha most hoztuk létre)
         if created_alert_id and not keep_alert:
