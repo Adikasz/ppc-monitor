@@ -90,7 +90,10 @@ class Config:
     clickup_api_token: str
     clickup_team_id: str
     clickup_default_list_id: str
-    clickup_anomalies_list_id: str          # "Anomalies" lista — CRITICAL taskokhoz
+    # MEGSZŰNT: `CLICKUP_ANOMALIES_LIST_ID`. A CRITICAL riasztás-taskok célja
+    # már nem egy közös, env-be drótozott lista, hanem az adott OM saját listája
+    # a `clickup_manager_mapping` táblából (0014 migration, `/clickup setup-manager`).
+    # A Railway-en beállított régi változó ártalmatlan, egyszerűen nem olvassuk.
     # A heti riport Doc-ok célhelye (Docs API v3). Elég az EGYIKET beállítani;
     # ha mindkettő megvan, a Folder nyer. Ha egyik sincs, a heti riport
     # warninggal kihagyja a Doc-létrehozást (lásd integrations/clickup.py).
@@ -147,7 +150,6 @@ class Config:
             clickup_api_token=_optional("CLICKUP_API_TOKEN"),
             clickup_team_id=_optional("CLICKUP_TEAM_ID"),
             clickup_default_list_id=_optional("CLICKUP_DEFAULT_LIST_ID"),
-            clickup_anomalies_list_id=_optional("CLICKUP_ANOMALIES_LIST_ID"),
             clickup_weekly_report_space_id=_optional("CLICKUP_WEEKLY_REPORT_SPACE_ID"),
             clickup_weekly_report_folder_id=_optional("CLICKUP_WEEKLY_REPORT_FOLDER_ID"),
 

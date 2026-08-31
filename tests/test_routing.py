@@ -55,14 +55,26 @@ def _patch_router(
     ))
     stack.enter_context(mock.patch.object(router, "_resolve_recipients", return_value=recipients))
     stack.enter_context(mock.patch.object(
-        router, "get_config", return_value=SimpleNamespace(discord_admin_channel_id=admin_channel_id),
+        router, "get_config", return_value=SimpleNamespace(
+            discord_admin_channel_id=admin_channel_id,
+            # A ClickUp task Discord-ugrólinkjének tartalék guild ID-ja.
+            discord_guild_id="guild1",
+        ),
     ))
     stack.enter_context(mock.patch.object(router.quiet_hours, "is_quiet_now", return_value=is_quiet))
     stack.enter_context(mock.patch.object(router.alerts_storage, "mark_alert_routed"))
     stack.enter_context(mock.patch.object(router.alerts_storage, "mark_alert_suppressed"))
+    # ClickUp: alapból NINCS mapping az OM-hez → a task-ág graceful skippel.
+    # A ClickUp-specifikus eseteket a tests/test_clickup_integration.py fedi.
+    stack.enter_context(mock.patch.object(
+        router.clickup_storage, "get_mapping_for_user", return_value=None,
+    ))
     stack.enter_context(mock.patch.object(
         router.clickup_router, "create_clickup_task",
         new=mock.AsyncMock(return_value=clickup_result),
+    ))
+    stack.enter_context(mock.patch.object(
+        router.clickup_router, "append_discord_link", new=mock.AsyncMock(return_value=True),
     ))
 
     send = mock.AsyncMock(return_value=send_result)
@@ -80,8 +92,15 @@ def _alert(severity: str = "warning", metric: str = "test_alert") -> dict:
     }
 
 
-def _recipient(discord_id: str, channel: str | None, role: str = "primary") -> dict:
+def _recipient(
+    discord_id: str,
+    channel: str | None,
+    role: str = "primary",
+    user_id: int = 1,
+) -> dict:
+    """Egy feloldott címzett — a `user_id` a ClickUp mapping kikereséséhez kell."""
     return {
+        "user_id": user_id,
         "discord_user_id": discord_id,
         "display_name": f"User{discord_id}",
         "role": role,
