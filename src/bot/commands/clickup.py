@@ -1,28 +1,28 @@
 """
-/clickup slash parancscsoport — a ClickUp anomália-struktúra beállítása.
+/clickup slash parancscsoport — az OM → ClickUp lista leképezés kezelése.
 
 Parancsok (mind admin csatorna):
-    /clickup setup                                       — a Space létrehozása/megkeresése
-    /clickup setup-manager user:@X clickup_user_id:Y     — OM Folder + List + assignee
-    /clickup list-members                                — a Workspace tagjai + ClickUp ID-juk
-    /clickup status                                      — mi van beállítva (Space + mappingek)
+    /clickup setup-manager user:@X clickup_user_id:Y folder_id:Z list_id:W
+                            — egy PPC manager mappingjának mentése (ellenőrzéssel)
+    /clickup list-members   — a Workspace tagjai + ClickUp user ID-juk
+    /clickup status         — mi van beállítva, és él-e még a ClickUp oldalon
 
-MIÉRT PARANCS ÉS NEM ENV VÁLTOZÓ:
-    A ClickUp Space/Folder/List azonosítók csak akkor léteznek, amikor a
-    rendszer LÉTREHOZTA őket — előre nem lehet őket .env-be írni. Ezért a setup
-    az API-n keresztül hozza létre a struktúrát, és az ID-kat DB-be menti
-    (0014 migration). Új PPC manager felvétele innentől egyetlen parancs:
-    nincs kód-módosítás, nincs Railway redeploy.
+A STRUKTÚRÁT NEM A BOT HOZZA LÉTRE:
+    A Space-t ("PPC Anomália Riasztások"), a managerenkénti Foldert és a benne
+    lévő Listát az ügyfél készíti el KÉZZEL a ClickUp felületén. A bot csak a
+    kész azonosítókat kapja meg, és MENTÉS ELŐTT ellenőrzi őket a ClickUp
+    API-n — így érvénytelen ID nem kerülhet az adatbázisba.
 
-IDEMPOTENS:
-    Mindkét setup parancs NÉV SZERINT KERES, és csak akkor hoz létre újat, ha
-    nincs találat. Kétszer lefuttatva ugyanazt az eredményt adja (a válasz
-    megmondja, most készült-e vagy már megvolt).
+    (Korábban volt egy `/clickup setup` parancs, ami API-ból hozta létre a
+    Space-t. Megszűnt: a struktúra tulajdonosa a csapat, nem a bot. Nem
+    hagytuk bent no-op parancsként — egy parancs, ami semmit nem csinál,
+    rosszabb, mint a hiánya; a `/clickup status` viszont kiírja a kézi
+    beállítás lépéseit, ha még nincs egyetlen mapping sem.)
 
-A parancsok SZÁNDÉKOSAN hangosak a hibákra: a `clickup_admin` modul kivételt
-dob emberi üzenettel, amit itt egy az egyben kiírunk. Egy néma "nem sikerült"
-válasz ugyanaz a hibaosztály lenne, ami az insight scan-nél hetekig rejtve
-maradt.
+Ez a parancscsoport SZÁNDÉKOSAN hangos a hibákra: a `clickup_admin` modul
+kivételt dob emberi üzenettel, amit itt egy az egyben kiírunk. Egy néma "nem
+sikerült" válasz ugyanaz a hibaosztály lenne, ami az insight scan-nél hetekig
+rejtve maradt.
 """
 from __future__ import annotations
 
@@ -32,11 +32,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from src.bot.commands._common import is_admin_channel as _is_admin_channel
+from src.bot.commands._common import (
+    is_admin_channel as _is_admin_channel,
+    reply_or_channel,
+)
 from src.integrations import clickup_admin
 from src.integrations.clickup_admin import ClickUpAdminError
 from src.storage import audit
-from src.storage import clickup_structure as clickup_storage
+from src.storage import clickup_mapping as clickup_storage
 from src.storage import users as users_storage
 from src.utils.logging import get_logger
 
@@ -45,7 +48,23 @@ log = get_logger(__name__)
 # A Discord üzenet 2000 karakteres — hosszú listáknál vágunk, de NEM némán.
 _MAX_LISTED = 25
 
+# A `/clickup status` ennyi mappingot ellenőriz élőben a ClickUp API-n. A többit
+# kilistázza, de "nem ellenőrzött" jelöléssel — a ClickUp percenkénti kérés-
+# limitjébe egy nagy csapatnál bele lehetne futni, és a némán csonkolt
+# ellenőrzés rosszabb, mint a bevallott.
+_MAX_VALIDATED = 15
+
 _ADMIN_ONLY = "Ez a parancs csak az admin csatornában használható."
+
+_SETUP_STEPS = (
+    "**A ClickUp struktúrát kézzel kell létrehozni:**\n"
+    f"1. Egy Space a ClickUp-ban (javasolt név: **{clickup_admin.SPACE_NAME}**)\n"
+    "2. Minden PPC managerhez egy Folder a Space-en belül\n"
+    "3. Mindegyik Folderben egy List (ide kerülnek a taskok)\n"
+    "4. A Folder és a List ID-ját másold ki (jobb klikk → *Copy link*), majd:\n"
+    "`/clickup setup-manager user:@OM clickup_user_id:… folder_id:… list_id:…`\n"
+    "*A ClickUp user ID-kat a `/clickup list-members` listázza.*"
+)
 
 
 def _display_name(member: discord.Member | discord.User) -> str:
@@ -55,89 +74,46 @@ def _display_name(member: discord.Member | discord.User) -> str:
     return member.display_name or member.name
 
 
+def _id_error(label: str, raw: str, kind: str) -> str:
+    """Hibaüzenet be nem olvasható azonosítóra, a helyes formákkal."""
+    pelda = (
+        "https://app.clickup.com/9012345/v/li/901234567890"
+        if kind == "list"
+        else "https://app.clickup.com/9012345/v/o/f/90123456"
+    )
+    return (
+        f"❌ A **{label}** nem olvasható ki ebből: `{raw}`\n"
+        f"Add meg a nyers numerikus ID-t, vagy illeszd be a ClickUp linket "
+        f"(jobb klikk az elemen → *Copy link*), pl. `{pelda}`."
+    )
+
+
 class ClickUpCog(commands.GroupCog, group_name="clickup"):
-    """A `clickup` parancscsoport — struktúra-setup és OM-mapping."""
+    """A `clickup` parancscsoport — OM-mapping és állapot."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
     # ------------------------------------------------------------------
-    # /clickup setup
-    # ------------------------------------------------------------------
-    @app_commands.command(
-        name="setup",
-        description="A ClickUp anomália-Space létrehozása vagy megkeresése (admin)",
-    )
-    async def setup_cmd(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        if not _is_admin_channel(interaction):
-            await interaction.followup.send(_ADMIN_ONLY)
-            return
-
-        problem = clickup_admin.config_error()
-        if problem:
-            await interaction.followup.send(
-                f"❌ A ClickUp beállítás hiányos — {problem}.\n"
-                f"*Állítsd be a Railway environment variables között, majd futtasd újra.*"
-            )
-            return
-
-        try:
-            space = await clickup_admin.ensure_space()
-        except ClickUpAdminError as exc:
-            log.warning("/clickup setup — ClickUp hiba: %s", exc)
-            await interaction.followup.send(f"❌ {exc}")
-            return
-
-        saved = await asyncio.to_thread(
-            clickup_storage.save_space,
-            clickup_admin.team_id(), space["name"], space["id"],
-        )
-        if saved is None:
-            await interaction.followup.send(
-                f"⚠️ A Space megvan a ClickUp-ban (**{space['name']}**, "
-                f"`{space['id']}`), de az adatbázisba MENTÉS nem sikerült — így "
-                f"a riasztás-router nem fogja megtalálni.\n"
-                f"*Lefutott a `0014_clickup_anomaly_tasks` migration? "
-                f"A részletek a Railway logban.*"
-            )
-            return
-
-        await asyncio.to_thread(
-            audit.log_action,
-            str(interaction.user.id),
-            "clickup_setup",
-            entity_type="clickup_structure",
-            details={"space_id": space["id"], "space_name": space["name"],
-                     "created": space["created"]},
-        )
-
-        allapot = "létrehozva" if space["created"] else "már létezett (nem duplikáltuk)"
-        await interaction.followup.send(
-            f"✅ **ClickUp Space {allapot}**\n"
-            f"Név: **{space['name']}**\n"
-            f"ID: `{space['id']}`\n\n"
-            f"Következő lépés: `/clickup setup-manager user:@OM clickup_user_id:…` "
-            f"minden PPC managerre.\n"
-            f"*A ClickUp user ID-kat a `/clickup list-members` listázza.*"
-        )
-
-    # ------------------------------------------------------------------
-    # /clickup setup-manager user:@X clickup_user_id:Y
+    # /clickup setup-manager user:@X clickup_user_id:Y folder_id:Z list_id:W
     # ------------------------------------------------------------------
     @app_commands.command(
         name="setup-manager",
-        description="OM ClickUp Folder + List létrehozása és mappelése (admin)",
+        description="OM ClickUp listájának mappelése a megadott ID-kkal (admin)",
     )
     @app_commands.describe(
         user="A PPC manager Discord felhasználója",
         clickup_user_id="A ClickUp user ID az assignee-hez (/clickup list-members mutatja)",
+        folder_id="A manager ClickUp Folderének ID-ja vagy linkje",
+        list_id="A Folderben lévő List ID-ja vagy linkje — ide kerülnek a taskok",
     )
     async def setup_manager(
         self,
         interaction: discord.Interaction,
         user: discord.Member,
         clickup_user_id: str,
+        folder_id: str,
+        list_id: str,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         if not _is_admin_channel(interaction):
@@ -149,6 +125,7 @@ class ClickUpCog(commands.GroupCog, group_name="clickup"):
             await interaction.followup.send(f"❌ A ClickUp beállítás hiányos — {problem}.")
             return
 
+        # --- 1) Bemenet-beolvasás (nyers ID vagy beillesztett ClickUp link) ---
         assignee_id = (clickup_user_id or "").strip()
         if not assignee_id.isdigit():
             # NEM blokkoló hiba lenne (a task assignee nélkül is létrejön), de
@@ -161,17 +138,49 @@ class ClickUpCog(commands.GroupCog, group_name="clickup"):
             )
             return
 
-        # A Space-nek már léteznie kell — enélkül nincs hova Foldert tenni.
-        space_row = await asyncio.to_thread(
-            clickup_storage.get_space, clickup_admin.team_id(), clickup_admin.SPACE_NAME,
-        )
-        if not space_row:
+        folder_ref = clickup_admin.parse_id(folder_id, "folder")
+        if folder_ref is None:
+            await interaction.followup.send(_id_error("Folder ID", folder_id, "folder"))
+            return
+
+        list_ref = clickup_admin.parse_id(list_id, "list")
+        if list_ref is None:
+            await interaction.followup.send(_id_error("List ID", list_id, "list"))
+            return
+
+        # --- 2) Ellenőrzés a ClickUp API-n, MENTÉS ELŐTT --------------------
+        # Egy 404-es lista némán nyelné el az összes későbbi riasztás-taskot,
+        # ezért inkább itt állunk meg, mint hogy érvénytelen ID-t mentsünk.
+        try:
+            lista = await clickup_admin.get_list(list_ref)
+        except ClickUpAdminError as exc:
+            log.warning("/clickup setup-manager — lista-ellenőrzés hiba: %s", exc)
             await interaction.followup.send(
-                "❌ Még nincs beállított ClickUp Space ehhez a Workspace-hez.\n"
-                "Futtasd először: `/clickup setup`"
+                f"❌ {exc}\n"
+                f"*A mapping NEM lett elmentve. Ellenőrizd, hogy a lista létezik-e, "
+                f"és hogy a ClickUp token tulajdonosa látja-e.*"
             )
             return
 
+        # A lista TÉNYLEG a megadott Folderben van? Ez fogja meg a leggyakoribb
+        # kézi hibát: egy másik manager Folderéből kimásolt lista-ID.
+        if lista["folder_hidden"]:
+            await interaction.followup.send(
+                f"❌ A **{lista['name']}** lista nem Folderben van (folderless lista), "
+                f"a megadott Folder ID (`{folder_ref}`) így nem tartozhat hozzá.\n"
+                f"*Hozd létre a listát a manager Folderén BELÜL, és másold ki újra az ID-kat.*"
+            )
+            return
+        if lista["folder_id"] and lista["folder_id"] != folder_ref:
+            await interaction.followup.send(
+                f"❌ A **{lista['name']}** lista NEM a megadott Folderben van.\n"
+                f"Megadott Folder: `{folder_ref}` · "
+                f"A lista tényleges Foldere: **{lista['folder_name']}** (`{lista['folder_id']}`)\n"
+                f"*A mapping NEM lett elmentve — ellenőrizd, melyik manager Folderéből másoltál.*"
+            )
+            return
+
+        # --- 3) Mentés -----------------------------------------------------
         # Auto-regisztráció: ha az OM még nincs a users táblában, létrehozzuk —
         # ugyanaz a minta, mint az /assign és a /user set-channel esetén.
         user_row, created_user = await asyncio.to_thread(
@@ -180,29 +189,18 @@ class ClickUpCog(commands.GroupCog, group_name="clickup"):
         if created_user:
             log.info("Új felhasználó regisztrálva (clickup setup-manager): %s", user)
 
-        folder_name = user_row.get("display_name") or _display_name(user)
-        try:
-            folder = await clickup_admin.ensure_folder(
-                space_row["clickup_space_id"], folder_name,
-            )
-            lista = await clickup_admin.ensure_list(folder["id"])
-        except ClickUpAdminError as exc:
-            log.warning("/clickup setup-manager — ClickUp hiba: %s", exc)
-            await interaction.followup.send(f"❌ {exc}")
-            return
-
         saved = await asyncio.to_thread(
             clickup_storage.upsert_mapping,
             user_row["id"],
-            clickup_folder_id=folder["id"],
-            clickup_list_id=lista["id"],
+            clickup_folder_id=folder_ref,
+            clickup_list_id=list_ref,
             clickup_assignee_id=assignee_id,
         )
         if saved is None:
             await interaction.followup.send(
-                f"⚠️ A ClickUp Folder és List megvan (`{folder['id']}` / "
-                f"`{lista['id']}`), de a mapping MENTÉSE nem sikerült — a "
-                f"riasztásokhoz így nem készül task.\n"
+                f"⚠️ A ClickUp azonosítók rendben vannak (lista: **{lista['name']}**), "
+                f"de a mapping MENTÉSE nem sikerült — a riasztásokhoz így nem "
+                f"készül task.\n"
                 f"*Lefutott a `0014_clickup_anomaly_tasks` migration? "
                 f"A részletek a Railway logban.*"
             )
@@ -215,19 +213,16 @@ class ClickUpCog(commands.GroupCog, group_name="clickup"):
             entity_type="user",
             entity_id=user_row["id"],
             details={
-                "folder_id": folder["id"], "list_id": lista["id"],
-                "assignee_id": assignee_id,
-                "folder_created": folder["created"], "list_created": lista["created"],
+                "folder_id": folder_ref, "list_id": list_ref,
+                "assignee_id": assignee_id, "list_name": lista["name"],
             },
         )
 
-        def _allapot(res: dict) -> str:
-            return "új" if res["created"] else "meglévő"
-
+        nev = user_row.get("display_name") or _display_name(user)
         await interaction.followup.send(
-            f"✅ **{folder_name}** ClickUp mappingja elmentve\n"
-            f"📁 Folder ({_allapot(folder)}): **{folder['name']}** — `{folder['id']}`\n"
-            f"📋 List ({_allapot(lista)}): **{lista['name']}** — `{lista['id']}`\n"
+            f"✅ **{nev}** ClickUp mappingja elmentve\n"
+            f"📁 Folder: **{lista['folder_name'] or '?'}** — `{folder_ref}`\n"
+            f"📋 List: **{lista['name']}** — `{list_ref}`\n"
             f"👤 Assignee: `{assignee_id}`\n\n"
             f"Mostantól a hozzá rendelt kampányok **CRITICAL** riasztásaihoz "
             f"ebbe a listába készül task, rá szignálva."
@@ -283,7 +278,7 @@ class ClickUpCog(commands.GroupCog, group_name="clickup"):
     # ------------------------------------------------------------------
     @app_commands.command(
         name="status",
-        description="A ClickUp integráció állapota: Space és OM-mappingek (admin)",
+        description="A ClickUp integráció állapota és a mappingek ellenőrzése (admin)",
     )
     async def status(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -292,11 +287,6 @@ class ClickUpCog(commands.GroupCog, group_name="clickup"):
             return
 
         problem = clickup_admin.config_error()
-        space_row = None
-        if not problem:
-            space_row = await asyncio.to_thread(
-                clickup_storage.get_space, clickup_admin.team_id(), clickup_admin.SPACE_NAME,
-            )
         mappings = await asyncio.to_thread(clickup_storage.list_mappings)
 
         sorok = ["📋 **ClickUp integráció — állapot**", ""]
@@ -305,35 +295,73 @@ class ClickUpCog(commands.GroupCog, group_name="clickup"):
         else:
             sorok.append("✅ Konfiguráció: `CLICKUP_API_TOKEN` + `CLICKUP_TEAM_ID` megvan")
 
-        if space_row:
-            sorok.append(
-                f"✅ Space: **{space_row.get('space_name')}** — "
-                f"`{space_row.get('clickup_space_id')}`"
-            )
-        else:
-            sorok.append("❌ Space: nincs beállítva — futtasd: `/clickup setup`")
-
         sorok.append("")
         if not mappings:
             sorok.append(
                 "❌ **Egyetlen OM-nek sincs ClickUp mappingja** — a CRITICAL "
                 "riasztások Discord-only routinggal mennek ki (task nélkül).\n"
-                "Beállítás: `/clickup setup-manager user:@OM clickup_user_id:…`"
             )
-        else:
-            sorok.append(f"**OM-mappingek ({len(mappings)}):**")
-            for row in mappings[:_MAX_LISTED]:
-                user = row.get("users") or {}
-                nev = user.get("display_name") or f"user #{row.get('user_id')}"
-                assignee = row.get("clickup_assignee_id") or "⚠️ nincs"
-                sorok.append(
-                    f"• **{nev}** — lista `{row.get('clickup_list_id')}` · "
-                    f"assignee `{assignee}`"
-                )
-            if len(mappings) > _MAX_LISTED:
-                sorok.append(f"• *…és még {len(mappings) - _MAX_LISTED} további*")
+            sorok.append(_SETUP_STEPS)
+            await self._reply(interaction, "\n".join(sorok))
+            return
 
-        await interaction.followup.send("\n".join(sorok))
+        sorok.append(f"**OM-mappingek ({len(mappings)}):**")
+        for index, row in enumerate(mappings[:_MAX_LISTED]):
+            user = row.get("users") or {}
+            nev = user.get("display_name") or f"user #{row.get('user_id')}"
+            assignee = row.get("clickup_assignee_id") or "⚠️ nincs"
+            allapot = await self._validate_row(
+                row, validate=(problem is None and index < _MAX_VALIDATED),
+            )
+            sorok.append(
+                f"{allapot} **{nev}** — lista `{row.get('clickup_list_id')}` · "
+                f"assignee `{assignee}`"
+            )
+
+        if len(mappings) > _MAX_LISTED:
+            sorok.append(f"• *…és még {len(mappings) - _MAX_LISTED} további (nem listázva)*")
+        if problem is None and len(mappings) > _MAX_VALIDATED:
+            sorok.append(
+                f"\n*A ClickUp-ellenőrzés az első {_MAX_VALIDATED} sorra futott "
+                f"(kérés-limit); a többi ❔ jelet kapott.*"
+            )
+
+        await self._reply(interaction, "\n".join(sorok))
+
+    async def _reply(self, interaction: discord.Interaction, content: str) -> None:
+        """Válasz a followupon, csatorna-fallbackkel.
+
+        A státusz akár `_MAX_VALIDATED` ClickUp hívást is indít; ha a ClickUp
+        lassú, a 15 perces interakciós token lejárhat, és az admin a hosszú
+        várakozás után semmit nem látna (ugyanaz a minta, mint az `/insight
+        scan-now` és a `/report weekly-now` esetén).
+        """
+        await reply_or_channel(interaction, content, logger=log, what="ClickUp státusz")
+
+    async def _validate_row(self, row: dict, *, validate: bool) -> str:
+        """Egy mapping sor állapot-jele: él-e még a lista a ClickUp-ban.
+
+        ✅ elérhető · ⚠️ elérhető, de már MÁS Folderben van (áthelyezték) ·
+        ❌ nem érhető el (törölték / elveszett a jogosultság) · ❔ nem ellenőriztük
+
+        Az átNEVEZÉS szándékosan nem hiba: a taskokat a lista ID-ja alapján
+        hozzuk létre, az együtt él az átnevezéssel. A törlés és az áthelyezés
+        viszont valódi eltérés a mentett állapottól.
+        """
+        if not validate:
+            return "❔"
+        try:
+            lista = await clickup_admin.get_list(str(row.get("clickup_list_id")))
+        except ClickUpAdminError as exc:
+            log.warning(
+                "/clickup status — a(z) %s lista nem ellenőrizhető: %s",
+                row.get("clickup_list_id"), exc,
+            )
+            return "❌"
+        stored_folder = str(row.get("clickup_folder_id") or "")
+        if lista["folder_id"] and stored_folder and lista["folder_id"] != stored_folder:
+            return "⚠️"
+        return "✅"
 
 
 async def setup(bot: commands.Bot) -> None:

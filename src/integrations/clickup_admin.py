@@ -1,31 +1,31 @@
 """
-ClickUp workspace-struktúra API (Space / Folder / List / tagok).
+ClickUp workspace-lekérdezések az admin parancsokhoz (lista, folder, tagok).
 
-Ezt a modult KIZÁRÓLAG az admin parancsok hívják (`/clickup setup`,
-`/clickup setup-manager`, `/clickup list-members`) — a riasztási úton nincs
-szerepe. A három ClickUp modul felosztása:
+Ezt a modult KIZÁRÓLAG az admin parancsok hívják (`/clickup setup-manager`,
+`/clickup list-members`, `/clickup status`) — a riasztási úton nincs szerepe.
+A három ClickUp modul felosztása:
 
     clickup.py         — Docs API v3, heti riport Doc
     clickup_router.py  — v2 task API, CRITICAL riasztás → task
-    clickup_admin.py   — v2 struktúra API (ez a fájl): Space/Folder/List/tagok
+    clickup_admin.py   — v2 lekérdezések (ez a fájl): lista/folder ellenőrzés, tagok
+
+A STRUKTÚRÁT NEM MI HOZZUK LÉTRE:
+    A Space-t, a PPC managerenkénti Foldert és a bennük lévő Listát az ügyfél
+    készíti el KÉZZEL a ClickUp felületén, majd a kész Folder/List ID-kat adja
+    meg a `/clickup setup-manager` parancsnak. Ez a modul ezért csak OLVAS:
+    ellenőrzi, hogy a beírt azonosító létezik-e és elérhető-e a tokennel.
+
+    Miért így jobb: a struktúra tulajdonosa a csapat marad (jogosultságok,
+    nézetek, automatizációk mind a ClickUp UI-ban állíthatók), a bot pedig nem
+    tud félkész vagy duplikált Space-eket létrehozni egy félresikerült setupnál.
 
 MIÉRT DOB EZ A MODUL (a másik kettővel ellentétben):
     A riasztási úton a néma degradálás a helyes: egy ClickUp-hiba nem
     akaszthatja meg a Discord riasztást. Egy ADMIN PARANCS viszont pont
-    fordítva működik — ha a Space létrehozása elhasal, azt az adminnak PONTOSAN
-    meg kell tudnia, különben a "0 dolog történt" válasz semmit nem árul el.
+    fordítva működik — ha a megadott lista nem létezik, azt az adminnak
+    PONTOSAN meg kell tudnia, mielőtt érvénytelen ID kerül az adatbázisba.
     Ezért itt `ClickUpAdminError` repül, emberi (magyar) üzenettel, amit a
     parancs egy az egyben ki tud írni.
-
-IDEMPOTENCIA:
-    Minden `ensure_*` függvény ELŐBB NÉV SZERINT KERES, és csak ha nincs
-    találat, hoz létre újat. A setup parancsok így többször is futtathatók
-    anélkül, hogy a ClickUp megtelne "PPC Anomália Riasztások (2)" Space-ekkel.
-
-    Következmény (tudatosan vállalt): ha valaki a ClickUp UI-ban ÁTNEVEZI a
-    Space-t vagy a Foldert, a következő setup ÚJAT hoz létre. A DB-ben tárolt
-    ID-k ilyenkor is a régire mutatnak — az átnevezés tehát biztonságos, csak a
-    setup újrafuttatása előtt érdemes tudni róla.
 
 A ClickUp REST API szinkron HTTP (requests); minden hívás asyncio.to_thread-ben
 fut, hogy ne blokkolja a bot event loopját.
@@ -33,6 +33,7 @@ fut, hogy ne blokkolja a bot event loopját.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 import requests
@@ -45,10 +46,10 @@ log = get_logger(__name__)
 _API_BASE = "https://api.clickup.com/api/v2"
 _TIMEOUT_S = 20
 
-# A riasztás-taskok Space-e. A név a keresés kulcsa is (lásd IDEMPOTENCIA).
+# A riasztás-taskok Space-ének JAVASOLT neve. Csak dokumentáció/útmutató: a
+# Space-t kézzel hozzák létre, a bot soha nem keres rá és nem tárolja az ID-ját
+# — a taskokhoz elég a lista azonosítója.
 SPACE_NAME = "PPC Anomália Riasztások"
-# Az OM Folderén belüli lista neve — ide kerülnek a taskok.
-LIST_NAME = "Anomália riasztások"
 
 
 class ClickUpAdminError(RuntimeError):
@@ -86,6 +87,45 @@ def _headers() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Azonosító-beolvasás (nyers ID vagy ClickUp link)
+# ---------------------------------------------------------------------------
+
+# A ClickUp "Copy link" a listára ilyen URL-t ad:
+#     https://app.clickup.com/{workspace}/v/li/{list_id}
+# (a régebbi felületen `/v/l/{list_id}`), Folderre pedig `/v/f/` illetve
+# `/v/o/f/` szegmenssel. Csak ezeket a MEGNEVEZETT mintákat fogadjuk el.
+_ID_PATTERNS: dict[str, tuple[str, ...]] = {
+    "list": (r"/v/li/(\d+)", r"/v/l/(\d+)"),
+    "folder": (r"/v/o/f/(\d+)", r"/v/f/(\d+)"),
+}
+
+
+def parse_id(raw: str | None, kind: str) -> str | None:
+    """ClickUp azonosító kinyerése nyers ID-ből VAGY beillesztett linkből.
+
+    Elfogad:
+      - "901234567890"                                  → 901234567890
+      - "https://app.clickup.com/9012/v/li/901234567890" → 901234567890
+      - "<https://…>" (Discord link-escape)              → ugyanaz
+
+    None, ha nem sikerült EGYÉRTELMŰEN azonosítani. SZÁNDÉKOSAN nem tippelünk
+    "az utolsó számjegy-szegmens" alapon: egy Folder-nézet URL-je a Space
+    ID-jával is végződhet, és egy elmentett rossz ID pont az a néma hiba, amit
+    a validáció el akar kerülni. Ilyenkor a parancs a nyers ID-t kéri be.
+    """
+    text = (raw or "").strip().strip("<>").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return text
+    for pattern in _ID_PATTERNS.get(kind, ()):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # HTTP réteg
 # ---------------------------------------------------------------------------
 
@@ -117,14 +157,11 @@ def _request(
         )
     if resp.status_code == 403:
         raise ClickUpAdminError(
-            f"{what}: a token nem jogosult erre a műveletre (403). "
-            f"A ClickUp-ban a token tulajdonosának Space-létrehozási joga kell legyen."
+            f"{what}: a token nem fér hozzá ehhez az elemhez (403). "
+            f"Oszd meg a Space-t a token tulajdonosával a ClickUp-ban."
         )
     if resp.status_code == 404:
-        raise ClickUpAdminError(
-            f"{what}: nem található (404) — rossz `CLICKUP_TEAM_ID`, vagy a "
-            f"hivatkozott Space/Folder időközben törlődött."
-        )
+        raise ClickUpAdminError(f"{what}: nem található (404).")
     if resp.status_code == 429:
         raise ClickUpAdminError(
             f"{what}: ClickUp rate limit (429) — várj egy percet, és futtasd újra."
@@ -143,138 +180,51 @@ def _request(
     return data
 
 
-def _by_name(rows: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
-    """Az első elem, aminek a neve (kis-nagybetű és szóköz nélkül) egyezik."""
-    target = name.strip().casefold()
-    for row in rows:
-        if str(row.get("name") or "").strip().casefold() == target:
-            return row
-    return None
-
-
 # ---------------------------------------------------------------------------
-# Space
+# Lista- és folder-ellenőrzés
 # ---------------------------------------------------------------------------
 
-# A Space létrehozásakor mindhárom mező kötelező (name, multiple_assignees,
-# features). Nem kapcsolunk be semmit, ami a riasztás-taskokhoz nem kell —
-# a due_dates viszont igen (a task-létrehozás határidőt is állít).
-_SPACE_FEATURES: dict[str, Any] = {
-    "due_dates": {
-        "enabled": True,
-        "start_date": False,
-        "remap_due_dates": False,
-        "remap_closed_due_date": False,
-    },
-    "time_tracking": {"enabled": False},
-    "tags": {"enabled": True},
-    "time_estimates": {"enabled": False},
-    "checklists": {"enabled": True},
-    "custom_fields": {"enabled": True},
-    "remap_dependencies": {"enabled": False},
-    "dependency_warning": {"enabled": False},
-    "portfolios": {"enabled": False},
-}
-
-
-def _list_spaces_sync() -> list[dict[str, Any]]:
+def _get_list_sync(list_id: str) -> dict[str, Any]:
     data = _request(
-        "GET", f"{_API_BASE}/team/{team_id()}/space",
-        what="Space-ek lekérése", params={"archived": "false"},
+        "GET", f"{_API_BASE}/list/{list_id}",
+        what=f"A(z) `{list_id}` lista lekérése",
     )
-    return data.get("spaces") or []
+    folder = data.get("folder") or {}
+    space = data.get("space") or {}
+    return {
+        "id": str(data.get("id") or list_id),
+        "name": data.get("name") or "?",
+        # Folderless listánál a ClickUp egy REJTETT folder-objektumot ad vissza
+        # (`hidden: true`) — az ilyen lista nem egy valódi, kézzel létrehozott
+        # Folderben van, ezért a folder ID-t ilyenkor nem tekintjük érvényesnek.
+        "folder_id": str(folder.get("id")) if folder.get("id") and not folder.get("hidden") else None,
+        "folder_name": folder.get("name") if not folder.get("hidden") else None,
+        "folder_hidden": bool(folder.get("hidden")),
+        "space_id": str(space.get("id")) if space.get("id") else None,
+        "space_name": space.get("name"),
+    }
 
 
-def _ensure_space_sync(name: str) -> dict[str, Any]:
-    """Meglévő Space név szerint, vagy létrehozás. `{"id", "name", "created"}`."""
-    existing = _by_name(_list_spaces_sync(), name)
-    if existing is not None:
-        log.info("ClickUp Space már létezik: %s (#%s)", name, existing.get("id"))
-        return {"id": str(existing.get("id")), "name": existing.get("name") or name,
-                "created": False}
+async def get_list(list_id: str) -> dict[str, Any]:
+    """Egy lista adatai: `{"id", "name", "folder_id", "folder_name", …}`.
 
-    created = _request(
-        "POST", f"{_API_BASE}/team/{team_id()}/space",
-        what="Space létrehozása",
-        body={"name": name, "multiple_assignees": True, "features": _SPACE_FEATURES},
-    )
-    space_id = created.get("id")
-    if not space_id:
-        raise ClickUpAdminError("Space létrehozása: a ClickUp válasza `id` nélkül érkezett.")
-    log.info("ClickUp Space létrehozva: %s (#%s)", name, space_id)
-    return {"id": str(space_id), "name": created.get("name") or name, "created": True}
-
-
-async def ensure_space(name: str = SPACE_NAME) -> dict[str, Any]:
-    """A riasztás-Space megkeresése név szerint, vagy létrehozása.
-
-    Visszatérés: `{"id": str, "name": str, "created": bool}`.
-    `ClickUpAdminError`-t dob, ha a ClickUp hívás nem sikerül.
+    `ClickUpAdminError`-t dob, ha a lista nem létezik, vagy a token nem fér
+    hozzá — a hívó parancs így NEM ment el érvénytelen azonosítót.
     """
-    return await asyncio.to_thread(_ensure_space_sync, name)
+    return await asyncio.to_thread(_get_list_sync, str(list_id))
 
 
-# ---------------------------------------------------------------------------
-# Folder + List
-# ---------------------------------------------------------------------------
-
-def _ensure_folder_sync(space_id: str, name: str) -> dict[str, Any]:
+def _get_folder_sync(folder_id: str) -> dict[str, Any]:
     data = _request(
-        "GET", f"{_API_BASE}/space/{space_id}/folder",
-        what="Folderek lekérése", params={"archived": "false"},
+        "GET", f"{_API_BASE}/folder/{folder_id}",
+        what=f"A(z) `{folder_id}` Folder lekérése",
     )
-    existing = _by_name(data.get("folders") or [], name)
-    if existing is not None:
-        log.info("ClickUp Folder már létezik: %s (#%s)", name, existing.get("id"))
-        return {"id": str(existing.get("id")), "name": existing.get("name") or name,
-                "created": False}
-
-    created = _request(
-        "POST", f"{_API_BASE}/space/{space_id}/folder",
-        what="Folder létrehozása", body={"name": name},
-    )
-    folder_id = created.get("id")
-    if not folder_id:
-        raise ClickUpAdminError("Folder létrehozása: a ClickUp válasza `id` nélkül érkezett.")
-    log.info("ClickUp Folder létrehozva: %s (#%s)", name, folder_id)
-    return {"id": str(folder_id), "name": created.get("name") or name, "created": True}
+    return {"id": str(data.get("id") or folder_id), "name": data.get("name") or "?"}
 
 
-def _ensure_list_sync(folder_id: str, name: str) -> dict[str, Any]:
-    data = _request(
-        "GET", f"{_API_BASE}/folder/{folder_id}/list",
-        what="Listák lekérése", params={"archived": "false"},
-    )
-    existing = _by_name(data.get("lists") or [], name)
-    if existing is not None:
-        log.info("ClickUp List már létezik: %s (#%s)", name, existing.get("id"))
-        return {"id": str(existing.get("id")), "name": existing.get("name") or name,
-                "created": False}
-
-    # SZÁNDÉKOSAN csak a nevet küldjük. A ClickUp v2 "Create List" végpontja
-    # NEM tud egyedi TASK-státuszokat (pl. "Nyitva") definiálni — az ottani
-    # `status` mező a lista SZÍNCÍMKÉJE, nem a benne használható státuszok.
-    # A lista így a Space alapértelmezett státuszait örökli, a task pedig az
-    # első (nyitott) státuszban jön létre — pontosan ahogy kértük.
-    created = _request(
-        "POST", f"{_API_BASE}/folder/{folder_id}/list",
-        what="List létrehozása", body={"name": name},
-    )
-    list_id = created.get("id")
-    if not list_id:
-        raise ClickUpAdminError("List létrehozása: a ClickUp válasza `id` nélkül érkezett.")
-    log.info("ClickUp List létrehozva: %s (#%s)", name, list_id)
-    return {"id": str(list_id), "name": created.get("name") or name, "created": True}
-
-
-async def ensure_folder(space_id: str, name: str) -> dict[str, Any]:
-    """Folder megkeresése név szerint a Space-ben, vagy létrehozása."""
-    return await asyncio.to_thread(_ensure_folder_sync, str(space_id), name)
-
-
-async def ensure_list(folder_id: str, name: str = LIST_NAME) -> dict[str, Any]:
-    """List megkeresése név szerint a Folderben, vagy létrehozása."""
-    return await asyncio.to_thread(_ensure_list_sync, str(folder_id), name)
+async def get_folder(folder_id: str) -> dict[str, Any]:
+    """Egy Folder adatai: `{"id", "name"}`. `ClickUpAdminError` ha nem elérhető."""
+    return await asyncio.to_thread(_get_folder_sync, str(folder_id))
 
 
 # ---------------------------------------------------------------------------
