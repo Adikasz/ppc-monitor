@@ -35,6 +35,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from src.bot.commands._common import (
+    ambiguous_owner_message as _ambiguous_owner_message,
+    is_ambiguous_owner as _is_ambiguous_owner,
+)
 from src.integrations import discord_router
 from src.monitoring import instant_summary
 from src.monitoring import summary as summary_gen
@@ -84,8 +88,25 @@ def _short_account(ext_id: object) -> str:
 
 
 def _channel_owner(channel_id: object) -> dict | None:
-    """Az aktuális csatorna OM-je (users.alerts_channel_id alapján). None ha nincs."""
+    """Az aktuális csatorna OM-je (users.alerts_channel_id alapján).
+
+    HÁROM kimenetet adhat vissza (lásd `users_storage.get_user_by_alerts_channel`):
+    user sor / None / `{"ambiguous": True, "matches": [...]}`. Az utolsót a hívónak
+    kezelnie kell — ütközésnél nincs egyértelmű OM, és önkényes választás helyett
+    a parancsnak el kell utasítania (`_is_ambiguous_owner`).
+    """
     return users_storage.get_user_by_alerts_channel(str(channel_id))
+
+
+def _unique_channel_owner(channel_id: object) -> dict | None:
+    """Csak EGYÉRTELMŰ OM; ütközésnél None — az autocomplete-ek ezt használják.
+
+    Autocomplete-ben nem lehet hibaüzenetet küldeni (a Discord választék-listát
+    vár), ezért ott az ütközés néma üres lista; a magyarázatot a felhasználó a
+    parancs tényleges futtatásakor kapja meg.
+    """
+    owner = _channel_owner(channel_id)
+    return None if _is_ambiguous_owner(owner) else owner
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +120,16 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         self.bot = bot
 
     async def _owner_or_reject(self, interaction: discord.Interaction) -> dict | None:
-        """Az aktuális csatorna OM-je, vagy None + barátságos elutasítás."""
+        """Az aktuális csatorna OM-je, vagy None + barátságos elutasítás.
+
+        Ütközésnél (több user ugyanazon a csatornán) SZÁNDÉKOSAN fail-closed:
+        inkább semmit nem csinálunk, mint hogy a rossz OM hatókörén dolgozzunk
+        (idegen kampányok összefoglalója, idegen kampány némítása).
+        """
         owner = await asyncio.to_thread(_channel_owner, interaction.channel_id)
+        if _is_ambiguous_owner(owner):
+            await interaction.followup.send(_ambiguous_owner_message(owner))
+            return None
         if owner is None:
             await interaction.followup.send(
                 "❌ Ehhez a csatornához nincs OM rendelve, ezért a `/my` parancsok itt "
@@ -156,7 +185,7 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         szűrés kliensnévre, külső azonosítóra és #id-re is illeszt; üres input az
         összes saját fiókot mutatja.
         """
-        owner = await asyncio.to_thread(_channel_owner, interaction.channel_id)
+        owner = await asyncio.to_thread(_unique_channel_owner, interaction.channel_id)
         if owner is None:
             return []
         accounts = await asyncio.to_thread(
@@ -188,7 +217,7 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         `account` mezőjéből feloldott, SAJÁT (egyértelmű) fiók nem-'ended'
         kampányai. Ha még nincs egyértelműen saját fiók kiválasztva, üres lista
         — ugyanaz a logika, mint a `/my lifecycle` `campaign` autocomplete-jénél."""
-        owner = await asyncio.to_thread(_channel_owner, interaction.channel_id)
+        owner = await asyncio.to_thread(_unique_channel_owner, interaction.channel_id)
         if owner is None:
             return []
         account_val = interaction.namespace.account
@@ -579,7 +608,7 @@ class MyCommandsCog(commands.GroupCog, group_name="my"):
         A fiókot a `account` mezőből olvassuk (namespace); ha még nincs megadva,
         vagy nem az OM-hez tartozik, üres listát adunk (előbb fiókot kell választani).
         """
-        owner = await asyncio.to_thread(_channel_owner, interaction.channel_id)
+        owner = await asyncio.to_thread(_unique_channel_owner, interaction.channel_id)
         if owner is None:
             return []
         account_val = interaction.namespace.account

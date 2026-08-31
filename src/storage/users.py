@@ -11,6 +11,9 @@ from __future__ import annotations
 from typing import Any
 
 from src.storage.supabase_client import get_supabase
+from src.utils.logging import get_logger
+
+log = get_logger(__name__)
 
 _TABLE = "users"
 
@@ -28,21 +31,65 @@ def get_user_by_discord_id(discord_user_id: str) -> dict[str, Any] | None:
     return res.data[0] if res.data else None
 
 
-def get_user_by_alerts_channel(channel_id: str | int) -> dict[str, Any] | None:
-    """A user, akinek az `alerts_channel_id`-ja a megadott csatorna. None ha nincs.
+def find_users_by_alerts_channel(channel_id: str | int) -> list[dict[str, Any]]:
+    """MINDEN user, akinek ez a csatorna az alert csatornája — `id` szerint rendezve.
 
-    A 22. lépés csatorna-szkópolt `/my` parancsai ezzel azonosítják az "aktuális
-    OM"-et: melyik OM saját #alerts csatornájából fut a parancs.
+    Külön függvény, mert két hívónak más kell:
+      - a csatorna-szkópolt parancsoknak az EGYÉRTELMŰ OM (lásd
+        `get_user_by_alerts_channel`),
+      - a `/user set-channel` validációjának a TELJES lista (kit ütnék le).
+
+    A rendezés nem kozmetika: enélkül a PostgREST sorrendje nem garantált, és
+    pont ez okozta, hogy egy ütközés véletlenszerűen hol az egyik, hol a másik
+    usert adta vissza.
     """
     res = (
         get_supabase()
         .table(_TABLE)
         .select("*")
         .eq("alerts_channel_id", str(channel_id))
-        .limit(1)
+        .order("id")
         .execute()
     )
-    return res.data[0] if res.data else None
+    return res.data or []
+
+
+def get_user_by_alerts_channel(channel_id: str | int) -> dict[str, Any] | None:
+    """A csatorna EGYÉRTELMŰ OM-je. Három kimenet — a hívónak mindet kezelnie kell:
+
+        {...user sor...}                          — pontosan egy user
+        None                                      — egy sincs
+        {"ambiguous": True, "matches": [...]}     — TÖBB user (ütközés)
+
+    A 22. lépés csatorna-szkópolt `/my` parancsai ezzel azonosítják az "aktuális
+    OM"-et: melyik OM saját #alerts csatornájából fut a parancs.
+
+    MIÉRT NEM VÁLASZT ÜTKÖZÉSNÉL: korábban `.limit(1)` volt, rendezés nélkül —
+    ha (elgépelés vagy átmeneti állapot miatt) két usernek ugyanaz az
+    `alerts_channel_id`-ja, a függvény NEM DETERMINISZTIKUSAN adta vissza az
+    egyiket. Élesben elő is fordult (Adam_PlanSmart és Máté azonos csatornán),
+    és a `/my` parancsok emiatt a rossz user hatókörén dolgozhattak: idegen
+    kampányok összefoglalója, idegen kampány némítása. Egy önkényes választás
+    itt csendes, rossz jogosultság-döntés — ezért inkább jelezzük az ütközést,
+    és a hívó fail-closed módon utasítsa el a parancsot.
+
+    Az `ambiguous` jelölő ugyanaz a minta, mint a `/campaign` és a `/my account`
+    feloldásánál (`{"ambiguous": True, "matches": [...]}`) — a hívók már ismerik.
+    """
+    rows = find_users_by_alerts_channel(channel_id)
+    if not rows:
+        return None
+    if len(rows) == 1:
+        return rows[0]
+
+    log.warning(
+        "Csatorna-ütközés: a(z) %s csatornához %d user tartozik (%s) — "
+        "a csatorna-szkópolt parancsok itt nem tudják eldönteni, KI az OM. "
+        "Egy usernél a `/user set-channel` paranccsal állíts be másik csatornát.",
+        channel_id, len(rows),
+        ", ".join(f"#{r.get('id')} {r.get('display_name') or '?'}" for r in rows),
+    )
+    return {"ambiguous": True, "matches": rows}
 
 
 def get_user(user_id: int) -> dict[str, Any] | None:
