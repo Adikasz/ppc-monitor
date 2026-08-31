@@ -52,33 +52,51 @@ def _tz() -> ZoneInfo:
     return ZoneInfo(get_config().timezone or "UTC")
 
 
+# Hétfőn a "tegnap" nem vasárnap, hanem PÉNTEK — lásd `daily_range`.
+_MONDAY = 0
+_MONDAY_LOOKBACK_DAYS = 3
+
+
 def daily_range(now: datetime | None = None) -> tuple[datetime, datetime]:
-    """A TELJES előző naptári nap a konfigurált időzónában: tegnap 00:00 → ma 00:00.
+    """Egy TELJES naptári nap a konfigurált időzónában: az előző munkanap 00:00 → 00:00.
 
     A visszaadott pár közvetlenül a lekérdezés két határa lesz:
         detected_at >= from_dt  ÉS  detected_at < to_dt
     (lásd `storage.alerts.get_alerts_for_user_in_range` — `.gte()` / `.lt()`).
 
     Fél-nyitott intervallum, szándékosan:
-      - az alsó határ INKLUZÍV → a tegnap 00:00:00-kor keletkezett alert benne van
-      - a felső határ EXKLUZÍV → a ma 00:00:00-kor keletkezett alert már a
-        következő napé, viszont a tegnap 23:59:59.999999 még benne van
+      - az alsó határ INKLUZÍV → a nap 00:00:00-kor keletkezett alert benne van
+      - a felső határ EXKLUZÍV → a következő nap 00:00:00-kor keletkezett alert
+        már a következő napé, viszont a 23:59:59.999999 még benne van
     Ez pontosabb, mint egy `<= 23:59:59` felső határ, ami a másodperc törtrészében
     keletkezett riasztásokat némán elhagyná.
 
-    NEM gördülő 24 óra: a `now`-ból CSAK a naptári napot vesszük, az időt
-    nullázzuk — így teljesen mindegy, hogy a scheduler 09:00-kor futtatja
-    (scheduler.py: cron hour=9, day_of_week="tue-fri"), vagy valaki kézzel
-    kéri le a `/summary`-val délután; az ablak ugyanaz.
+    HÉTFŐI KIVÉTEL — az ablak PÉNTEK 00:00 → SZOMBAT 00:00, nem vasárnap:
+        A napi összefoglaló hétfőtől péntekig fut (scheduler.py: cron hour=9,
+        day_of_week="mon-fri"). Ha hétfőn is a naptári "tegnapot" néznénk, a
+        vasárnapot kapnánk — azt viszont a hétvégi összefoglaló (péntek 22:00 →
+        hétfő 08:00) már lefedi, a PÉNTEKI nap pedig kimaradna a napi
+        összefoglalók sorozatából (kedden a hétfőt kapjuk, tehát a péntekre
+        soha nem kerülne sor). Ezért hétfőn 3 napot lépünk vissza, nem 1-et.
 
-    Óraátállításkor is a teljes napot fedi: a `today0 - timedelta(days=1)`
-    fali-óra aritmetika (a tegnapi 00:00-t adja, nem "24 órával korábbat"),
-    így az őszi nap 25, a tavaszi 23 órányi valós időt jelent.
+        Hétfő reggel így KÉT KÜLÖN üzenet megy ki: ez a napi (péntekről) és a
+        hétvégi összefoglaló (szombat–vasárnapról). Szándékosan nincsenek
+        összevonva — két külön időszak, két külön riport.
+
+    NEM gördülő 24 óra: a `now`-ból CSAK a naptári napot vesszük, az időt
+    nullázzuk — így teljesen mindegy, hogy a scheduler 09:00-kor futtatja, vagy
+    valaki kézzel kéri le a `/summary`-val délután; az ablak ugyanaz.
+
+    Óraátállításkor is a teljes napot fedi: a `today0 - timedelta(days=N)`
+    fali-óra aritmetika (a korábbi nap 00:00-ját adja, nem "N×24 órával
+    korábbat"), így az őszi nap 25, a tavaszi 23 órányi valós időt jelent.
     """
     tz = _tz()
     now = now.astimezone(tz) if now else datetime.now(tz)
     today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return today0 - timedelta(days=1), today0
+    back = _MONDAY_LOOKBACK_DAYS if now.weekday() == _MONDAY else 1
+    from_dt = today0 - timedelta(days=back)
+    return from_dt, from_dt + timedelta(days=1)
 
 
 def weekend_range(now: datetime | None = None) -> tuple[datetime, datetime]:
@@ -130,11 +148,11 @@ def workweek_range(now: datetime | None = None) -> tuple[datetime, datetime]:
     Óraátállításkor is a teljes naptári napokat fedi: a `timedelta` itt
     fali-óra aritmetika (hétfő 00:00 + 5 nap = szombat 00:00), nem "120 óra".
 
-    FIGYELEM: az ütemezett job péntek 17:05-kor fut (a munkanap végén), amikor
-    a péntek még nem telt el teljesen. Az ablak felső határa szándékosan mégis
+    FIGYELEM: az ütemezett job péntek 15:05-kor fut (ügyfélkérés), amikor a
+    péntek még nem telt el teljesen. Az ablak felső határa szándékosan mégis
     szombat 00:00 — így a szombat 00:00-ig keletkező riasztások mind beleesnek,
-    és az ablak nem függ a futás órájától. A 17:05 után keletkező pénteki
-    riasztások értelemszerűen már nem szerepelhetnek a 17:05-kor kiküldött
+    és az ablak nem függ a futás órájától. A 15:05 után keletkező pénteki
+    riasztások értelemszerűen már nem szerepelhetnek a 15:05-kor kiküldött
     üzenetben (lásd a scheduler kommentjét a vállalt résről).
     """
     tz = _tz()

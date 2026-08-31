@@ -9,11 +9,10 @@ Miért kell: az insight scan naponta EGYSZER, 08:00-kor fut (scheduler cron),
 parancs UGYANAZT a függvényt hívja, amit a cron job — nem egy párhuzamos
 másolatot —, így amit itt látsz, az pontosan az, amit reggel kapnál.
 
-SZÁNDÉKOSAN NEM bypassolja a csendes időt. Ha bypassolna, egy este lefuttatott
-teszt sikeresnek látszana, miközben a 08:00-s éles futás némán elhalna. Ehelyett
-a válasz KÜLÖN kiírja, hány insightot nyomott el a csendes idő — így a
-konfigurációs hiba (pl. QUIET_HOURS_END=9 mellett a 08:00-s scan minden
-insightja elnyomódik) azonnal látszik, ahelyett hogy „0 insight"-ként jelenne meg.
+A scan (ütemezetten és innen is) CSAK generál és elment — Discord üzenetet nem
+küld. Az insightok a napi/heti összefoglalóban jutnak el az OM-ekhez, egyetlen
+üzenetben (lásd `scheduler.daily_insight_scan`). Ezért ez a parancs sem küld
+semmit a csatornákra: a válasza a scan számlálói, nem a kiküldött üzenetek.
 """
 from __future__ import annotations
 
@@ -24,7 +23,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from src.config import get_config
+from src.bot.commands._common import (
+    admin_channel_id as _admin_channel_id,  # noqa: F401 — konzisztens felület
+    is_admin_channel as _is_admin_channel,
+    reply_or_channel,
+    resolve_client as _resolve_client,
+)
 from src.monitoring import scheduler as scheduler_mod
 from src.storage import audit
 from src.storage import clients as clients_storage
@@ -38,41 +42,6 @@ log = get_logger(__name__)
 _INTERACTION_TOKEN_SECONDS = 15 * 60
 
 
-def _admin_channel_id() -> int | None:
-    raw = get_config().discord_admin_channel_id
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        log.warning("DISCORD_ADMIN_CHANNEL_ID nem szám: %r — auth check kikapcsol", raw)
-        return None
-
-
-def _is_admin_channel(interaction: discord.Interaction) -> bool:
-    """True, ha az interakció az admin csatornában történt (vagy nincs konfigurálva)."""
-    admin = _admin_channel_id()
-    if admin is None:
-        return True
-    return interaction.channel_id == admin
-
-
-def _resolve_client(value: str) -> dict | None:
-    """Ügyfél feloldása név VAGY numerikus ID alapján (ugyanaz, mint a /client-nél).
-
-    Ha a bemenet csak számjegy, előbb ID-ként próbáljuk; ha nincs ilyen ID,
-    névként is megkíséreljük.
-    """
-    val = (value or "").strip()
-    if not val:
-        return None
-    if val.isdigit():
-        row = clients_storage.get_client(int(val))
-        if row is not None:
-            return row
-    return clients_storage.get_client_by_name(val)
-
-
 def _format_report(stats: dict[str, int], *, scope: str, elapsed_s: float) -> str:
     """A scan eredménye emberi formában.
 
@@ -83,8 +52,7 @@ def _format_report(stats: dict[str, int], *, scope: str, elapsed_s: float) -> st
     insights = stats.get("insights", 0)
     skipped = stats.get("skipped_no_history", 0)
     failed = stats.get("failed", 0)
-    routed = stats.get("routed", 0)
-    quiet = stats.get("quiet_hours", 0)
+    summarized = stats.get("summarized", 0)
 
     if total == 0:
         return (
@@ -101,12 +69,11 @@ def _format_report(stats: dict[str, int], *, scope: str, elapsed_s: float) -> st
         f"💡 **{insights}** insight generálva",
     ]
 
-    if routed or quiet:
-        sorok.append(f"📤 ebből kiküldve: **{routed}**")
-    if quiet:
+    if summarized:
         sorok.append(
-            f"🔇 csendes idő miatt elnyomva: **{quiet}** — "
-            f"*ezek a DB-be bekerültek `suppressed` státusszal, de nem mentek ki*"
+            f"📥 **{summarized}** elmentve a napi összefoglalóhoz — "
+            f"*a scan nem küld önálló üzenetet, az insightok a reggeli "
+            f"összefoglalóban mennek ki*"
         )
     if skipped:
         sorok.append(
@@ -231,28 +198,7 @@ class InsightsCog(commands.GroupCog, group_name="insight"):
     # ------------------------------------------------------------------
 
     async def _reply(self, interaction: discord.Interaction, content: str) -> None:
-        """Válasz a followupon; ha az interakciós token lejárt, a csatornába.
-
-        Egy teljes scan túlfuthat a Discord 15 perces interakciós ablakán —
-        ilyenkor a `followup.send` 401/404-gyel elszáll, és az admin semmit nem
-        látna a több perces várakozás után.
-        """
-        try:
-            await interaction.followup.send(content)
-            return
-        except discord.HTTPException as exc:
-            log.warning(
-                "Insight scan válasz: a followup elszállt (%s) — csatornába küldjük", exc,
-            )
-
-        channel = interaction.channel
-        if channel is None:
-            log.error("Insight scan válasz: nincs csatorna a fallbackhez — elveszett")
-            return
-        try:
-            await channel.send(f"<@{interaction.user.id}>\n{content}")
-        except Exception:  # noqa: BLE001
-            log.exception("Insight scan válasz: a csatornába küldés is elszállt")
+        await reply_or_channel(interaction, content, logger=log, what="Insight scan")
 
 
 async def setup(bot: commands.Bot) -> None:

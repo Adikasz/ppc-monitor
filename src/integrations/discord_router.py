@@ -545,9 +545,12 @@ def _format_summary(
                 f"✅ **Hétvégi összefoglaló** — {from_label} → {to_label}\n"
                 f"A hétvégén nem volt anomália. Minden kampány rendben. 🎉"
             )
+        # NEM "tegnap": hétfőn a napi összefoglaló a PÉNTEKI napot fedi (lásd
+        # `monitoring.summary.daily_range` hétfői kivétele), ott a "tegnap" szó
+        # hazugság lenne. A pontos dátum a fejlécben van.
         return (
             f"✅ **Napi összefoglaló** — {from_label}\n"
-            f"Tegnap nem volt anomália. Minden kampány rendben. 🎉"
+            f"Ezen a napon nem volt anomália. Minden kampány rendben. 🎉"
         )
 
     if kind == "workweek":
@@ -564,7 +567,7 @@ def _format_summary(
     else:
         header = f"📊 **Napi összefoglaló** — {from_label}"
         issues_title = "**Problémák:**"
-        alerts_label = "Alertek tegnap"
+        alerts_label = "Alertek aznap"
 
     # Az összesítő sor MINDIG a teljes darabszám (nem a kilistázott soroké).
     lines = [
