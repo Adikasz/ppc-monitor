@@ -4,16 +4,24 @@
 Parancsok:
     /discover client client:<név vagy id>  — egy ügyfél kampány-discoveryje
     /discover all                          — minden aktív ügyfél (csak admin csatorna)
+    /discover google                       — a Google-fiókos ügyfelek (csak admin csatorna)
 
 A discovery lekéri az ügyfél hirdetési fiókjaihoz tartozó kampányokat a
 Meta/Google API-ból, és szinkronizálja a `campaigns` táblát (insert/update/
 soft-delete). A részleges hibák (pl. egy fiók API-hibája) NEM állítják le a
 futást — az eredmény `errors` listájában jelennek meg.
 
+A discovery ÜTEMEZETTEN IS FUT (minden nap 03:30, lásd
+`scheduler.daily_discovery_job`). Ezek a parancsok tehát nem az egyetlen útja a
+kampánylista frissülésének, hanem a napi job KÉZI futtatásai — és pontosan
+UGYANAZT a függvényt hívják (`/discover all` szűrő nélkül, `/discover google` a
+Google-fiókos ügyfelek ID-jaival). Nincs külön "kézi változat", ami
+elsodródhatna az ütemezettől.
+
 Megjegyzések:
   - A discovery hálózati hívásokat végez → asyncio.to_thread() + defer
     (a Discord followup ablak 15 perc, ez bőven elég).
-  - A /discover all admin csatornára van korlátozva (sok ügyfélen futhat).
+  - A /discover all és /discover google admin csatornára van korlátozva.
 """
 from __future__ import annotations
 
@@ -25,6 +33,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from src.config import get_config
+from src.monitoring import scheduler as scheduler_mod
 from src.monitoring.discovery import discover_campaigns_for_client
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import clients as clients_storage
@@ -79,6 +88,47 @@ def _summary_line(result: dict[str, Any]) -> str:
     if result["errors"]:
         line += f" · ⚠️ {len(result['errors'])} hiba"
     return line
+
+
+def _job_had_problems(stats: dict[str, Any]) -> bool:
+    """Volt-e bármilyen hiba a job futásában (embed-szín döntéshez)."""
+    return bool(stats.get("errors") or stats.get("failed_clients"))
+
+
+def _job_description(stats: dict[str, Any], *, scope: str | None = None) -> str:
+    """A `daily_discovery_job` eredményének embed-leírása, ügyfelenkénti sorokkal.
+
+    A fejléc SZÁNDÉKOSAN a fiók-szintű számokat is mutatja (`accounts_failed`):
+    élesben pont az a néma hiba, amikor néhány ügynökségi fiók jogosultsági
+    hiba miatt kimarad, és az összesítő csak annyit mond, hogy "0 új kampány".
+    """
+    header = (
+        f"**Összesítő ({stats['clients']} ügyfél, {stats['accounts']} fiók):** "
+        f"📊 {stats['inserted']} új · {stats['updated']} frissítve · "
+        f"{stats['deactivated']} deaktiválva"
+    )
+    if scope:
+        header = f"*Hatókör: {scope}*\n" + header
+    if stats["accounts_failed"]:
+        header += f" · 🚫 {stats['accounts_failed']} fiók nem elérhető"
+    if stats["errors"] or stats["failed_clients"]:
+        header += f" · ⚠️ {stats['errors']} hiba"
+        if stats["failed_clients"]:
+            header += f" ({stats['failed_clients']} ügyfél elszállt)"
+    description = header + "\n\n"
+
+    # Description-alapú lista, a 4096 karakteres embed limit alatt tartva.
+    for entry in stats.get("per_client") or []:
+        name = entry.get("name") or f"#{entry.get('client_id')}"
+        if entry.get("error"):
+            line = f"❌ **{name}** — `{entry['error']}`"
+        else:
+            line = f"**{name}** — {_summary_line(entry['result'])}"
+        if len(description) + len(line) + 1 > 3900:
+            description += "… (a többi ügyfél nem fért ki — lásd logok)"
+            break
+        description += line + "\n"
+    return description
 
 
 def _format_errors(errors: list[dict[str, Any]]) -> str:
@@ -156,48 +206,19 @@ class DiscoveryCog(commands.GroupCog, group_name="discover"):
             )
             return
 
-        clients = await asyncio.to_thread(clients_storage.list_clients, active_only=True)
-        if not clients:
+        log.info("/discover all indítva (a napi 03:30-s job kézi futtatása)")
+
+        # UGYANAZ a függvény, amit a hajnali cron hív — nincs külön "kézi
+        # változat", ami elsodródhatna az ütemezettől.
+        stats = await scheduler_mod.daily_discovery_job()
+        if not stats["clients"]:
             await interaction.followup.send("Nincs aktív ügyfél, amin futtatható lenne a discovery.")
             return
 
-        log.info("/discover all indítva: %d aktív ügyfél", len(clients))
-
-        totals = {"inserted": 0, "updated": 0, "deactivated": 0, "errors": 0}
-        per_client_lines: list[str] = []
-
-        for c in clients:
-            try:
-                result = await asyncio.to_thread(discover_campaigns_for_client, c["id"])
-            except Exception as exc:  # noqa: BLE001
-                log.exception("Discovery fatális hiba (client_id=%s)", c["id"])
-                per_client_lines.append(f"**{c['name']}** — ❌ `{exc}`")
-                totals["errors"] += 1
-                continue
-
-            totals["inserted"] += result["inserted"]
-            totals["updated"] += result["updated"]
-            totals["deactivated"] += result["deactivated"]
-            totals["errors"] += len(result["errors"])
-            per_client_lines.append(f"**{c['name']}** — {_summary_line(result)}")
-
-        # Description-alapú lista, a 4096 karakteres embed limit alatt tartva.
-        header = (
-            f"**Összesítő ({len(clients)} ügyfél):** "
-            f"📊 {totals['inserted']} új · {totals['updated']} frissítve · "
-            f"{totals['deactivated']} deaktiválva · ⚠️ {totals['errors']} hiba\n\n"
-        )
-        description = header
-        for line in per_client_lines:
-            if len(description) + len(line) + 1 > 3900:
-                description += "… (a többi ügyfél nem fért ki)"
-                break
-            description += line + "\n"
-
         embed = discord.Embed(
             title="🔍 Discovery — összes aktív ügyfél",
-            description=description,
-            color=discord.Color.orange() if totals["errors"] else discord.Color.green(),
+            description=_job_description(stats),
+            color=discord.Color.orange() if _job_had_problems(stats) else discord.Color.green(),
         )
         await interaction.followup.send(embed=embed)
 
@@ -238,43 +259,15 @@ class DiscoveryCog(commands.GroupCog, group_name="discover"):
             len(google_accounts), len(client_ids),
         )
 
-        totals = {"inserted": 0, "updated": 0, "deactivated": 0, "errors": 0}
-        per_client_lines: list[str] = []
-
-        for cid in client_ids:
-            c = await asyncio.to_thread(clients_storage.get_client, cid)
-            cname = (c or {}).get("name", f"#{cid}")
-            try:
-                result = await asyncio.to_thread(discover_campaigns_for_client, cid)
-            except Exception as exc:  # noqa: BLE001
-                log.exception("Google discovery fatális hiba (client_id=%s)", cid)
-                per_client_lines.append(f"❌ **{cname}** — `{exc}`")
-                totals["errors"] += 1
-                continue
-
-            totals["inserted"] += result["inserted"]
-            totals["updated"] += result["updated"]
-            totals["deactivated"] += result["deactivated"]
-            totals["errors"] += len(result["errors"])
-            note = f" ⚠️ {len(result['errors'])} hiba" if result["errors"] else ""
-            per_client_lines.append(f"✅ **{cname}**: {result['inserted']} kampány{note}")
-
-        header = (
-            f"**Összesen: {totals['inserted']} új kampány** "
-            f"({len(client_ids)} Google-ügyfél · {totals['updated']} frissítve · "
-            f"{totals['deactivated']} deaktiválva · ⚠️ {totals['errors']} hiba)\n\n"
-        )
-        description = header
-        for line in per_client_lines:
-            if len(description) + len(line) + 1 > 3900:
-                description += "… (a többi ügyfél nem fért ki)"
-                break
-            description += line + "\n"
+        # Ugyanaz a job, csak az ügyfélkörre szűkítve — a Google-fiókos
+        # ügyfelekre. (A discovery ügyfél-szintű: ezeknél a MÉTA fiókok is
+        # frissülnek, ami nem baj — a parancs a Google-kör lefedését garantálja.)
+        stats = await scheduler_mod.daily_discovery_job(client_ids=client_ids)
 
         embed = discord.Embed(
             title="🔍 Discovery — Google fiókok",
-            description=description,
-            color=discord.Color.orange() if totals["errors"] else discord.Color.green(),
+            description=_job_description(stats, scope=f"{len(client_ids)} Google-ügyfél"),
+            color=discord.Color.orange() if _job_had_problems(stats) else discord.Color.green(),
         )
         await interaction.followup.send(embed=embed)
 
