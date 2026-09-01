@@ -1,12 +1,14 @@
 """
-ClickUp anomália-task integráció — struktúra, mapping, routing, hiba-izoláció.
+ClickUp anomália-task integráció — mapping, routing, hiba-izoláció.
 
 Hat elvárás áll a tesztek mögött:
 
-1. A SETUP IDEMPOTENS. A `/clickup setup` és a `setup-manager` név szerint
-   keres, és csak ha nincs találat, hoz létre újat — különben minden
-   újrafuttatás egy újabb "PPC Anomália Riasztások" Space-t szülne, és a
-   riasztások szétszóródnának több struktúra között.
+1. ÉRVÉNYTELEN AZONOSÍTÓ NEM KERÜLHET AZ ADATBÁZISBA. A ClickUp struktúrát
+   (Space → Folderek → Listák) az ügyfél hozza létre KÉZZEL, és a kimásolt
+   ID-kat adja meg a `/clickup setup-manager`-nek. A parancs ezért MENTÉS
+   ELŐTT ellenőrzi a listát a ClickUp API-n, és azt is, hogy tényleg a
+   megadott Folderben van-e: egy elgépelt lista-ID némán nyelné el az összes
+   későbbi riasztás-taskot.
 
 2. A TASK SZÖVEGE UGYANONNAN JÖN, MINT A DISCORD ÜZENETÉ. Egyetlen közös
    formázó (`integrations/alert_content.py`) adja a kliens/platform címkét, az
@@ -25,7 +27,7 @@ Hat elvárás áll a tesztek mögött:
    (benne a task linkje) → task frissül (benne az üzenet ugrólinkje). Ez a
    sorrend a funkció lényege, ezért külön, hívás-naplóval ellenőrizzük.
 
-6. A TÁBLÁK HIÁNYA NEM DÖNTI ROMBA A RIASZTÁST. Ha a 0014 migration még nem
+6. A TÁBLA HIÁNYA NEM DÖNTI ROMBA A RIASZTÁST. Ha a 0014 migration még nem
    futott le, a storage réteg warninggal degradál (None / False), nem dob.
 """
 from __future__ import annotations
@@ -40,10 +42,11 @@ import pytest
 from src.bot.commands import clickup as clickup_cmd
 from src.integrations import alert_content
 from src.integrations import clickup_admin
+from src.integrations.clickup_admin import ClickUpAdminError
 from src.integrations import clickup_router
 from src.integrations import discord_router
 from src.monitoring import router
-from src.storage import clickup_structure as clickup_storage
+from src.storage import clickup_mapping as clickup_storage
 
 
 # ===========================================================================
@@ -146,7 +149,7 @@ def _capture(caplog, *logger_names, level=logging.WARNING):
 
 _LOG_ROUTER = "src.monitoring.router"
 _LOG_TASK = "src.integrations.clickup_router"
-_LOG_STORAGE = "src.storage.clickup_structure"
+_LOG_STORAGE = "src.storage.clickup_mapping"
 
 
 class _Interaction:
@@ -267,46 +270,8 @@ _SENT = {"channel_id": 111, "message_id": 222, "guild_id": 333}
 
 
 # ===========================================================================
-# 1) Storage — clickup_structure + clickup_manager_mapping CRUD
+# 1) Storage — clickup_manager_mapping CRUD
 # ===========================================================================
-
-def test_space_save_and_read_roundtrip():
-    """A mentett Space visszaolvasható ugyanazzal a workspace+név kulccsal."""
-    sb = _SB()
-    with mock.patch.object(clickup_storage, "get_supabase", return_value=sb):
-        saved = clickup_storage.save_space("TEAM1", "PPC Anomália Riasztások", "SP1")
-        found = clickup_storage.get_space("TEAM1", "PPC Anomália Riasztások")
-
-    assert saved is not None
-    assert found is not None
-    assert found["clickup_space_id"] == "SP1"
-
-
-def test_space_save_is_idempotent_on_team_and_name():
-    """Kétszeri setup ugyanazt a sort frissíti — nem születik második Space-sor."""
-    sb = _SB()
-    with mock.patch.object(clickup_storage, "get_supabase", return_value=sb):
-        clickup_storage.save_space("TEAM1", "PPC Anomália Riasztások", "SP1")
-        clickup_storage.save_space("TEAM1", "PPC Anomália Riasztások", "SP2")
-
-    rows = sb.store["clickup_structure"]
-    assert len(rows) == 1
-    assert rows[0]["clickup_space_id"] == "SP2"
-
-
-def test_space_from_another_workspace_is_not_returned():
-    """Más `CLICKUP_TEAM_ID` → "nincs setup", nem egy idegen workspace Space-e.
-
-    Enélkül a task-létrehozás egy másik workspace listájára menne, és 404-gyel
-    némán elhalna.
-    """
-    sb = _SB()
-    with mock.patch.object(clickup_storage, "get_supabase", return_value=sb):
-        clickup_storage.save_space("TEAM1", "PPC Anomália Riasztások", "SP1")
-        masik = clickup_storage.get_space("TEAM2", "PPC Anomália Riasztások")
-
-    assert masik is None
-
 
 def test_mapping_crud_roundtrip_and_idempotency():
     """Mapping létrehozás → olvasás → frissítés → törlés, user_id kulcsra."""
@@ -356,8 +321,6 @@ def test_storage_degrades_when_the_migration_has_not_run(caplog):
     with mock.patch.object(clickup_storage, "get_supabase", return_value=boom), \
          _capture(caplog, _LOG_STORAGE):
         assert clickup_storage.get_mapping_for_user(1) is None
-        assert clickup_storage.get_space("TEAM1", "X") is None
-        assert clickup_storage.save_space("TEAM1", "X", "SP1") is None
         assert clickup_storage.upsert_mapping(
             1, clickup_folder_id="F", clickup_list_id="L") is None
         assert clickup_storage.list_mappings() == []
@@ -367,7 +330,7 @@ def test_storage_degrades_when_the_migration_has_not_run(caplog):
 
 
 # ===========================================================================
-# 2) clickup_admin — idempotens struktúra-építés, mockolt ClickUp API
+# 2) clickup_admin — azonosító-beolvasás és ellenőrzés (mockolt ClickUp API)
 # ===========================================================================
 
 def _api(responses: dict):
@@ -389,79 +352,98 @@ def _api(responses: dict):
 _CFG = SimpleNamespace(clickup_api_token="pk_test", clickup_team_id="TEAM1")
 
 
-@pytest.mark.asyncio
-async def test_ensure_space_reuses_the_existing_space_by_name():
-    """A már létező Space-t NEM hozza létre újra (idempotencia)."""
-    request, calls = _api({
-        ("GET", "/team/TEAM1/space"): (200, {"spaces": [
-            {"id": "SP9", "name": "PPC Anomália Riasztások"},
-            {"id": "SP1", "name": "Valami más"},
-        ]}),
-    })
-    with mock.patch.object(clickup_admin, "get_config", return_value=_CFG), \
-         mock.patch.object(clickup_admin.requests, "request", new=request):
-        space = await clickup_admin.ensure_space()
-
-    assert space == {"id": "SP9", "name": "PPC Anomália Riasztások", "created": False}
-    assert all(m != "POST" for m, _ in calls), "meglévő Space-nél nincs létrehozás"
+def test_parse_id_accepts_raw_ids_and_pasted_links():
+    """Nyers ID és beillesztett ClickUp link is elfogadott (Copy link)."""
+    assert clickup_admin.parse_id("901234567890", "list") == "901234567890"
+    assert clickup_admin.parse_id("  901234567890  ", "list") == "901234567890"
+    assert clickup_admin.parse_id(
+        "https://app.clickup.com/9012345/v/li/901234567890", "list") == "901234567890"
+    # Discord a beillesztett linket <>-be teheti a link-előnézet elnyomásához.
+    assert clickup_admin.parse_id(
+        "<https://app.clickup.com/9012345/v/l/901234567890>", "list") == "901234567890"
+    assert clickup_admin.parse_id(
+        "https://app.clickup.com/9012345/v/o/f/90123456", "folder") == "90123456"
+    assert clickup_admin.parse_id(
+        "https://app.clickup.com/9012345/v/f/90123456", "folder") == "90123456"
 
 
-@pytest.mark.asyncio
-async def test_ensure_space_creates_when_missing():
-    request, calls = _api({
-        ("GET", "/team/TEAM1/space"): (200, {"spaces": [{"id": "SP1", "name": "Más"}]}),
-        ("POST", "/team/TEAM1/space"): (200, {"id": "SP9", "name": "PPC Anomália Riasztások"}),
-    })
-    with mock.patch.object(clickup_admin, "get_config", return_value=_CFG), \
-         mock.patch.object(clickup_admin.requests, "request", new=request):
-        space = await clickup_admin.ensure_space()
+def test_parse_id_refuses_to_guess():
+    """Ismeretlen alakú linkből NEM tippelünk azonosítót.
 
-    assert space["id"] == "SP9"
-    assert space["created"] is True
-    assert ("POST", "https://api.clickup.com/api/v2/team/TEAM1/space") in calls
-
-
-@pytest.mark.asyncio
-async def test_ensure_folder_and_list_are_idempotent():
-    """Meglévő Folder + List esetén egyetlen POST sem megy ki."""
-    request, calls = _api({
-        ("GET", "/space/SP9/folder"): (200, {"folders": [{"id": "FD1", "name": "Dávid"}]}),
-        ("GET", "/folder/FD1/list"): (200, {"lists": [
-            {"id": "LS1", "name": "Anomália riasztások"},
-        ]}),
-    })
-    with mock.patch.object(clickup_admin, "get_config", return_value=_CFG), \
-         mock.patch.object(clickup_admin.requests, "request", new=request):
-        folder = await clickup_admin.ensure_folder("SP9", "Dávid")
-        lista = await clickup_admin.ensure_list(folder["id"])
-
-    assert (folder["id"], folder["created"]) == ("FD1", False)
-    assert (lista["id"], lista["created"]) == ("LS1", False)
-    assert all(m != "POST" for m, _ in calls)
-
-
-@pytest.mark.asyncio
-async def test_list_creation_does_not_send_custom_statuses():
-    """A List NÉV NÉLKÜL más mezőt nem kap.
-
-    A ClickUp v2 "Create List" végpontja nem tud egyedi TASK-státuszokat
-    definiálni (az ottani `status` a lista SZÍNE). Ha valaha bekerülne egy
-    kitalált státusznév, ez a teszt megfogja — élesben 400-at kapnánk.
+    Egy Folder-nézet URL-je a Space ID-jával is végződhet — az "utolsó
+    számjegy-szegmens" heurisztika pont azt a néma, rossz ID-t mentené el,
+    amit a validáció el akar kerülni.
     """
-    kuldott: dict = {}
+    assert clickup_admin.parse_id("https://app.clickup.com/9012345/v/li/", "list") is None
+    assert clickup_admin.parse_id("https://app.clickup.com/9012345/valami/42", "list") is None
+    assert clickup_admin.parse_id("", "list") is None
+    assert clickup_admin.parse_id(None, "list") is None
+    # A lista-mintát nem fogadjuk el folderként (és fordítva sem).
+    assert clickup_admin.parse_id(
+        "https://app.clickup.com/9012345/v/li/901234567890", "folder") is None
 
-    def _request(method, url, **kw):
-        if method == "POST":
-            kuldott.update(kw.get("json") or {})
-            return SimpleNamespace(status_code=200, text="{}",
-                                   json=lambda: {"id": "LS9", "name": "Anomália riasztások"})
-        return SimpleNamespace(status_code=200, text="{}", json=lambda: {"lists": []})
 
-    with mock.patch.object(clickup_admin, "get_config", return_value=_CFG), \
-         mock.patch.object(clickup_admin.requests, "request", new=_request):
-        await clickup_admin.ensure_list("FD1")
+@pytest.mark.asyncio
+async def test_get_list_returns_the_owning_folder():
+    """A lista lekérdezése megmondja, MELYIK Folderben van — ez a kereszt-ellenőrzés alapja."""
+    request, calls = _api({
+        ("GET", "/list/LS1"): (200, {
+            "id": "LS1", "name": "Anomália riasztások",
+            "folder": {"id": "FD1", "name": "Dávid", "hidden": False},
+            "space": {"id": "SP9", "name": "PPC Anomália Riasztások"},
+        }),
+    })
+    with mock.patch.object(clickup_admin, "get_config", return_value=_CFG),          mock.patch.object(clickup_admin.requests, "request", new=request):
+        lista = await clickup_admin.get_list("LS1")
 
-    assert kuldott == {"name": "Anomália riasztások"}
+    assert lista["name"] == "Anomália riasztások"
+    assert lista["folder_id"] == "FD1"
+    assert lista["folder_name"] == "Dávid"
+    assert lista["folder_hidden"] is False
+    assert all(m == "GET" for m, _ in calls), "az ellenőrzés csak olvas, nem hoz létre semmit"
+
+
+@pytest.mark.asyncio
+async def test_get_list_flags_a_folderless_list():
+    """Folderless listánál a ClickUp REJTETT foldert ad vissza — ez nem valódi Folder."""
+    request, _ = _api({
+        ("GET", "/list/LS2"): (200, {
+            "id": "LS2", "name": "Magányos lista",
+            "folder": {"id": "HIDDEN1", "name": "hidden", "hidden": True},
+        }),
+    })
+    with mock.patch.object(clickup_admin, "get_config", return_value=_CFG),          mock.patch.object(clickup_admin.requests, "request", new=request):
+        lista = await clickup_admin.get_list("LS2")
+
+    assert lista["folder_hidden"] is True
+    assert lista["folder_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_list_raises_a_human_message_when_missing():
+    request, _ = _api({("GET", "/list/NINCS"): (404, {})})
+    with mock.patch.object(clickup_admin, "get_config", return_value=_CFG),          mock.patch.object(clickup_admin.requests, "request", new=request):
+        with pytest.raises(clickup_admin.ClickUpAdminError) as exc:
+            await clickup_admin.get_list("NINCS")
+
+    assert "404" in str(exc.value)
+    assert "NINCS" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_get_folder_reads_the_name():
+    request, _ = _api({("GET", "/folder/FD1"): (200, {"id": "FD1", "name": "Dávid"})})
+    with mock.patch.object(clickup_admin, "get_config", return_value=_CFG),          mock.patch.object(clickup_admin.requests, "request", new=request):
+        assert await clickup_admin.get_folder("FD1") == {"id": "FD1", "name": "Dávid"}
+
+
+@pytest.mark.asyncio
+async def test_the_admin_module_creates_nothing():
+    """A struktúrát az ügyfél hozza létre kézzel — a bot NEM tud Space-t/Foldert csinálni."""
+    for eltavolitott in ("ensure_space", "ensure_folder", "ensure_list"):
+        assert not hasattr(clickup_admin, eltavolitott), (
+            f"{eltavolitott} visszakerült — a struktúra-létrehozás kézi maradjon"
+        )
 
 
 @pytest.mark.asyncio
@@ -488,163 +470,361 @@ async def test_list_members_returns_ids_for_the_configured_workspace():
 @pytest.mark.asyncio
 async def test_admin_api_errors_are_raised_with_a_human_message():
     """Admin úton a hiba HANGOS: emberi üzenettel dob, nem néma None-nal tér vissza."""
-    request, _ = _api({("GET", "/team/TEAM1/space"): (401, {})})
+    request, _ = _api({("GET", "/list/LS1"): (401, {})})
     with mock.patch.object(clickup_admin, "get_config", return_value=_CFG), \
          mock.patch.object(clickup_admin.requests, "request", new=request):
         with pytest.raises(clickup_admin.ClickUpAdminError) as exc:
-            await clickup_admin.ensure_space()
+            await clickup_admin.get_list("LS1")
 
     assert "CLICKUP_API_TOKEN" in str(exc.value)
 
 
 # ===========================================================================
-# 3) A parancsok — /clickup setup, setup-manager, list-members
+# 3) A parancsok — /clickup setup-manager, list-members, status
 # ===========================================================================
 
-@pytest.mark.asyncio
-async def test_setup_command_saves_the_space_id_to_the_database():
-    cog = clickup_cmd.ClickUpCog(mock.Mock())
-    interaction = _Interaction()
-    mentve = {}
-
-    with mock.patch.object(clickup_cmd, "_is_admin_channel", return_value=True), \
-         mock.patch.object(clickup_cmd.clickup_admin, "config_error", return_value=None), \
-         mock.patch.object(clickup_cmd.clickup_admin, "team_id", return_value="TEAM1"), \
-         mock.patch.object(clickup_cmd.clickup_admin, "ensure_space", new=mock.AsyncMock(
-             return_value={"id": "SP9", "name": "PPC Anomália Riasztások", "created": True})), \
-         mock.patch.object(clickup_cmd.clickup_storage, "save_space",
-                           side_effect=lambda *a: mentve.update(
-                               {"team": a[0], "name": a[1], "space": a[2]}) or {"id": 1}), \
-         mock.patch.object(clickup_cmd.audit, "log_action"):
-        await clickup_cmd.ClickUpCog.setup_cmd.callback(cog, interaction)
-
-    assert mentve == {"team": "TEAM1", "name": "PPC Anomália Riasztások", "space": "SP9"}
-    valasz = "\n".join(interaction.sent())
-    assert "SP9" in valasz and "létrehozva" in valasz
+def _member(user_id=99, name="Dávid"):
+    """Discord member-utánzat a parancshíváshoz."""
+    m = mock.Mock(spec=[], id=user_id)
+    m.display_name = name
+    m.name = name.lower()
+    return m
 
 
-@pytest.mark.asyncio
-async def test_setup_command_says_when_the_space_already_existed():
-    """Az újrafuttatás nem hazudik "létrehozva"-t egy meglévő Space-re."""
-    cog = clickup_cmd.ClickUpCog(mock.Mock())
-    interaction = _Interaction()
-
-    with mock.patch.object(clickup_cmd, "_is_admin_channel", return_value=True), \
-         mock.patch.object(clickup_cmd.clickup_admin, "config_error", return_value=None), \
-         mock.patch.object(clickup_cmd.clickup_admin, "team_id", return_value="TEAM1"), \
-         mock.patch.object(clickup_cmd.clickup_admin, "ensure_space", new=mock.AsyncMock(
-             return_value={"id": "SP9", "name": "PPC Anomália Riasztások", "created": False})), \
-         mock.patch.object(clickup_cmd.clickup_storage, "save_space", return_value={"id": 1}), \
-         mock.patch.object(clickup_cmd.audit, "log_action"):
-        await clickup_cmd.ClickUpCog.setup_cmd.callback(cog, interaction)
-
-    assert "már létezett" in "\n".join(interaction.sent())
+_LIST_OK = {
+    "id": "901234567890", "name": "Anomália riasztások",
+    "folder_id": "90123456", "folder_name": "Dávid", "folder_hidden": False,
+    "space_id": "SP9", "space_name": "PPC Anomália Riasztások",
+}
 
 
-@pytest.mark.asyncio
-async def test_setup_command_reports_missing_configuration():
-    cog = clickup_cmd.ClickUpCog(mock.Mock())
-    interaction = _Interaction()
+def _patch_setup_manager(stack, *, list_result=_LIST_OK, mentve=None):
+    """A setup-manager külső függéseit mockolja; a mentést a `mentve` dictbe gyűjti."""
+    stack.enter_context(mock.patch.object(clickup_cmd, "_is_admin_channel", return_value=True))
+    stack.enter_context(mock.patch.object(
+        clickup_cmd.clickup_admin, "config_error", return_value=None))
+    stack.enter_context(mock.patch.object(
+        clickup_cmd.users_storage, "get_or_create_user",
+        return_value=({"id": 1, "display_name": "Dávid"}, False)))
+    stack.enter_context(mock.patch.object(clickup_cmd.audit, "log_action"))
 
-    with mock.patch.object(clickup_cmd, "_is_admin_channel", return_value=True), \
-         mock.patch.object(clickup_cmd.clickup_admin, "config_error",
-                           return_value="hiányzik a `CLICKUP_API_TOKEN`"):
-        await clickup_cmd.ClickUpCog.setup_cmd.callback(cog, interaction)
+    get_list = mock.AsyncMock(
+        side_effect=list_result if isinstance(list_result, Exception) else None,
+        return_value=None if isinstance(list_result, Exception) else list_result,
+    )
+    stack.enter_context(mock.patch.object(clickup_cmd.clickup_admin, "get_list", new=get_list))
 
-    assert "CLICKUP_API_TOKEN" in "\n".join(interaction.sent())
+    # `mentve if mentve is not None else {}` — NEM `mentve or {}`: a hívó üres
+    # dictje falsy, és az `or` egy ÚJ dictbe írna, amit senki nem lát.
+    sink = mentve if mentve is not None else {}
+    upsert = mock.Mock(
+        side_effect=lambda uid, **kw: sink.update({"user_id": uid, **kw}) or {"id": 1},
+    )
+    stack.enter_context(mock.patch.object(clickup_cmd.clickup_storage, "upsert_mapping", new=upsert))
+    return SimpleNamespace(get_list=get_list, upsert=upsert)
 
 
 @pytest.mark.asyncio
-async def test_setup_manager_creates_folder_list_and_saves_the_mapping():
-    cog = clickup_cmd.ClickUpCog(mock.Mock())
+async def test_setup_manager_saves_the_mapping_after_validating_the_list():
+    """Érvényes ID-k → a lista ellenőrzése UTÁN mentés."""
     interaction = _Interaction()
-    user = mock.Mock(spec=[], id=99)
-    user.display_name = "Dávid"
-    user.name = "david"
-    mentve = {}
-
-    with mock.patch.object(clickup_cmd, "_is_admin_channel", return_value=True), \
-         mock.patch.object(clickup_cmd.clickup_admin, "config_error", return_value=None), \
-         mock.patch.object(clickup_cmd.clickup_admin, "team_id", return_value="TEAM1"), \
-         mock.patch.object(clickup_cmd.clickup_storage, "get_space",
-                           return_value={"clickup_space_id": "SP9"}), \
-         mock.patch.object(clickup_cmd.users_storage, "get_or_create_user",
-                           return_value=({"id": 1, "display_name": "Dávid"}, False)), \
-         mock.patch.object(clickup_cmd.clickup_admin, "ensure_folder", new=mock.AsyncMock(
-             return_value={"id": "FD1", "name": "Dávid", "created": True})), \
-         mock.patch.object(clickup_cmd.clickup_admin, "ensure_list", new=mock.AsyncMock(
-             return_value={"id": "LS1", "name": "Anomália riasztások", "created": True})), \
-         mock.patch.object(clickup_cmd.clickup_storage, "upsert_mapping",
-                           side_effect=lambda uid, **kw: mentve.update(
-                               {"user_id": uid, **kw}) or {"id": 1}), \
-         mock.patch.object(clickup_cmd.audit, "log_action"):
+    mentve: dict = {}
+    with contextlib.ExitStack() as stack:
+        m = _patch_setup_manager(stack, mentve=mentve)
         await clickup_cmd.ClickUpCog.setup_manager.callback(
-            cog, interaction, user=user, clickup_user_id="555",
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction,
+            user=_member(), clickup_user_id="555", folder_id="90123456", list_id="901234567890",
         )
 
+    m.get_list.assert_awaited_once_with("901234567890")
     assert mentve == {
-        "user_id": 1, "clickup_folder_id": "FD1",
-        "clickup_list_id": "LS1", "clickup_assignee_id": "555",
+        "user_id": 1, "clickup_folder_id": "90123456",
+        "clickup_list_id": "901234567890", "clickup_assignee_id": "555",
     }
-    assert "LS1" in "\n".join(interaction.sent())
+    valasz = "\n".join(interaction.sent())
+    assert "Anomália riasztások" in valasz and "555" in valasz
 
 
 @pytest.mark.asyncio
-async def test_setup_manager_requires_setup_first():
-    """Space nélkül nincs hova Foldert tenni — a parancs ezt mondja is."""
-    cog = clickup_cmd.ClickUpCog(mock.Mock())
+async def test_setup_manager_accepts_pasted_clickup_links():
+    """A ClickUp "Copy link" URL-je is elfogadott — nem kell ID-t vadászni."""
     interaction = _Interaction()
-    user = mock.Mock(spec=[], id=99)
-    user.display_name = "Dávid"
-    user.name = "david"
-
-    with mock.patch.object(clickup_cmd, "_is_admin_channel", return_value=True), \
-         mock.patch.object(clickup_cmd.clickup_admin, "config_error", return_value=None), \
-         mock.patch.object(clickup_cmd.clickup_admin, "team_id", return_value="TEAM1"), \
-         mock.patch.object(clickup_cmd.clickup_storage, "get_space", return_value=None), \
-         mock.patch.object(clickup_cmd.clickup_admin, "ensure_folder",
-                           new=mock.AsyncMock()) as folder:
+    mentve: dict = {}
+    with contextlib.ExitStack() as stack:
+        _patch_setup_manager(
+            stack, mentve=mentve,
+            list_result={**_LIST_OK, "id": "901234567890", "folder_id": "90123456"},
+        )
         await clickup_cmd.ClickUpCog.setup_manager.callback(
-            cog, interaction, user=user, clickup_user_id="555",
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction,
+            user=_member(), clickup_user_id="555",
+            folder_id="https://app.clickup.com/9012345/v/o/f/90123456",
+            list_id="https://app.clickup.com/9012345/v/li/901234567890",
         )
 
-    folder.assert_not_awaited()
-    assert "/clickup setup" in "\n".join(interaction.sent())
+    assert mentve["clickup_folder_id"] == "90123456"
+    assert mentve["clickup_list_id"] == "901234567890"
+
+
+@pytest.mark.asyncio
+async def test_setup_manager_does_not_save_an_unreachable_list():
+    """Nem létező / nem elérhető lista → egyértelmű hiba, SEMMI nem mentődik.
+
+    Egy 404-es lista némán nyelné el az összes későbbi riasztás-taskot.
+    """
+    interaction = _Interaction()
+    with contextlib.ExitStack() as stack:
+        m = _patch_setup_manager(
+            stack,
+            list_result=ClickUpAdminError(
+                "A(z) `909999999999` lista lekérése: nem található (404)."),
+        )
+        await clickup_cmd.ClickUpCog.setup_manager.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction,
+            user=_member(), clickup_user_id="555",
+            folder_id="90123456", list_id="909999999999",
+        )
+
+    m.upsert.assert_not_called()
+    valasz = "\n".join(interaction.sent())
+    assert "404" in valasz
+    assert "NEM lett elmentve" in valasz
+
+
+@pytest.mark.asyncio
+async def test_setup_manager_does_not_save_a_list_from_another_folder():
+    """A lista létezik, de MÁS Folderben van → nem mentünk (kimásolási hiba)."""
+    interaction = _Interaction()
+    with contextlib.ExitStack() as stack:
+        m = _patch_setup_manager(
+            stack,
+            list_result={**_LIST_OK, "folder_id": "90999999", "folder_name": "Ádám"},
+        )
+        await clickup_cmd.ClickUpCog.setup_manager.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction,
+            user=_member(), clickup_user_id="555", folder_id="90123456", list_id="901234567890",
+        )
+
+    m.upsert.assert_not_called()
+    valasz = "\n".join(interaction.sent())
+    assert "Ádám" in valasz and "90999999" in valasz
+
+
+@pytest.mark.asyncio
+async def test_setup_manager_does_not_save_a_folderless_list():
+    interaction = _Interaction()
+    with contextlib.ExitStack() as stack:
+        m = _patch_setup_manager(
+            stack,
+            list_result={**_LIST_OK, "folder_id": None, "folder_name": None,
+                         "folder_hidden": True},
+        )
+        await clickup_cmd.ClickUpCog.setup_manager.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction,
+            user=_member(), clickup_user_id="555", folder_id="90123456", list_id="901234567890",
+        )
+
+    m.upsert.assert_not_called()
+    assert "folderless" in "\n".join(interaction.sent())
 
 
 @pytest.mark.asyncio
 async def test_setup_manager_rejects_a_non_numeric_clickup_user_id():
     """Elgépelt assignee ID → azonnali, érthető hiba (nem néma, assignee nélküli taskok)."""
-    cog = clickup_cmd.ClickUpCog(mock.Mock())
     interaction = _Interaction()
-    user = mock.Mock(spec=[], id=99)
-    user.display_name = "Dávid"
-    user.name = "david"
-
-    with mock.patch.object(clickup_cmd, "_is_admin_channel", return_value=True), \
-         mock.patch.object(clickup_cmd.clickup_admin, "config_error", return_value=None), \
-         mock.patch.object(clickup_cmd.clickup_storage, "get_space",
-                           new=mock.Mock()) as get_space:
+    with contextlib.ExitStack() as stack:
+        m = _patch_setup_manager(stack)
         await clickup_cmd.ClickUpCog.setup_manager.callback(
-            cog, interaction, user=user, clickup_user_id="@david",
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction,
+            user=_member(), clickup_user_id="@david", folder_id="90123456", list_id="901234567890",
         )
 
-    get_space.assert_not_called()
+    m.get_list.assert_not_awaited()
+    m.upsert.assert_not_called()
     assert "list-members" in "\n".join(interaction.sent())
+
+
+@pytest.mark.asyncio
+async def test_setup_manager_rejects_an_unparseable_id():
+    """Felismerhetetlen link → a parancs a nyers ID-t kéri, nem tippel."""
+    for folder_id, list_id, kell in (
+        ("valami-hulyeseg", "901234567890", "Folder ID"),
+        ("90123456", "valami-hulyeseg", "List ID"),
+    ):
+        interaction = _Interaction()
+        with contextlib.ExitStack() as stack:
+            m = _patch_setup_manager(stack)
+            await clickup_cmd.ClickUpCog.setup_manager.callback(
+                clickup_cmd.ClickUpCog(mock.Mock()), interaction,
+                user=_member(), clickup_user_id="555",
+                folder_id=folder_id, list_id=list_id,
+            )
+
+        m.upsert.assert_not_called()
+        assert kell in "\n".join(interaction.sent())
+
+
+@pytest.mark.asyncio
+async def test_setup_manager_reports_a_failed_database_write():
+    """A ClickUp ID-k jók, de a DB írás elhasal → a válasz megmondja, mi a teendő."""
+    interaction = _Interaction()
+    with contextlib.ExitStack() as stack:
+        _patch_setup_manager(stack)
+        stack.enter_context(mock.patch.object(
+            clickup_cmd.clickup_storage, "upsert_mapping", return_value=None))
+        await clickup_cmd.ClickUpCog.setup_manager.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction,
+            user=_member(), clickup_user_id="555", folder_id="90123456", list_id="901234567890",
+        )
+
+    assert "0014" in "\n".join(interaction.sent())
+
+
+def test_there_is_no_setup_command_anymore():
+    """A struktúrát kézzel hozzák létre — nem hagytunk bent no-op `setup` parancsot."""
+    parancsok = {c.name for c in clickup_cmd.ClickUpCog.__cog_app_commands__}
+    assert parancsok == {"setup-manager", "list-members", "status"}
 
 
 @pytest.mark.asyncio
 async def test_commands_are_admin_channel_only():
     cog = clickup_cmd.ClickUpCog(mock.Mock())
     for hivas in (
-        lambda i: clickup_cmd.ClickUpCog.setup_cmd.callback(cog, i),
         lambda i: clickup_cmd.ClickUpCog.list_members.callback(cog, i),
         lambda i: clickup_cmd.ClickUpCog.status.callback(cog, i),
+        lambda i: clickup_cmd.ClickUpCog.setup_manager.callback(
+            cog, i, user=_member(), clickup_user_id="555", folder_id="90123456", list_id="901234567890"),
     ):
         interaction = _Interaction()
         with mock.patch.object(clickup_cmd, "_is_admin_channel", return_value=False):
             await hivas(interaction)
         assert "admin csatornában" in "\n".join(interaction.sent())
+
+
+# --- /clickup status -------------------------------------------------------
+
+def _mapping_row(user_id=1, name="Dávid", list_id="901234567890", folder_id="90123456", assignee="555"):
+    return {
+        "user_id": user_id, "clickup_folder_id": folder_id, "clickup_list_id": list_id,
+        "clickup_assignee_id": assignee,
+        "users": {"id": user_id, "display_name": name, "discord_user_id": "d1"},
+    }
+
+
+def _patch_status(stack, *, mappings, get_list=None, config_problem=None):
+    stack.enter_context(mock.patch.object(clickup_cmd, "_is_admin_channel", return_value=True))
+    stack.enter_context(mock.patch.object(
+        clickup_cmd.clickup_admin, "config_error", return_value=config_problem))
+    stack.enter_context(mock.patch.object(
+        clickup_cmd.clickup_storage, "list_mappings", return_value=mappings))
+    stack.enter_context(mock.patch.object(
+        clickup_cmd.clickup_admin, "get_list",
+        new=get_list if get_list is not None else mock.AsyncMock(return_value=_LIST_OK),
+    ))
+
+
+@pytest.mark.asyncio
+async def test_status_shows_the_manual_setup_steps_when_there_is_no_mapping():
+    """Üres állapotban a status MEGMONDJA, mit kell kézzel létrehozni a ClickUp-ban."""
+    interaction = _Interaction()
+    with contextlib.ExitStack() as stack:
+        _patch_status(stack, mappings=[])
+        await clickup_cmd.ClickUpCog.status.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction)
+
+    valasz = "\n".join(interaction.sent())
+    assert clickup_admin.SPACE_NAME in valasz
+    assert "setup-manager" in valasz
+
+
+@pytest.mark.asyncio
+async def test_status_marks_a_live_mapping_as_ok():
+    interaction = _Interaction()
+    with contextlib.ExitStack() as stack:
+        _patch_status(stack, mappings=[_mapping_row()])
+        await clickup_cmd.ClickUpCog.status.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction)
+
+    assert "✅ **Dávid**" in "\n".join(interaction.sent())
+
+
+@pytest.mark.asyncio
+async def test_status_flags_a_deleted_list():
+    """A ClickUp-ban időközben törölt lista ❌ jelet kap — nem néma "minden rendben"."""
+    interaction = _Interaction()
+    with contextlib.ExitStack() as stack:
+        _patch_status(
+            stack, mappings=[_mapping_row()],
+            get_list=mock.AsyncMock(side_effect=ClickUpAdminError("nem található (404)")),
+        )
+        await clickup_cmd.ClickUpCog.status.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction)
+
+    assert "❌ **Dávid**" in "\n".join(interaction.sent())
+
+
+@pytest.mark.asyncio
+async def test_status_flags_a_list_that_moved_to_another_folder():
+    interaction = _Interaction()
+    with contextlib.ExitStack() as stack:
+        _patch_status(
+            stack, mappings=[_mapping_row()],
+            get_list=mock.AsyncMock(return_value={**_LIST_OK, "folder_id": "90999999"}),
+        )
+        await clickup_cmd.ClickUpCog.status.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction)
+
+    assert "⚠️ **Dávid**" in "\n".join(interaction.sent())
+
+
+@pytest.mark.asyncio
+async def test_status_treats_a_renamed_list_as_healthy():
+    """Az átNEVEZÉS nem hiba: a taskokat ID alapján hozzuk létre."""
+    interaction = _Interaction()
+    with contextlib.ExitStack() as stack:
+        _patch_status(
+            stack, mappings=[_mapping_row()],
+            get_list=mock.AsyncMock(return_value={**_LIST_OK, "name": "Új név"}),
+        )
+        await clickup_cmd.ClickUpCog.status.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction)
+
+    assert "✅ **Dávid**" in "\n".join(interaction.sent())
+
+
+@pytest.mark.asyncio
+async def test_status_does_not_call_clickup_when_the_config_is_missing():
+    """Token nélkül nincs értelme ellenőrizni — a sorok ❔ jelet kapnak."""
+    interaction = _Interaction()
+    get_list = mock.AsyncMock(return_value=_LIST_OK)
+    with contextlib.ExitStack() as stack:
+        _patch_status(stack, mappings=[_mapping_row()], get_list=get_list,
+                      config_problem="hiányzik a `CLICKUP_API_TOKEN`")
+        await clickup_cmd.ClickUpCog.status.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction)
+
+    get_list.assert_not_awaited()
+    valasz = "\n".join(interaction.sent())
+    assert "CLICKUP_API_TOKEN" in valasz
+    assert "❔ **Dávid**" in valasz
+
+
+@pytest.mark.asyncio
+async def test_status_caps_the_validation_and_says_so():
+    """A ClickUp-ellenőrzés felső korlátos — és a válasz BEVALLJA, meddig futott."""
+    sok = [_mapping_row(user_id=i, name=f"OM{i}", list_id=f"90123456789{i}")
+           for i in range(clickup_cmd._MAX_VALIDATED + 3)]
+    get_list = mock.AsyncMock(return_value=_LIST_OK)
+    interaction = _Interaction()
+    with contextlib.ExitStack() as stack:
+        _patch_status(stack, mappings=sok, get_list=get_list)
+        await clickup_cmd.ClickUpCog.status.callback(
+            clickup_cmd.ClickUpCog(mock.Mock()), interaction)
+
+    assert get_list.await_count == clickup_cmd._MAX_VALIDATED
+    valasz = "\n".join(interaction.sent())
+    assert str(clickup_cmd._MAX_VALIDATED) in valasz
+    assert "❔" in valasz
 
 
 # ===========================================================================

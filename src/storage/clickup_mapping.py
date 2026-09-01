@@ -1,22 +1,28 @@
 """
-ClickUp struktúra + OM-mapping adathozzáférés (0014 migration).
+OM → ClickUp leképezés adathozzáférés (`clickup_manager_mapping`, 0014 migration).
 
-Két táblát kezel, mert egy fogalmi egységet alkotnak — "hova és kinek megy a
-ClickUp task":
+Egyetlen táblát kezel: melyik PPC manager riasztásaiból melyik ClickUp listába
+készül task, és kire szignáljuk.
 
-    clickup_structure        — a `/clickup setup` által létrehozott Space
-                               (Workspace-enként egy sor)
-    clickup_manager_mapping  — OM → Folder / List / assignee leképezés
-                               (`/clickup setup-manager` tölti)
+    user_id             — a MI users táblánk id-ja
+    clickup_folder_id   — a manager Foldere (kézzel hozták létre a ClickUp-ban)
+    clickup_list_id     — a Folderben lévő lista, ide kerülnek a taskok
+    clickup_assignee_id — a ClickUp user ID az assignee-hez
+
+A sorokat a `/clickup setup-manager` írja, a KÉZZEL létrehozott ClickUp
+struktúrából kimásolt azonosítókkal. A parancs a mentés előtt ellenőrzi az
+azonosítókat a ClickUp API-n — ide tehát csak létező, elérhető ID kerül.
+(Space ID-t szándékosan NEM tárolunk: a taskhoz a lista azonosítója elég, és
+egy olvasatlan oszlop csak félrevezetne.)
 
 MIÉRT NEM DOB EGYIK FÜGGVÉNY SEM:
-    A riasztás-router OLVASSA ezeket minden CRITICAL alertnél. Ha a 0014
-    migration még nem futott le, vagy a Supabase pillanatnyilag nem elérhető,
-    az NEM akaszthatja meg a riasztást — a Discord üzenetnek akkor is ki kell
-    mennie. Ezért minden olvasás/írás warninggal degradál (None / False), és
-    a hívó dönt: ClickUp task nélkül, Discord-only routinggal folytat.
+    A riasztás-router OLVASSA ezt minden CRITICAL alertnél. Ha a 0014 migration
+    még nem futott le, vagy a Supabase pillanatnyilag nem elérhető, az NEM
+    akaszthatja meg a riasztást — a Discord üzenetnek akkor is ki kell mennie.
+    Ezért minden olvasás/írás warninggal degradál (None / False / üres lista),
+    és a hívó dönt: ClickUp task nélkül, Discord-only routinggal folytat.
 
-    Az ÍRÁS oldalon (admin parancsok) ez azt jelenti, hogy a parancs a False
+    Az ÍRÁS oldalon (admin parancsok) ez azt jelenti, hogy a parancs a None
     visszatérésből tud emberi hibaüzenetet adni — nem néma stack trace-t.
 """
 from __future__ import annotations
@@ -27,8 +33,7 @@ from typing import Any
 from src.storage.supabase_client import get_supabase
 from src.utils.logging import get_logger
 
-_STRUCTURE_TABLE = "clickup_structure"
-_MAPPING_TABLE = "clickup_manager_mapping"
+_TABLE = "clickup_manager_mapping"
 
 # Minden degradált ág ezt fűzi a warninghoz — a Railway logból azonnal
 # kiderüljön, hogy nem kód-hiba, hanem elmaradt migráció a gyanús.
@@ -41,67 +46,6 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ---------------------------------------------------------------------------
-# clickup_structure — a Space
-# ---------------------------------------------------------------------------
-
-def get_space(clickup_team_id: str, space_name: str) -> dict[str, Any] | None:
-    """A workspace+név párhoz tartozó elmentett Space sor, vagy None.
-
-    A `clickup_team_id` szűrés nem formaság: ha a CLICKUP_TEAM_ID megváltozik
-    (más ClickUp workspace), a régi Space ID egy IDEGEN workspace-re mutatna, és
-    a task-létrehozás 404-gyel némán elhalna. Így inkább "nincs setup" választ
-    adunk, amit a parancs és a router is kezelni tud.
-    """
-    try:
-        res = (
-            get_supabase()
-            .table(_STRUCTURE_TABLE)
-            .select("*")
-            .eq("clickup_team_id", str(clickup_team_id))
-            .eq("space_name", space_name)
-            .limit(1)
-            .execute()
-        )
-    except Exception as exc:  # noqa: BLE001 — hiányzó tábla / DB hiba
-        log.warning("ClickUp Space olvasás sikertelen: %s — %s", exc, _MIGRATION_HINT)
-        return None
-    return res.data[0] if res.data else None
-
-
-def save_space(
-    clickup_team_id: str,
-    space_name: str,
-    clickup_space_id: str,
-) -> dict[str, Any] | None:
-    """A Space elmentése (upsert a `clickup_team_id, space_name` kulcsra).
-
-    Idempotens: a `/clickup setup` többszöri futtatása ugyanazt a sort frissíti.
-    Visszatérés: a mentett sor, vagy None (logolt hiba).
-    """
-    payload = {
-        "clickup_team_id": str(clickup_team_id),
-        "space_name": space_name,
-        "clickup_space_id": str(clickup_space_id),
-        "updated_at": _now_iso(),
-    }
-    try:
-        res = (
-            get_supabase()
-            .table(_STRUCTURE_TABLE)
-            .upsert(payload, on_conflict="clickup_team_id,space_name")
-            .execute()
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("ClickUp Space mentése sikertelen: %s — %s", exc, _MIGRATION_HINT)
-        return None
-    return res.data[0] if res.data else payload
-
-
-# ---------------------------------------------------------------------------
-# clickup_manager_mapping — OM → Folder / List / assignee
-# ---------------------------------------------------------------------------
-
 def get_mapping_for_user(user_id: int) -> dict[str, Any] | None:
     """Egy OM ClickUp mappingja, vagy None ha nincs (még nem futott setup-manager).
 
@@ -113,7 +57,7 @@ def get_mapping_for_user(user_id: int) -> dict[str, Any] | None:
     try:
         res = (
             get_supabase()
-            .table(_MAPPING_TABLE)
+            .table(_TABLE)
             .select("*")
             .eq("user_id", user_id)
             .limit(1)
@@ -138,8 +82,8 @@ def upsert_mapping(
     """OM mapping létrehozása/frissítése (upsert a `user_id` egyedi kulcsra).
 
     Idempotens: a `/clickup setup-manager` újrafuttatása FRISSÍTI a sort (pl.
-    javított assignee ID), nem hoz létre másodikat — különben egy alertből két
-    task születne, két listában.
+    javított assignee ID vagy áthelyezett lista), nem hoz létre másodikat —
+    különben egy alertből két task születne, két listában.
 
     Visszatérés: a mentett sor, vagy None (logolt hiba).
     """
@@ -153,7 +97,7 @@ def upsert_mapping(
     try:
         res = (
             get_supabase()
-            .table(_MAPPING_TABLE)
+            .table(_TABLE)
             .upsert(payload, on_conflict="user_id")
             .execute()
         )
@@ -175,7 +119,7 @@ def list_mappings() -> list[dict[str, Any]]:
     try:
         res = (
             get_supabase()
-            .table(_MAPPING_TABLE)
+            .table(_TABLE)
             .select("*, users(id, display_name, discord_user_id)")
             .execute()
         )
@@ -194,7 +138,7 @@ def delete_mapping(user_id: int) -> bool:
     try:
         existing = (
             get_supabase()
-            .table(_MAPPING_TABLE)
+            .table(_TABLE)
             .select("id")
             .eq("user_id", user_id)
             .limit(1)
@@ -202,7 +146,7 @@ def delete_mapping(user_id: int) -> bool:
         )
         if not existing.data:
             return False
-        get_supabase().table(_MAPPING_TABLE).delete().eq("user_id", user_id).execute()
+        get_supabase().table(_TABLE).delete().eq("user_id", user_id).execute()
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "ClickUp mapping törlése sikertelen (user #%s): %s — %s",

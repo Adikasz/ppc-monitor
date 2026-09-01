@@ -68,7 +68,7 @@ from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import alerts as alerts_storage
 from src.storage import assignments as assignments_storage
 from src.storage import campaigns as campaigns_storage
-from src.storage import clickup_structure as clickup_storage
+from src.storage import clickup_mapping as clickup_storage
 from src.storage import clients as clients_storage
 from src.storage import mutes as mutes_storage
 from src.utils import quiet_hours
@@ -391,7 +391,8 @@ async def _create_clickup_task(
             log.warning(
                 "ClickUp task kihagyva (alert #%s) — @%s (user #%s) OM-nek még "
                 "nincs ClickUp mappingja. Létrehozás: `/clickup setup-manager "
-                "user:@%s clickup_user_id:…`. A riasztás Discord-only routinggal megy.",
+                "user:@%s clickup_user_id:… folder_id:… list_id:…`. "
+                "A riasztás Discord-only routinggal megy.",
                 alert_id, primary.get("display_name") or primary.get("discord_user_id"),
                 user_id, primary.get("discord_user_id"),
             )
