@@ -25,11 +25,19 @@ Hibakezelés (fault isolation):
 
 Visszatérési érték:
   {
-    "inserted":    5,
-    "updated":     12,
-    "deactivated": 1,
-    "errors":      [{"account": "act_xxx", "error": "..."}],
+    "accounts":        3,   — feldolgozásra megkísérelt fiókok
+    "accounts_failed": 1,   — fiókok, amiket EGYÁLTALÁN nem sikerült lekérni
+    "inserted":        5,
+    "updated":         12,
+    "deactivated":     1,
+    "errors":          [{"account": "act_xxx", "error": "..."}],
   }
+
+Az `accounts` / `accounts_failed` a napi automatikus discovery (scheduler.
+`daily_discovery_job`) összesítő logjához kell: abból derül ki, hány fiók
+maradt ki némán egy jogosultsági hiba miatt. A fiók-szintű számlálás nem
+vezethető le az `errors` listából, mert abba kampány-szintű upsert hibák is
+kerülnek — azoknál a fiók lekérése SIKERÜLT.
 """
 from __future__ import annotations
 
@@ -59,13 +67,17 @@ def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
 
     Visszatérés:
         {
-            "inserted":    int,      — DB-be újonnan felvett kampányok
-            "updated":     int,      — frissített kampányok (status, last_seen_at)
-            "deactivated": int,      — soft-deleted (24h+ nem látott) kampányok
-            "errors":      list,     — [{"account": "...", "error": "..."}]
+            "accounts":        int,  — feldolgozásra megkísérelt fiókok
+            "accounts_failed": int,  — fiókok, amiket egyáltalán nem sikerült lekérni
+            "inserted":        int,  — DB-be újonnan felvett kampányok
+            "updated":         int,  — frissített kampányok (status, last_seen_at)
+            "deactivated":     int,  — soft-deleted (24h+ nem látott) kampányok
+            "errors":          list, — [{"account": "...", "error": "..."}]
         }
     """
     result: dict[str, Any] = {
+        "accounts": 0,
+        "accounts_failed": 0,
         "inserted": 0,
         "updated": 0,
         "deactivated": 0,
@@ -103,9 +115,11 @@ def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
         platform: str = account["platform"]
         ext_account_id: str = account["external_account_id"]
         db_account_id: int = account["id"]
+        result["accounts"] += 1
 
         # Platform kliens előállítása (cache-elve, init-hiba platformonként egyszer)
         if platform in failed_platforms:
+            result["accounts_failed"] += 1
             result["errors"].append({
                 "account": ext_account_id,
                 "error": failed_platforms[platform],
@@ -121,6 +135,7 @@ def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
                     platform, exc,
                 )
                 failed_platforms[platform] = str(exc)
+                result["accounts_failed"] += 1
                 result["errors"].append({
                     "account": ext_account_id,
                     "error": str(exc),
@@ -142,11 +157,12 @@ def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
                 "Discovery: API hiba fiók=%s (%s): %s",
                 ext_account_id, platform, exc,
             )
+            result["accounts_failed"] += 1
             result["errors"].append({
                 "account": ext_account_id,
                 "error": str(exc),
             })
-            continue  # következő fiók
+            continue  # következő fiók — a soft-delete-ig NEM jutunk el
 
         api_campaign_ids: set[str] = set()
 
@@ -175,13 +191,32 @@ def discover_campaigns_for_client(client_id: int) -> dict[str, Any]:
                     "error": str(exc),
                 })
 
-        # 4) Soft-delete: ennél régebben látott is_monitored kampányok
-        _deactivate_stale(
-            db_account_id=db_account_id,
-            stale_cutoff=stale_cutoff,
-            api_campaign_ids=api_campaign_ids,
-            result=result,
-        )
+        # 4) Soft-delete: ennél régebben látott is_monitored kampányok.
+        #
+        # VÉDELEM: ha az API ÜRES listát adott vissza (nem hibát), a soft-delete
+        # az adott fiók ÖSSZES monitorozott kampányát leállítaná — egyetlen
+        # csendes API-válaszból az egész ügyfél kiesne a monitoringból. Ez a
+        # napi automatikus futásnál valós kockázat (a `daily_discovery_job`
+        # minden fiókra lefut), ezért ilyenkor inkább KIHAGYJUK a leállítást és
+        # warningot írunk: egy nappal tovább figyelt lezárt kampány olcsóbb
+        # hiba, mint egy némán vakká tett fiók.
+        #
+        # Ha a fióknak amúgy sincs monitorozott kampánya, nincs mit védeni —
+        # a jogos "üres fiók" eset így nem generál zajt.
+        if not api_campaign_ids and _has_monitored_campaigns(db_account_id):
+            log.warning(
+                "Discovery: fiók=%s (%s) ÜRES kampánylistát adott vissza, pedig "
+                "vannak monitorozott kampányai — a leállítás (soft-delete) "
+                "kihagyva. Ellenőrizd a fiók jogosultságait a platformon.",
+                ext_account_id, platform,
+            )
+        else:
+            _deactivate_stale(
+                db_account_id=db_account_id,
+                stale_cutoff=stale_cutoff,
+                api_campaign_ids=api_campaign_ids,
+                result=result,
+            )
 
     log.info(
         "Discovery kész: client_id=%s | inserted=%d updated=%d deactivated=%d errors=%d",
@@ -328,6 +363,22 @@ def _upsert_campaign(
             "Discovery: FRISSÍTVE kampány #%s (db_id=%s, status=%s)",
             ext_campaign_id, db_id, status,
         )
+
+
+def _has_monitored_campaigns(db_account_id: int) -> bool:
+    """Van-e a fióknak legalább egy monitorozott kampánya (üres-válasz védelemhez)."""
+    rows = (
+        get_supabase()
+        .table("campaigns")
+        .select("id")
+        .eq("ad_account_id", db_account_id)
+        .eq("is_monitored", True)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return bool(rows)
 
 
 def _deactivate_stale(

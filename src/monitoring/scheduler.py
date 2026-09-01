@@ -31,6 +31,7 @@ from src.integrations.google_ads import GoogleAdsClient
 from src.integrations.meta_ads import MetaAdsClient
 from src.monitoring.ai_insights import generate_ai_insight
 from src.monitoring.detector import detect_anomalies_for_campaign
+from src.monitoring.discovery import discover_campaigns_for_client
 from src.monitoring.insight_engine import detect_insights_for_campaign
 from src.monitoring.router import route_alert
 from src.monitoring.summary import SUMMARY_KINDS
@@ -567,6 +568,114 @@ async def weekly_action_report_job() -> dict[str, Any]:
 # Auto-resume (25. lépés) — lejárt szüneteltetésű kampányok visszaállítása
 # ---------------------------------------------------------------------------
 
+async def daily_discovery_job(
+    *,
+    client_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """Automatikus kampány-discovery MINDEN aktív ügyfél minden aktív fiókjára.
+
+    MIÉRT KELL: az óránkénti `hourly_monitoring` a MÁR ISMERT kampányokat
+    frissíti — a kampánylistát `get_active_campaigns()`-ból veszi, és soha nem
+    kérdezi meg a platformtól, hogy közben keletkezett-e ÚJ kampány. Discovery
+    nélkül tehát egy új kampány addig láthatatlan, amíg valaki kézzel le nem
+    futtatja a `/discover` parancsot; egy lezárt kampányt pedig a rendszer
+    továbbra is aktívként figyel.
+
+    MIÉRT NAPONTA (és nem óránként): a discovery fiókonként egy
+    kampánylista-lekérés (a platform SDK-i lapoznak, tehát ~1-3 HTTP kérés).
+    ~98 aktív fióknál ez naponta pár száz kérés — elhanyagolható. Óránként
+    ugyanez napi több ezer kérés lenne, olyan adatért, ami napokban változik:
+    a kampánylista nem óránkénti nagyságrend. A napi ütem az az intervallum,
+    ami után egy új kampány legfeljebb egy napig marad láthatatlan.
+
+    MIÉRT HAJNALBAN (03:30): ilyenkor sem összefoglaló (09:00), sem insight
+    scan (08:00), sem heti riport (hétfő 08:00) nem fut, és a csendes idő miatt
+    riasztási forgalom sincs. A :30 perc szándékos — az óránkénti monitoring
+    ciklus MINDEN óra :00-kor indul (03:00-kor is), így a discovery nem esik
+    egybe a napi legnagyobb API-terheléssel, ugyanazokra a fiókokra.
+
+    A parancsok UGYANEZT a függvényt hívják (`/discover all` szűrő nélkül,
+    `/discover google` a Google-fiókos ügyfelek ID-jaival) — nincs külön
+    "cron változat", ami elsodródhatna a kézi úttól.
+
+    Paraméterek:
+        client_ids — ha meg van adva, CSAK ezekre az ügyfelekre fut (a
+                     `/discover google` szűkítése); None → minden aktív ügyfél.
+
+    Visszatérés — a parancsok ebből építik a válaszukat, és ebből készül a záró
+    log sor is. MINDIG teljes kulcskészlettel tér vissza, a korai kilépési
+    ágakon is, hogy a hívónak ne kelljen `.get()`-elnie:
+
+        {"clients": int,          # feldolgozott ügyfelek
+         "accounts": int,         # feldolgozásra megkísérelt fiókok
+         "accounts_failed": int,  # fiók, amit egyáltalán nem sikerült lekérni
+         "inserted": int,         # ÚJ kampány
+         "updated": int,          # frissítve (status + last_seen_at)
+         "deactivated": int,      # soft-delete (24h+ nem látott)
+         "errors": int,           # fiók- ÉS kampány-szintű hibák darabszáma
+         "failed_clients": int,   # ügyfél, akinél a discovery elszállt
+         "per_client": list}      # [{"client_id", "name", "result"|"error"}]
+
+    Fault isolation két szinten: egy fiók hibája nem állítja meg az ügyfél többi
+    fiókját (ezt a `discover_campaigns_for_client` végzi), egy ügyfél hibája
+    pedig nem állítja meg a többi ügyfelet (ez az itteni try/except).
+    """
+    log.info("Automatikus kampány-discovery indítva…")
+    stats: dict[str, Any] = {
+        "clients": 0, "accounts": 0, "accounts_failed": 0,
+        "inserted": 0, "updated": 0, "deactivated": 0,
+        "errors": 0, "failed_clients": 0, "per_client": [],
+    }
+
+    try:
+        if client_ids is None:
+            clients = await asyncio.to_thread(clients_storage.list_clients, active_only=True)
+        else:
+            clients = []
+            for cid in client_ids:
+                row = await asyncio.to_thread(clients_storage.get_client, cid)
+                clients.append(row or {"id": cid, "name": f"#{cid}"})
+    except Exception:
+        log.exception("Discovery job: az ügyféllista lekérése sikertelen — kihagyva")
+        return stats
+
+    if not clients:
+        log.info("Discovery job: nincs feldolgozandó ügyfél — kihagyva")
+        return stats
+
+    stats["clients"] = len(clients)
+
+    for client in clients:
+        cid = client.get("id")
+        cname = client.get("name") or f"#{cid}"
+        try:
+            result = await asyncio.to_thread(discover_campaigns_for_client, cid)
+        except Exception as exc:  # noqa: BLE001 — egy ügyfél hibája ne állítsa le a jobot
+            log.exception("Discovery job: fatális hiba (client_id=%s)", cid)
+            stats["failed_clients"] += 1
+            stats["per_client"].append({"client_id": cid, "name": cname, "error": str(exc)})
+            continue
+
+        for key in ("accounts", "accounts_failed", "inserted", "updated", "deactivated"):
+            stats[key] += result.get(key, 0)
+        stats["errors"] += len(result.get("errors") or [])
+        stats["per_client"].append({"client_id": cid, "name": cname, "result": result})
+
+        # Ugyanaz a fiókok közti szünet, mint az óránkénti ciklusban — a
+        # platform API-k felé egyenletes terhelés.
+        await asyncio.sleep(_INTER_ACCOUNT_DELAY_S)
+
+    log.info(
+        "Automatikus discovery kész: %d fiók feldolgozva, %d új kampány "
+        "felfedezve, %d fiók hibázott (%d ügyfél, %d kampány frissítve, "
+        "%d deaktiválva, %d hiba összesen, %d ügyfél szállt el)",
+        stats["accounts"], stats["inserted"], stats["accounts_failed"],
+        stats["clients"], stats["updated"], stats["deactivated"],
+        stats["errors"], stats["failed_clients"],
+    )
+    return stats
+
+
 async def auto_resume_job() -> None:
     """A `/client pause`-zal szüneteltetett, határidőt elért kampányok visszaállítása.
 
@@ -747,6 +856,39 @@ def start_scheduler() -> AsyncIOScheduler:
         max_instances=1,
     )
 
+    # Automatikus kampány-discovery: MINDEN NAP 03:30.
+    #
+    # Enélkül a kampánylista CSAK kézi `/discover` futtatáskor frissült — az
+    # óránkénti ciklus a már ismert kampányokat járja végig, újat sosem vesz
+    # észre. Élesben ez azt jelentette, hogy a `campaigns.last_seen_at` az egész
+    # adatbázisban 3 dátumot tartalmazott (a három kézi futtatás napját), és a
+    # legfrissebb is hetekkel korábbi volt.
+    #
+    # Miért hajnalban: se összefoglaló (09:00), se insight scan (08:00), se heti
+    # riport (hétfő 08:00) nem fut ilyenkor, és a csendes idő miatt riasztási
+    # forgalom sincs — a discovery hosszú, soros API-menete így nem találkozik
+    # a riasztási úttal.
+    #
+    # Miért :30 és NEM :00: a `hourly_monitoring` MINDEN óra :00 percében indul,
+    # tehát 03:00-kor is. Ott indítva a discovery pont a napi legnagyobb
+    # API-terheléssel esne egybe, ugyanazokra a fiókokra. A fél órás eltolás
+    # garantálja, hogy a két menet ne érjen össze.
+    #
+    # A `misfire_grace_time` itt szándékosan nagy (1 óra): ha a bot hajnalban
+    # épp újraindul (Railway deploy), a discovery a felébredés után még lefusson
+    # — egy kihagyott nap újra láthatatlan kampányokat jelentene.
+    _scheduler.add_job(
+        daily_discovery_job,
+        trigger="cron",
+        hour=3,
+        minute=30,
+        id="daily_discovery",
+        replace_existing=True,
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+    )
+
     # Auto-resume: MINDEN NAP 06:00 — a lejárt szüneteltetésű kampányok (25. lépés
     # /client pause) visszaállítása mature-re.
     _scheduler.add_job(
@@ -763,10 +905,10 @@ def start_scheduler() -> AsyncIOScheduler:
 
     _scheduler.start()
     log.info(
-        "Monitoring scheduler indítva (óránkénti ciklus + napi összefoglaló "
-        "hétfő–péntek 09:00 (hétfőn a pénteki napról) + hétvégi összefoglaló "
-        "hétfő 09:00 + heti munkanapi összefoglaló péntek 15:05 + napi insight "
-        "scan 08:00 + heti riport hétfő 08:00, tz=%s)",
+        "Monitoring scheduler indítva (óránkénti ciklus + napi discovery 03:30 "
+        "+ napi összefoglaló hétfő–péntek 09:00 (hétfőn a pénteki napról) + "
+        "hétvégi összefoglaló hétfő 09:00 + heti munkanapi összefoglaló péntek "
+        "15:05 + napi insight scan 08:00 + heti riport hétfő 08:00, tz=%s)",
         timezone,
     )
     return _scheduler
