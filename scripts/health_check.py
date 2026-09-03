@@ -27,7 +27,13 @@ from src.integrations.meta_ads import MetaAdsClient
 from src.monitoring.token_monitor import check_meta_token_health
 from src.storage.supabase_client import get_supabase
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+# A Windows konzol cp1252-t használ, enélkül a ✅/⚠️/❌ UnicodeEncodeError-t dob.
+# Csak akkor hívjuk, ha a stdout tényleg tudja: pytest (és minden más capture
+# réteg) olyan objektumra cseréli a stdout-ot, amin nincs `reconfigure` — enélkül
+# ez a modul IMPORTÁLHATATLAN lenne tesztből, és a `check_anthropic`-ot le kellene
+# másolni a smoke tesztbe (lásd tests/test_anthropic_client_smoke.py).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 OK = "✅"
 WARN = "⚠️"
