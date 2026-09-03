@@ -1,10 +1,11 @@
 """
-Közös segédek az ADMIN parancsokhoz (`/insight scan-now`, `/report weekly-now`).
+Közös segédek a parancsokhoz (`/insight scan-now`, `/report weekly-now`, `/my …`).
 
 Ezek a függvények szándékosan NEM tartalmaznak üzleti logikát — csak azt a
-Discord-plumbingot, ami minden hosszan futó admin parancsnál ugyanaz:
+Discord-plumbingot, ami több parancsnál ugyanaz:
 
     - admin csatorna ellenőrzés
+    - a csatorna OM-jének feloldása, ütközés-kezeléssel
     - ügyfél feloldása név VAGY numerikus ID alapján
     - válaszküldés, ami túléli a 15 perces interakciós token lejáratát
 
@@ -22,6 +23,7 @@ import discord
 
 from src.config import get_config
 from src.storage import clients as clients_storage
+from src.storage import users as users_storage
 from src.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -45,6 +47,54 @@ def is_admin_channel(interaction: discord.Interaction) -> bool:
     if admin is None:
         return True
     return interaction.channel_id == admin
+
+
+AMBIGUOUS_OWNER_MESSAGE = (
+    "❌ Ez a csatorna több felhasználóhoz is hozzá van rendelve — szólj adminnak.\n"
+    "Amíg ez fennáll, a csatorna-szkópolt parancsok (`/my …`, `/account kpi`, "
+    "`/account summary-now`) itt nem használhatók, mert nem eldönthető, "
+    "kinek a hatókörében futnának."
+)
+
+
+def is_ambiguous_owner(owner: dict | None) -> bool:
+    """True, ha a csatorna-feloldás TÖBB usert talált (nem egy konkrét OM).
+
+    A `users_storage.get_user_by_alerts_channel` ilyenkor
+    `{"ambiguous": True, "matches": [...]}`-t ad vissza a user sor helyett —
+    lásd az ottani docstringet arról, miért nem választ önkényesen.
+    """
+    return bool(owner) and bool(owner.get("ambiguous"))
+
+
+def ambiguous_owner_message(owner: dict | None) -> str:
+    """Az ütközés emberi üzenete, az érintett userek megnevezésével.
+
+    Az admin így a Discord-válaszból megtudja, KIT kell átállítania — nem kell
+    a Railway logot bogarásznia (oda a `get_user_by_alerts_channel` warningja megy).
+    """
+    nevek = ", ".join(
+        f"**{m.get('display_name') or '?'}** (#{m.get('id')})"
+        for m in (owner or {}).get("matches") or []
+    )
+    if not nevek:
+        return AMBIGUOUS_OWNER_MESSAGE
+    return (
+        f"{AMBIGUOUS_OWNER_MESSAGE}\n"
+        f"Érintettek: {nevek} — egyiküknél állíts be másik csatornát a "
+        f"`/user set-channel` paranccsal."
+    )
+
+
+def unique_channel_owner(channel_id: object) -> dict | None:
+    """A csatorna EGYÉRTELMŰ OM-je; ütközésnél és hiánynál egyaránt None.
+
+    Az autocomplete-ek használják: ott nem lehet hibaüzenetet küldeni (a Discord
+    csak választék-listát vár), ezért az ütközés néma üres listát eredményez —
+    a felhasználó a parancs futtatásakor kapja meg a magyarázatot.
+    """
+    owner = users_storage.get_user_by_alerts_channel(str(channel_id))
+    return None if is_ambiguous_owner(owner) else owner
 
 
 def resolve_client(value: str) -> dict | None:

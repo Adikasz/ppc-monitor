@@ -36,6 +36,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from src.bot.commands._common import (
+    ambiguous_owner_message as _ambiguous_owner_message,
+    is_ambiguous_owner as _is_ambiguous_owner,
+    unique_channel_owner as _unique_channel_owner,
+)
 from src.config import get_config
 from src.integrations import account_catalog
 from src.integrations.discord_router import split_message
@@ -1216,6 +1221,11 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         channel_owner = await asyncio.to_thread(
             users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
         )
+        # Ütközés (több user ugyanazon a csatornán) → fail-closed: nem
+        # találgatunk, kinek a fiókjaira vonatkozna a KPI-állítás.
+        if _is_ambiguous_owner(channel_owner):
+            await interaction.followup.send(_ambiguous_owner_message(channel_owner))
+            return
         if channel_owner is None:
             await interaction.followup.send(
                 "❌ Ez a parancs csak a saját #alerts csatornádból futtatható. "
@@ -1365,7 +1375,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     ) -> list[app_commands.Choice[str]]:
         """CSAK alerts csatornából ajánl fiókokat (az OM sajátjait); máshol üres."""
         owner = await asyncio.to_thread(
-            users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
+            _unique_channel_owner, interaction.channel_id
         )
         if owner is None:
             return []
@@ -1378,7 +1388,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
         """Az `accounts` (vesszős lista) mezőhöz: az UTOLSÓ token alapján, a saját
         fiókok közül; a választott #id-t a már beírt tokenek MÖGÉ fűzi."""
         owner = await asyncio.to_thread(
-            users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
+            _unique_channel_owner, interaction.channel_id
         )
         if owner is None:
             return []
@@ -1426,6 +1436,16 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
             users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
         )
         is_admin_ch = _is_admin_channel(interaction)
+
+        # Ütközésnél nincs egyértelmű személyes hatókör. Az admin csatornából a
+        # parancs amúgy sem személyes hatókörrel fut (bármely fiókra megy), ezért
+        # ott az ütközés ugyanaz, mintha nem volna OM-je a csatornának. Máshol
+        # viszont fail-closed: nem tippeljük meg, kinek a fiókjait kérdezhetné le.
+        if _is_ambiguous_owner(channel_owner):
+            if not is_admin_ch:
+                await interaction.followup.send(_ambiguous_owner_message(channel_owner))
+                return
+            channel_owner = None
 
         if channel_owner is None and not is_admin_ch:
             await interaction.followup.send(
@@ -1489,7 +1509,7 @@ class AdAccountsCog(commands.GroupCog, group_name="account"):
     ) -> list[app_commands.Choice[str]]:
         """Alerts csatornában a saját fiókok, admin csatornában az összes."""
         owner = await asyncio.to_thread(
-            users_storage.get_user_by_alerts_channel, str(interaction.channel_id)
+            _unique_channel_owner, interaction.channel_id
         )
         if owner is not None:
             return await self._owned_account_choices(owner, current)

@@ -31,7 +31,12 @@ _ADMIN_CHANNEL_ID = "1509567720868417656"
 def _patch(stack, *, admin_channel_id, fake_channel):
     stack.enter_context(mock.patch.object(
         router, "get_config",
-        return_value=SimpleNamespace(discord_admin_channel_id=admin_channel_id),
+        return_value=SimpleNamespace(
+            discord_admin_channel_id=admin_channel_id,
+            # Az észlelési időpontok helyi időre váltásához kell (a formázás a
+            # közös `alert_content`-ben van, az időzónát a Discord réteg adja).
+            timezone="Europe/Budapest",
+        ),
     ))
     stack.enter_context(mock.patch.object(
         router, "_resolve_channel", new=mock.AsyncMock(return_value=fake_channel),

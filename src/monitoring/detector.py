@@ -55,6 +55,7 @@ import asyncio
 from datetime import date, datetime, timezone
 from typing import Any
 
+from src.integrations import alert_content
 from src.storage import ad_account_kpis as ad_account_kpis_storage
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import client_kpis as client_kpis_storage
@@ -558,10 +559,13 @@ def _int(v: Any, default: int) -> int:
 
 
 def _fmt(v: float | None) -> str:
-    """Szám emberi formázása: egész → tizedesek nélkül."""
-    if v is None:
-        return "—"
-    return str(int(v)) if float(v).is_integer() else f"{v:.2f}"
+    """Szám emberi formázása: egész → tizedesek nélkül.
+
+    A tényleges szabály a közös `alert_content.format_number`-ben lakik: a
+    ClickUp task címében megjelenő érték is azon megy át, így ugyanaz a szám
+    nem tud két csatornán kétféleképp kinézni.
+    """
+    return alert_content.format_number(v)
 
 
 def _fmtn(v: float, decimals: int) -> str:
