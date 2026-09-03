@@ -10,6 +10,8 @@ route_alert(alert) lépései:
         csak az /alert test force-override lépi át)
     b) Némítás-ellenőrzés (muted kampány → skip)
     c) Dedup (a már elküldött — status='sent' — alertet nem küldjük újra)
+    c2) CRITICAL esetén ClickUp task — MÉG A DISCORD ÜZENET ELŐTT, hogy a task
+        linkje beleférjen az üzenetbe (lásd KÉTIRÁNYÚ LINKELÉS lentebb)
     d) Per-OM kiküldés (CRITICAL + WARNING + INSIGHT egyaránt):
         - Minden assignee a SAJÁT alert csatornájába kapja a riasztást
           (users.alerts_channel_id), kiegészítve a többi értesített kolléga
@@ -20,9 +22,26 @@ route_alert(alert) lépései:
         - KIVÉTEL: INSIGHT severity-re NINCS admin fallback (lásd
           `_NO_ADMIN_FALLBACK_SEVERITY`) — az insight kizárólag a hozzárendelt
           OM saját csatornájára mehet, sehova máshova.
-        - CRITICAL esetén emellett ClickUp task is készül.
        (Email = 10b. lépés, most kimarad.)
+    d2) A kiküldött üzenet ugrólinkjének visszaírása a ClickUp taskra
     e) Az alert megjelölése elküldöttként (status='sent', sent_at, msg/task id)
+
+KÉTIRÁNYÚ LINKELÉS (ClickUp ↔ Discord) — a sorrend nem cserélhető fel:
+    1. task létrejön     → megvan a task URL
+    2. Discord üzenet    → benne "📋 ClickUp: {task_url}"
+    3. task frissítése    → benne "🔗 Discord: {üzenet ugrólinkje}"
+    A 2. lépéshez kell az 1. eredménye, a 3.-hoz a 2.-é — ezért készül a task
+    a küldés ELŐTT, és ezért csak utólag kerül rá a Discord link.
+
+    HIBA-IZOLÁCIÓ mindkét irányban:
+      - Ha az 1. lépés bármiért elhasal (nincs mapping, nincs token, API hiba),
+        a Discord üzenet AKKOR IS KIMEGY, csak task-link nélkül.
+      - Ha a 2. lépés hasal el, a task megmarad Discord-link nélkül (warning).
+      - Egyik hiba sem állítja meg a riasztási folyamatot.
+
+    Kinek a listájába kerül a task: a MÁR FELOLDOTT címzettek közül az első
+    `primary` szerepűébe (`_primary_recipient`) — a routing itt nem old fel
+    semmit újra, ugyanazt a hozzárendelést használja, mint a Discord-ág.
 
 NINCS "megoldódott" / feloldó értesítés — SZÁNDÉKOSAN:
     A rendszer CSAK akkor küld üzenetet, ha VAN probléma. Ha egy korábban
@@ -44,11 +63,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from src.config import get_config
-from src.integrations import clickup_router, discord_router, email_router
+from src.integrations import alert_content, clickup_router, discord_router, email_router
 from src.storage import ad_accounts as ad_accounts_storage
 from src.storage import alerts as alerts_storage
 from src.storage import assignments as assignments_storage
 from src.storage import campaigns as campaigns_storage
+from src.storage import clickup_mapping as clickup_storage
 from src.storage import clients as clients_storage
 from src.storage import mutes as mutes_storage
 from src.utils import quiet_hours
@@ -163,19 +183,27 @@ async def route_alert(
     client_name = client.get("name") if client else "?"
     client_id = client.get("id") if client else None
 
-    # Platform-jelölés a fejlécben: "Ügyfél [META] / Kampány".
-    platform_tag = f" [{platform.upper()}]" if platform else ""
+    # Platform-jelölés a fejlécben: "Ügyfél [META] / Kampány". A címkét a közös
+    # formázó adja, hogy a ClickUp task ugyanezt az ügyfél/platform megnevezést
+    # lássa (lásd integrations/alert_content.py).
     campaign_name = campaign.get("campaign_type") or campaign.get("name") or "?"
-    campaign_label = f"{client_name}{platform_tag} / {campaign_name}"
+    campaign_label = alert_content.campaign_label(client_name, platform, campaign_name)
 
     recipients = await asyncio.to_thread(_resolve_recipients, campaign_id, client_id)
     result["recipients"] = [r["discord_user_id"] for r in recipients]
 
     admin_channel_id = get_config().discord_admin_channel_id
 
+    # c2) ClickUp task — a Discord üzenet ELŐTT, hogy a linkje beleférjen.
+    # Bármilyen hiba esetén None: a riasztás task nélkül is kimegy.
+    clickup_res = await _create_clickup_task(
+        alert, campaign, client, platform=platform, recipients=recipients,
+    )
+    clickup_task_url = clickup_res.get("url") if clickup_res else None
+
     # d) Per-OM kiküldés (lásd modul-docstring)
     channels: list[str] = []
-    first_message_id: str | None = None
+    first_send: dict[str, Any] | None = None
 
     if recipients:
         for recipient in recipients:
@@ -191,6 +219,7 @@ async def route_alert(
                     personal_channel, alert,
                     campaign_label=campaign_label,
                     other_recipients=others or None,
+                    clickup_task_url=clickup_task_url,
                 )
             elif severity in _NO_ADMIN_FALLBACK_SEVERITY:
                 log.info(
@@ -208,11 +237,12 @@ async def route_alert(
                     admin_channel_id, alert,
                     campaign_label=campaign_label,
                     missing_channel_user=recipient["discord_user_id"],
+                    clickup_task_url=clickup_task_url,
                 )
 
             if res:
                 channels.append("discord")
-                first_message_id = first_message_id or str(res["message_id"])
+                first_send = first_send or res
     elif severity in _NO_ADMIN_FALLBACK_SEVERITY:
         log.info(
             "Routing: insight #%s kihagyva — nincs assignee, insight pedig "
@@ -226,21 +256,22 @@ async def route_alert(
             admin_channel_id, alert,
             campaign_label=campaign_label,
             no_assignee=True,
+            clickup_task_url=clickup_task_url,
         )
         if res:
             channels.append("discord")
-            first_message_id = first_message_id or str(res["message_id"])
+            first_send = first_send or res
 
-    clickup_res = None
+    if clickup_res:
+        channels.append("clickup")
+        # d2) A kiküldött üzenet ugrólinkje vissza a taskra. Ha nem ment ki
+        # üzenet (vagy hiányzik egy azonosító), a task link nélkül marad —
+        # warning, de nem hiba.
+        await _append_discord_link(clickup_res, first_send, alert_id=alert_id)
+
+    first_message_id = str(first_send["message_id"]) if first_send else None
+
     if severity == "critical":
-        # A platformot fent már feloldottuk a fiókból (a campaigns táblában nincs
-        # platform) — itt újrahasználjuk a ClickUp leíráshoz.
-        clickup_res = await clickup_router.create_clickup_task(
-            alert, campaign, client, platform=platform,
-        )
-        if clickup_res:
-            channels.append("clickup")
-
         # Ügyfél-email (CRITICAL) — csak ha van contact_email és még nem ment email
         # erről az alertről (dedup: alerts.email_sent_at, 0007 migration).
         if client and client.get("contact_email") and not alert.get("email_sent_at"):
@@ -291,6 +322,151 @@ async def route_alert(
 
 
 # ---------------------------------------------------------------------------
+# ClickUp — task létrehozás és visszalinkelés (lásd modul-docstring)
+# ---------------------------------------------------------------------------
+
+def _primary_recipient(recipients: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """A ClickUp task gazdája a MÁR FELOLDOTT címzettek közül. None ha nincs.
+
+    Az első `primary` szerepű címzett; ha csak `supporter` van, az első bármelyik
+    — egy helyettesre kiosztott task is jobb, mint egy sem.
+
+    Itt SEMMILYEN új feloldás nem történik: a `route_alert` már lefuttatta a
+    `_resolve_recipients`-et (assignments: kampány- + ügyfél-szint), ez a
+    függvény csak választ a kész listából. Így a ClickUp task és a Discord
+    üzenet nem tudhat két különböző felelőst gondolni ugyanarról a kampányról.
+    """
+    for recipient in recipients:
+        if (recipient.get("role") or "primary") == "primary":
+            return recipient
+    return recipients[0] if recipients else None
+
+
+async def _create_clickup_task(
+    alert: dict[str, Any],
+    campaign: dict[str, Any],
+    client: dict[str, Any] | None,
+    *,
+    platform: str | None,
+    recipients: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """ClickUp task a riasztáshoz — vagy None, ha bármiért kimarad.
+
+    Graceful skip (warning + None, a Discord riasztás megy tovább):
+      - a severity nem szerepel a `clickup_router.TASK_SEVERITIES`-ben (alap: csak CRITICAL)
+      - nincs feloldott címzett (a taskot nem tudnánk kire szignálni / hova tenni)
+      - az OM-nek még nincs `clickup_manager_mapping` sora (`/clickup setup-manager`)
+      - hiányzó CLICKUP_API_TOKEN vagy ClickUp API hiba (a task-modul nyeli el)
+
+    A `try/except` a legkülső védőháló: a riasztás akkor sem eshet ki, ha ezen
+    az ágon valami VÁRATLAN történik (pl. a DB-réteg mégis dob).
+    """
+    severity = (alert.get("severity") or "").lower()
+    if not clickup_router.is_task_severity(severity):
+        return None
+
+    alert_id = alert.get("id")
+    try:
+        primary = _primary_recipient(recipients)
+        if primary is None:
+            log.warning(
+                "ClickUp task kihagyva (alert #%s) — a kampánynak nincs "
+                "hozzárendelt OM-je, így nincs cél-lista. A riasztás Discordon "
+                "kimegy (admin fallback).",
+                alert_id,
+            )
+            return None
+
+        user_id = primary.get("user_id")
+        if user_id is None:
+            log.warning(
+                "ClickUp task kihagyva (alert #%s) — @%s címzetthez nem tartozik "
+                "users sor id. A riasztás Discordon kimegy.",
+                alert_id, primary.get("discord_user_id"),
+            )
+            return None
+
+        mapping = await asyncio.to_thread(clickup_storage.get_mapping_for_user, user_id)
+        if not mapping:
+            log.warning(
+                "ClickUp task kihagyva (alert #%s) — @%s (user #%s) OM-nek még "
+                "nincs ClickUp mappingja. Létrehozás: `/clickup setup-manager "
+                "user:@%s clickup_user_id:… folder_id:… list_id:…`. "
+                "A riasztás Discord-only routinggal megy.",
+                alert_id, primary.get("display_name") or primary.get("discord_user_id"),
+                user_id, primary.get("discord_user_id"),
+            )
+            return None
+
+        return await clickup_router.create_clickup_task(
+            alert, campaign, client, platform=platform, mapping=mapping,
+        )
+    except Exception as exc:  # noqa: BLE001 — a ClickUp-ág SOHA nem blokkolhat
+        log.error(
+            "ClickUp task létrehozása váratlan hibával elszállt (alert #%s): %s "
+            "— a riasztás Discordon task nélkül megy ki.",
+            alert_id, exc,
+        )
+        return None
+
+
+async def _append_discord_link(
+    clickup_res: dict[str, Any],
+    send_res: dict[str, Any] | None,
+    *,
+    alert_id: Any,
+) -> None:
+    """A kiküldött Discord üzenet ugrólinkjének visszaírása a ClickUp taskra.
+
+    Az ELSŐ SIKERES küldés üzenetére linkelünk. Több címzettnél ez a címzett-
+    lista első olyan tagjának üzenete, akinek a küldés ténylegesen sikerült —
+    nem feltétlenül a `primary` OM-é, akinek a listájába a task került. Ez
+    szándékos egyszerűsítés: MINDEN címzett UGYANAZT a riasztás-szöveget kapja,
+    így bármelyik példány jó horgony a taskról visszafelé.
+
+    Sosem dob és sosem blokkol: ha nem ment ki üzenet, vagy hiányzik valamelyik
+    azonosító, a task egyszerűen Discord-link nélkül marad (warning). Ez a
+    kevésbé súlyos hiba-irány: a riasztás ilyenkor MÁR kiment, a task pedig
+    létezik — csak a kereszthivatkozás hiányzik.
+    """
+    task_id = clickup_res.get("task_id")
+    if not task_id:
+        return
+
+    try:
+        if not send_res:
+            log.warning(
+                "ClickUp task #%s Discord-link nélkül marad (alert #%s) — "
+                "egyetlen Discord üzenet sem ment ki sikeresen.",
+                task_id, alert_id,
+            )
+            return
+
+        # A guild ID-t elsődlegesen a küldés válaszából vesszük (az a TÉNYLEGES
+        # szerver); ha hiányzik (pl. DM), a konfigurált guild a tartalék.
+        guild_id = send_res.get("guild_id") or get_config().discord_guild_id
+        url = alert_content.discord_jump_url(
+            guild_id, send_res.get("channel_id"), send_res.get("message_id"),
+        )
+        if url is None:
+            log.warning(
+                "ClickUp task #%s Discord-link nélkül marad (alert #%s) — "
+                "hiányzó guild/csatorna/üzenet azonosító (guild=%r).",
+                task_id, alert_id, guild_id,
+            )
+            return
+
+        await clickup_router.append_discord_link(
+            str(task_id), clickup_res.get("description") or "", url,
+        )
+    except Exception as exc:  # noqa: BLE001 — a visszalinkelés sosem blokkolhat
+        log.warning(
+            "ClickUp task #%s Discord-linkjének visszaírása elszállt (alert #%s): %s",
+            task_id, alert_id, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Belső segédfüggvények (szinkron — to_thread-ből hívva)
 # ---------------------------------------------------------------------------
 
@@ -313,6 +489,11 @@ def _resolve_recipients(campaign_id: int, client_id: int | None) -> list[dict[st
     """Címzettek: kampány-szintű + ügyfél-szintű hozzárendelések (duplikátum-mentes).
 
     A riasztás CSAK a hozzárendelt személy(ek)hez megy (követelmény).
+
+    A `user_id` (a MI users táblánk id-ja) is benne van a sorokban: a ClickUp-ág
+    ezzel keresi ki az OM `clickup_manager_mapping` sorát. Ez szándékosan itt,
+    a MEGLÉVŐ feloldásban keletkezik — nem külön lekérdezésből —, hogy a task és
+    a Discord üzenet garantáltan ugyanarra a felelősre hivatkozzon.
     """
     rows = assignments_storage.get_assignments_for_campaign(campaign_id)
     if client_id is not None:
@@ -328,6 +509,7 @@ def _resolve_recipients(campaign_id: int, client_id: int | None) -> list[dict[st
         if discord_user_id and discord_user_id not in seen:
             seen.add(discord_user_id)
             out.append({
+                "user_id": user.get("id"),
                 "discord_user_id": discord_user_id,
                 "display_name": user.get("display_name"),
                 "role": row.get("role") or "primary",
