@@ -26,6 +26,22 @@ google-ads==31.0.0; python_version < "3.14"
 # Claude (Anthropic)
 anthropic==0.39.0
 
+# HTTP kliens — TRANZITÍV függőség (anthropic + supabase), mégis SZÁNDÉKOSAN
+# rögzítjük. A httpx 0.28.0 eltávolította a `proxies` paramétert a
+# Client/AsyncClient konstruktorából, az anthropic 0.39.0 viszont még mindig
+# átadja (`_base_client.py`) — feltétel nélkül, akkor is, ha None. Emiatt
+# élesben MINDEN Claude hívás elhasalt már a kliens létrehozásánál:
+#   AsyncClient.__init__() got an unexpected keyword argument 'proxies'
+# Itt korábban nem volt pin, ezért a Railway build a legfrissebb httpx-et
+# húzta be, és a hiba KÓDVÁLTOZÁS NÉLKÜL, egy újratelepítéskor jelent meg —
+# lokálisan (régebbi venv, httpx 0.27.2) viszont minden működött.
+#
+# A sáv két oldalról zárt: supabase 2.17.0 stack → httpx[http2] >=0.26,<0.29,
+# anthropic 0.39.0 → gyakorlatilag <0.28. A 0.27.2 mindkettőnek megfelel.
+# Ha az anthropic SDK-t 0.50.0-ra vagy újabbra emeled (ott szűnt meg a
+# `proxies` átadása), ez a pin felengedhető 0.28-ra.
+httpx==0.27.2
+
 # ClickUp — egyszerű HTTP, nincs dedikált SDK, requests-szel kezeljük
 requests==2.32.3
 
