@@ -535,12 +535,31 @@ def search_campaign_choices(account_id: int, query: str, *, limit: int = 25) -> 
     return qb.order("name").limit(limit).execute().data or []
 
 
-def search_campaign_choices_global(query: str, *, limit: int = 25) -> list[dict[str, Any]]:
+def ad_account_ids_for_client(client_id: int) -> list[int]:
+    """Egy ügyfél hirdetési fiók ID-jai (campaigns → ad_accounts → clients szűkítéshez)."""
+    rows = (
+        get_supabase().table("ad_accounts")
+        .select("id")
+        .eq("client_id", client_id)
+        .execute()
+        .data
+        or []
+    )
+    return [a["id"] for a in rows]
+
+
+def search_campaign_choices_global(
+    query: str, *, client_id: int | None = None, limit: int = 25
+) -> list[dict[str, Any]]:
     """Kampány autocomplete MINDEN fiókban, kliensnévvel (admin `/alert …`).
 
     A visszaadott sorok tartalmazzák a beágyazott `ad_accounts(clients(name))`
     objektumot, hogy a felkínált címke `Kliens / Kampány` formájú lehessen.
     Szám → pontos id, szöveg → név ILIKE; az 'ended' kampányokat kihagyja.
+
+    `client_id` megadásakor csak az adott ügyfél fiókjainak kampányai jönnek
+    vissza (`/alert test client:` szűkítés) — ügyfél nélkül a keresés globális
+    marad (backward compat).
     """
     q = (query or "").strip()
     qb = (
@@ -548,6 +567,11 @@ def search_campaign_choices_global(query: str, *, limit: int = 25) -> list[dict[
         .select("id, name, ad_accounts(clients(name))")
         .neq("lifecycle_state", "ended")
     )
+    if client_id is not None:
+        account_ids = ad_account_ids_for_client(client_id)
+        if not account_ids:
+            return []
+        qb = qb.in_("ad_account_id", account_ids)
     if q.isdigit():
         qb = qb.eq("id", int(q))
     elif q:
@@ -555,11 +579,17 @@ def search_campaign_choices_global(query: str, *, limit: int = 25) -> list[dict[
     return qb.order("name").limit(limit).execute().data or []
 
 
-def resolve_campaign(value: str, account_id: int | None = None) -> dict[str, Any] | None:
+def resolve_campaign(
+    value: str, account_id: int | None = None, *, client_id: int | None = None
+) -> dict[str, Any] | None:
     """Kampány feloldása str értékből (autocomplete VAGY kézi bevitel).
 
     - szám (`"920"`)  → pontos belső ID egyezés (backward compat)
     - szöveg          → név ILIKE keresés (ha `account_id` adott, arra szűrve)
+
+    `client_id` megadásakor a feloldás az adott ügyfél fiókjaira szűkül — így a
+    `/alert test client:… campaign:…` név-alapú bevitele ugyanazt a halmazt látja,
+    mint a kliens-szűkített autocomplete. Ügyfél nélkül a feloldás globális marad.
 
     Visszatérés:
         - kampány sor {"id", "name", "lifecycle_state", "ad_account_id"} — egy egyértelmű találat
@@ -573,13 +603,24 @@ def resolve_campaign(value: str, account_id: int | None = None) -> dict[str, Any
     sb = get_supabase()
     cols = "id, name, lifecycle_state, ad_account_id"
 
+    client_account_ids: list[int] | None = None
+    if client_id is not None:
+        client_account_ids = ad_account_ids_for_client(client_id)
+        if not client_account_ids:
+            return None
+
     if v.isdigit():
-        res = sb.table(_TABLE).select(cols).eq("id", int(v)).limit(1).execute()
+        qb = sb.table(_TABLE).select(cols).eq("id", int(v))
+        if client_account_ids is not None:
+            qb = qb.in_("ad_account_id", client_account_ids)
+        res = qb.limit(1).execute()
         return res.data[0] if res.data else None
 
     qb = sb.table(_TABLE).select(cols).ilike("name", f"%{v}%")
     if account_id is not None:
         qb = qb.eq("ad_account_id", account_id)
+    if client_account_ids is not None:
+        qb = qb.in_("ad_account_id", client_account_ids)
     results = qb.order("name").limit(5).execute().data or []
 
     if len(results) == 1:
