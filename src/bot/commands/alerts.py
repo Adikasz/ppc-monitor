@@ -4,10 +4,15 @@
 Parancsok:
     /alert mute    campaign:<név|#id> [hours:<2>]           — kampány némítása X órára
     /alert unmute  campaign:<név|#id>                        — némítás korai feloldása
-    /alert test    campaign:<név|#id> severity:<…>          — fake riasztás → routing teszt
+    /alert test    campaign:<név|#id> severity:<…> [client:<név>] — fake riasztás → routing teszt
 
 A `campaign` mező névvel (autocomplete, `Kliens / Kampány`) és #id-vel is működik
 (backward compat): a `campaigns_storage.resolve_campaign` oldja fel.
+
+A `/alert test` opcionális `client` mezője a `campaign` autocomplete-jét az adott
+ügyfél kampányaira szűkíti (namespace-alapú szűrés, mint a `/my mute` account →
+campaign vagy a `/account add` platform → account mezőinél). Kliens nélkül a
+keresés globális marad.
 
 A némítás a `mutes` táblán keresztül történik (src.storage.mutes). Muted
 kampányra a detektor nem generál, az alert-router nem küld riasztást.
@@ -28,6 +33,7 @@ from src.monitoring import router as alert_router
 from src.monitoring import summary as summary_gen
 from src.storage import audit
 from src.storage import campaigns as campaigns_storage
+from src.storage import clients as clients_storage
 from src.storage import mutes as mutes_storage
 from src.storage import users as users_storage
 from src.utils.logging import get_logger
@@ -49,6 +55,21 @@ def _admin_channel_id() -> int | None:
         return None
 
 
+def _resolve_client(value: str) -> dict | None:
+    """Ügyfél feloldása név VAGY numerikus ID alapján (az autocomplete a #id-t adja át).
+
+    Ugyanaz a minta, mint a `/campaign list client_name:` mezőjénél.
+    """
+    val = (value or "").strip()
+    if not val:
+        return None
+    if val.isdigit():
+        row = clients_storage.get_client(int(val))
+        if row is not None:
+            return row
+    return clients_storage.find_client_by_name_ci(val)
+
+
 def _is_admin_channel(interaction: discord.Interaction) -> bool:
     """True, ha az interakció az admin csatornában történt (vagy nincs konfigurálva)."""
     admin = _admin_channel_id()
@@ -67,17 +88,25 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
     # Kampány-feloldás + autocomplete (admin: bármelyik fiók)
     # ------------------------------------------------------------------
     async def _resolve_campaign_or_reject(
-        self, interaction: discord.Interaction, campaign: str
+        self, interaction: discord.Interaction, campaign: str,
+        *, client_row: dict | None = None,
     ) -> dict | None:
         """A `campaign` mező feloldása kampány-sorra (#id VAGY név).
 
         Egyértelmű találatnál a kampány sort adja vissza; nem-talált / többértelmű
         esetben üzen és None-t ad vissza (a hívó ekkor return-öljön).
+
+        `client_row` megadásakor a feloldás az adott ügyfél kampányaira szűkül —
+        ugyanarra a halmazra, amit a kliens-szűkített autocomplete kínál.
         """
-        resolved = await asyncio.to_thread(campaigns_storage.resolve_campaign, campaign)
+        resolved = await asyncio.to_thread(
+            campaigns_storage.resolve_campaign, campaign, None,
+            client_id=(client_row["id"] if client_row else None),
+        )
         if resolved is None:
+            scope = f" a(z) **{client_row['name']}** ügyfélnél" if client_row else ""
             await interaction.followup.send(
-                f"Nincs ilyen kampány: **{campaign}** — válassz az autocomplete-ből."
+                f"Nincs ilyen kampány{scope}: **{campaign}** — válassz az autocomplete-ből."
             )
             return None
         if resolved.get("ambiguous"):
@@ -89,13 +118,36 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
             return None
         return resolved
 
-    async def _campaign_choices_global(self, current: str) -> list[app_commands.Choice[str]]:
-        """Autocomplete az `/alert …` kampány-mezőihez: minden fiók, `Kliens / Kampány`
-        címkével. Legalább 2 karakter (vagy id) kell, hogy ne listázzunk mindent."""
+    async def _campaign_choices_global(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Autocomplete az `/alert …` kampány-mezőihez: `Kliens / Kampány` címkével.
+        Legalább 2 karakter (vagy id) kell, hogy ne listázzunk mindent.
+
+        Ha a parancsnak van kitöltött `client` mezője (`/alert test`), a lista
+        CSAK az adott ügyfél kampányait kínálja — ugyanaz a namespace-alapú
+        szűkítés, mint a `/my mute` (account → campaign) és a `/account add`
+        (platform → account) mezőinél. Kliens nélkül a keresés globális marad,
+        így a `/alert mute` és `/alert unmute` viselkedése változatlan.
+        """
         q = (current or "").strip()
         if len(q) < 2 and not q.isdigit():
             return []
-        rows = await asyncio.to_thread(campaigns_storage.search_campaign_choices_global, q)
+
+        client_id: int | None = None
+        ns = getattr(interaction, "namespace", None)
+        client_val = getattr(ns, "client", None) if ns is not None else None
+        if client_val:
+            client_row = await asyncio.to_thread(_resolve_client, str(client_val))
+            if client_row is None:
+                # Ismeretlen (félig begépelt) ügyfélnév: inkább üres lista, mint a
+                # globális találatok — azok pont a szűkítés célját rontanák el.
+                return []
+            client_id = client_row["id"]
+
+        rows = await asyncio.to_thread(
+            campaigns_storage.search_campaign_choices_global, q, client_id=client_id,
+        )
         out: list[app_commands.Choice[str]] = []
         for r in rows:
             client = ((r.get("ad_accounts") or {}).get("clients")) or {}
@@ -173,7 +225,7 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
     async def mute_campaign_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        return await self._campaign_choices_global(current)
+        return await self._campaign_choices_global(interaction, current)
 
     # ------------------------------------------------------------------
     # /alert unmute campaign:<név|#id>
@@ -217,7 +269,7 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
     async def unmute_campaign_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        return await self._campaign_choices_global(current)
+        return await self._campaign_choices_global(interaction, current)
 
     # ------------------------------------------------------------------
     # /alert test campaign:<név|#id> severity:<critical|warning|insight>
@@ -229,6 +281,7 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
     @app_commands.describe(
         campaign="A kampány neve (autocomplete) VAGY #id",
         severity="A teszt-riasztás súlyossága",
+        client="Opcionális: ügyfél — kitöltve a campaign: autocomplete csak az ő kampányait kínálja",
         force="paused/ended kampányra is küldjön (admin override) — alap: nem",
     )
     @app_commands.choices(
@@ -243,6 +296,7 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
         interaction: discord.Interaction,
         campaign: str,
         severity: app_commands.Choice[str],
+        client: str | None = None,
         force: bool = False,
     ) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -253,7 +307,19 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
             )
             return
 
-        c = await self._resolve_campaign_or_reject(interaction, campaign)
+        client_row: dict | None = None
+        if client:
+            client_row = await asyncio.to_thread(_resolve_client, client)
+            if client_row is None:
+                await interaction.followup.send(
+                    f"Nem található ügyfél: **{client}**\n"
+                    f"Ellenőrizd a `/client list` paranccsal az elérhető ügyfeleket."
+                )
+                return
+
+        c = await self._resolve_campaign_or_reject(
+            interaction, campaign, client_row=client_row,
+        )
         if c is None:
             return
         campaign_id = c["id"]
@@ -309,7 +375,21 @@ class AlertsCog(commands.GroupCog, group_name="alert"):
     async def test_campaign_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        return await self._campaign_choices_global(current)
+        return await self._campaign_choices_global(interaction, current)
+
+    @test.autocomplete("client")
+    async def test_client_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Ügyfél-javaslatok (érték: #id) — ugyanaz a minta, mint a
+        `/campaign list client_name:` mezőjénél."""
+        rows = await asyncio.to_thread(
+            clients_storage.search_clients, current, active=None,
+        )
+        return [
+            app_commands.Choice(name=r["name"][:100], value=str(r["id"]))
+            for r in rows
+        ][:25]
 
 
 class SummaryCog(commands.Cog):
